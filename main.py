@@ -14,10 +14,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 
-HISTORY_SECONDS = 2 * 60 * 60
+HISTORY_SECONDS = 30 * 60
 FETCH_INTERVAL = 5
 COOLDOWN = 60
 
+# 🟢 جلب الأسعار من Bitvavo
 def fetch_all_prices():
     try:
         res = requests.get("https://api.bitvavo.com/v2/ticker/price")
@@ -30,6 +31,7 @@ def fetch_all_prices():
         print("❌ فشل جلب الأسعار:", e)
         return {}
 
+# 🟢 تخزين الأسعار في Redis
 def store_prices(prices):
     now = int(time.time())
     cutoff = now - HISTORY_SECONDS
@@ -37,87 +39,59 @@ def store_prices(prices):
         key = f"prices:{symbol}"
         r.zadd(key, {price: now})
         r.zremrangebyscore(key, 0, cutoff)
+    print(f"✅ تم تخزين {len(prices)} عملة. مثال: {list(prices.items())[:3]}")
 
-def get_price_at(symbol, target_time):
+# 🟢 استخراج السعر القديم
+def get_price_at(symbol, seconds_ago):
+    target = int(time.time()) - seconds_ago
     key = f"prices:{symbol}"
-    results = r.zrangebyscore(key, target_time - 2, target_time + 2, withscores=True)
-    if results:
-        try:
-            return float(results[0][0])
-        except:
-            return None
+    result = r.zrangebyscore(key, target - 2, target + 2, withscores=False)
+    if result:
+        return float(result[0])
     return None
 
+# 🟢 إرسال إشارة شراء
 def notify_buy(symbol):
     last_key = f"alerted:{symbol}"
     if r.get(last_key):
         return
     msg = f"اشتري {symbol}"
-
+    r.set(last_key, "1", ex=COOLDOWN)
     try:
-        r.set(last_key, "1", ex=COOLDOWN)
-
-        saqar_res = requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
-        print(">> صقر:", saqar_res.status_code, saqar_res.text)
-
-        tg_res = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"}
-        )
-        print(">> تلغرام:", tg_res.status_code, tg_res.text)
-
-        print(f"🚀 إشارة شراء: {msg}")
+        saqar = requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
+        tg = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"})
+        print(">> صقر:", saqar.status_code, saqar.text)
+        print(">> تلغرام:", tg.status_code, tg.text)
     except Exception as e:
-        print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
+        print("❌ فشل إرسال الإشارة:", e)
 
+# 🟢 تحليل العملات واحدة واحدة
 def analyze_symbol(symbol):
-    now = int(time.time())
-    key = f"prices:{symbol}"
-    history = r.zrangebyscore(key, now - HISTORY_SECONDS, now, withscores=True)
+    current = get_price_at(symbol, 0)
+    if not current or current == 0:
+        return
 
-    if len(history) < 2:
-        return None
-
-    try:
-        current = float(history[-1][0])
-    except Exception as e:
-        print(f"⚠️ خطأ في قراءة السعر الحالي لـ {symbol}: {e}")
-        return None
-
-    timestamps = {
-        "5s": now - 5,
-        "10s": now - 10,
-        "60s": now - 60,
-        "180s": now - 180
-    }
-
-    prices = {label: get_price_at(symbol, t) for label, t in timestamps.items()}
     deltas = {}
+    intervals = [5, 10, 60, 180, 300]
+    thresholds = {5: 0.1, 10: 0.2, 60: 0.5, 180: 1.0, 300: 1.5}
 
-    for label, old_price in prices.items():
-        if old_price and old_price > 0:
-            change = ((current - old_price) / old_price) * 100
-            deltas[label] = round(change, 3)
+    for sec in intervals:
+        past = get_price_at(symbol, sec)
+        if past and past > 0:
+            change = ((current - past) / past) * 100
+            deltas[sec] = round(change, 3)
 
-    print(f"🔍 تحليل {symbol}:\n  🔸 السعر الحالي: {current}")
-    for label, change in deltas.items():
-        print(f"  🔸 {label}: {change}% (مقارنة بـ {prices[label]})")
+    print(f"🔍 تحليل {symbol}: 🟧 السعر الحالي: {current}")
+    for sec, change in deltas.items():
+        print(f"⏱️ {sec}s: {change}% (مقارنة بـ {get_price_at(symbol, sec)})")
 
-    for label, change in deltas.items():
-        if (label == "5s" and change >= 0.1) or \
-           (label == "10s" and change >= 0.2) or \
-           (label == "60s" and change >= 0.5) or \
-           (label == "180s" and change >= 1.0):
+        if change >= thresholds[sec]:
+            print(f"🚨 انفجار {symbol}: +{change}% خلال {sec}s")
             notify_buy(symbol)
-            return {
-                "tag": label,
-                "change": change,
-                "current": current,
-                "previous": prices[label]
-            }
+            break
 
-    return None
-
+# 🧠 خيط التحليل المستمر
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
@@ -129,15 +103,15 @@ def analyzer_loop():
                 print(f"❌ تحليل {sym}:", e)
         time.sleep(FETCH_INTERVAL)
 
+# 🧠 خيط التخزين المستمر
 def collector_loop():
     while True:
         prices = fetch_all_prices()
         if prices:
             store_prices(prices)
-            first = list(prices.items())[:3]
-            print(f"✅ تم تخزين {len(prices)} عملة. مثال: {first}")
         time.sleep(FETCH_INTERVAL)
 
+# 🧠 عرض السجل لأقوى العملات
 def print_summary():
     keys = r.keys("prices:*")
     symbols = [k.decode().split(":")[1] for k in keys]
@@ -146,14 +120,13 @@ def print_summary():
     changes_10min = []
 
     for sym in symbols:
-        current = get_price_at(sym, now)
-        ago_5 = get_price_at(sym, now - 300)
-        ago_10 = get_price_at(sym, now - 600)
+        current = get_price_at(sym, 0)
+        ago_5 = get_price_at(sym, 300)
+        ago_10 = get_price_at(sym, 600)
 
         if current and ago_5:
             change = ((current - ago_5) / ago_5) * 100
             changes_5min.append((sym, round(change, 2)))
-
         if current and ago_10:
             change = ((current - ago_10) / ago_10) * 100
             changes_10min.append((sym, round(change, 2)))
@@ -174,6 +147,7 @@ def print_summary():
         data={"chat_id": CHAT_ID, "text": text}
     )
 
+# 🚀 Flask Webhook
 @app.route("/")
 def home():
     return "Sniper bot is alive ✅"
@@ -187,7 +161,6 @@ def telegram_webhook():
     text = data["message"].get("text", "").strip().lower()
     if "السجل" in text:
         print_summary()
-
     return "ok", 200
 
 if __name__ == "__main__":
