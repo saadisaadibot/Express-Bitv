@@ -71,40 +71,40 @@ def notify_buy(symbol):
         print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
 def analyze_symbol(symbol):
     now = int(time.time())
+    history = r.zrangebyscore(f"price:{symbol}", now - HISTORY_SECONDS, now, withscores=True)
 
-    try:
-        current = Decimal(str(get_price_at(symbol, now)))
-    except:
-        return
+    if len(history) < 2:
+        return None
 
-    checks = {
-        "5s": get_price_at(symbol, now - 5),
-        "10s": get_price_at(symbol, now - 10),
-        "60s": get_price_at(symbol, now - 60),
-        "180s": get_price_at(symbol, now - 180),
-        "300s": get_price_at(symbol, now - 300),
+    current = float(json.loads(history[-1][0])["price"])
+    prices = {
+        "5s": get_price_at(symbol, 5),
+        "10s": get_price_at(symbol, 10),
+        "60s": get_price_at(symbol, 60),
+        "180s": get_price_at(symbol, 180),
     }
 
-    for label, old in checks.items():
-        try:
-            old_price = Decimal(str(old))
-            if old_price <= Decimal("0.00000000000001"):
-                continue
+    deltas = {}
+    for label, old_price in prices.items():
+        if old_price and old_price > 0:
             change = ((current - old_price) / old_price) * 100
-        except (InvalidOperation, ZeroDivisionError):
-            continue
+            deltas[label] = round(change, 3)
+    
+    print(f"تحليل {symbol}: {deltas}")
+    
+    for label, change in deltas.items():
+        if (label == "5s" and change >= 0.1) or \
+           (label == "10s" and change >= 0.2) or \
+           (label == "60s" and change >= 0.5) or \
+           (label == "180s" and change >= 1.0):
+            return {
+                "tag": label,
+                "change": change,
+                "current": current,
+                "previous": prices[label]
+            }
 
-        if label == "5s" and change >= 0.1:
-            notify_buy(symbol)
-        elif label == "10s" and change >= 3:
-            notify_buy(symbol)
-        elif label == "60s" and change >= 5:
-            notify_buy(symbol)
-        elif label == "180s" and change >= 8:
-            notify_buy(symbol)
-        elif label == "300s" and change >= 10:
-            notify_buy(symbol)
-
+    return None
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
