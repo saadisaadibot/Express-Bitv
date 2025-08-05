@@ -205,12 +205,16 @@ def clear_old_prices():
 if __name__ == "__main__":
     clear_old_prices()  # 🧹 حذف البيانات القديمة
 
+    # ✅ ابدأ بجمع الأسعار أولًا
     threading.Thread(target=collector_loop, daemon=True).start()
 
-    # ⏳ انتظر أول دفعة أسعار قبل بدء التحليل
+    # ⏳ انتظر أول دفعة أسعار تنضاف في Redis
     while not r.keys("prices:*"):
-        print("⏳ في انتظار أول دفعة أسعار...")
+        print("⏳ بانتظار أول دفعة أسعار من Bitvavo...")
         time.sleep(1)
 
+    # ✅ الآن شغّل التحليل
     threading.Thread(target=analyzer_loop, daemon=True).start()
+
+    # ✅ وأخيرًا شغّل السيرفر
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
