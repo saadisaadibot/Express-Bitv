@@ -39,15 +39,28 @@ def get_change(symbol, minutes):
         pair = f"{symbol}-EUR"
         url = f"https://api.bitvavo.com/v2/candles/{pair}/1m?limit={minutes+1}"
         res = requests.get(url, timeout=3)
-        data = res.json()
-        if len(data) < minutes + 1:
+
+        # ✅ تحقق أن الرد غير فارغ وأنه بصيغة JSON صالحة
+        if not res.content or res.status_code != 200:
+            print(f"⛔ {symbol}: رد غير صالح من Bitvavo (status={res.status_code})")
+            return None
+
+        try:
+            data = res.json()
+        except Exception as e:
+            print(f"⛔ {symbol}: فشل تحويل JSON:", e)
+            return None
+
+        if not isinstance(data, list) or len(data) < minutes + 1:
             print(f"⛔ {symbol}: عدد الشموع غير كافِ ({len(data)})")
             return None
+
         open_price = float(data[0][1])
         close_price = float(data[-1][4])
         change = ((close_price - open_price) / open_price) * 100
         print(f"📈 {symbol}: تغيير {change:.2f}% خلال {minutes} دقيقة")
         return round(change, 2)
+
     except Exception as e:
         print(f"❌ خطأ أثناء تحليل {symbol}: {e}")
         return None
