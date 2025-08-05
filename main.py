@@ -76,7 +76,7 @@ def analyze_symbol(symbol):
     if not current or current == 0:
         return
 
-    checks = [(30, 2.5), (60, 3.0), (120, 4.0)]
+    checks = [(30, 0.1), (60, 3.0), (120, 4.0)]
 
     for sec, threshold in checks:
         past = get_price_at(symbol, sec)
