@@ -5,6 +5,7 @@ import requests
 import threading
 from flask import Flask, request
 from dotenv import load_dotenv
+from decimal import Decimal, InvalidOperation
 
 load_dotenv()
 app = Flask(__name__)
@@ -12,7 +13,7 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
+SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
 
 HISTORY_SECONDS = 2 * 60 * 60
 FETCH_INTERVAL = 5
@@ -50,21 +51,30 @@ def notify_buy(symbol):
     if r.get(last_key):
         return
     msg = f"اشتري {symbol}"
+
     try:
         r.set(last_key, "1", ex=COOLDOWN)
-        requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
-        requests.post(
+
+        # 🛰️ إرسال الإشارة إلى صقر
+        saqar_res = requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
+        print(">> صقر:", saqar_res.status_code, saqar_res.text)
+
+        # 📩 إرسال الإشارة إلى تلغرام
+        tg_res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"}
         )
+        print(">> تلغرام:", tg_res.status_code, tg_res.text)
+
         print(f"🚀 إشارة شراء: {msg}")
     except Exception as e:
         print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
-
 def analyze_symbol(symbol):
     now = int(time.time())
-    current = get_price_at(symbol, now)
-    if not current:
+
+    try:
+        current = Decimal(str(get_price_at(symbol, now)))
+    except:
         return
 
     checks = {
@@ -75,10 +85,15 @@ def analyze_symbol(symbol):
         "300s": get_price_at(symbol, now - 300),
     }
 
-    for label, old_price in checks.items():
-        if not old_price:
+    for label, old in checks.items():
+        try:
+            old_price = Decimal(str(old))
+            if old_price <= Decimal("0.00000000000001"):
+                continue
+            change = ((current - old_price) / old_price) * 100
+        except (InvalidOperation, ZeroDivisionError):
             continue
-        change = ((current - old_price) / old_price) * 100
+
         if label == "5s" and change >= 0.1:
             notify_buy(symbol)
         elif label == "10s" and change >= 3:
