@@ -5,7 +5,6 @@ import requests
 import threading
 from flask import Flask, request
 from dotenv import load_dotenv
-from decimal import Decimal, InvalidOperation
 
 load_dotenv()
 app = Flask(__name__)
@@ -43,7 +42,10 @@ def get_price_at(symbol, target_time):
     key = f"prices:{symbol}"
     results = r.zrangebyscore(key, target_time - 2, target_time + 2, withscores=True)
     if results:
-        return float(results[0][0])
+        try:
+            return float(results[0][0])
+        except:
+            return None
     return None
 
 def notify_buy(symbol):
@@ -55,11 +57,9 @@ def notify_buy(symbol):
     try:
         r.set(last_key, "1", ex=COOLDOWN)
 
-        # 🛰️ إرسال الإشارة إلى صقر
         saqar_res = requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
         print(">> صقر:", saqar_res.status_code, saqar_res.text)
 
-        # 📩 إرسال الإشارة إلى تلغرام
         tg_res = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"}
@@ -69,34 +69,46 @@ def notify_buy(symbol):
         print(f"🚀 إشارة شراء: {msg}")
     except Exception as e:
         print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
+
 def analyze_symbol(symbol):
     now = int(time.time())
-    history = r.zrangebyscore(f"price:{symbol}", now - HISTORY_SECONDS, now, withscores=True)
+    key = f"prices:{symbol}"
+    history = r.zrangebyscore(key, now - HISTORY_SECONDS, now, withscores=True)
 
     if len(history) < 2:
         return None
 
-    current = float(json.loads(history[-1][0])["price"])
-    prices = {
-        "5s": get_price_at(symbol, 5),
-        "10s": get_price_at(symbol, 10),
-        "60s": get_price_at(symbol, 60),
-        "180s": get_price_at(symbol, 180),
+    try:
+        current = float(history[-1][0])
+    except Exception as e:
+        print(f"⚠️ خطأ في قراءة السعر الحالي لـ {symbol}: {e}")
+        return None
+
+    timestamps = {
+        "5s": now - 5,
+        "10s": now - 10,
+        "60s": now - 60,
+        "180s": now - 180
     }
 
+    prices = {label: get_price_at(symbol, t) for label, t in timestamps.items()}
     deltas = {}
+
     for label, old_price in prices.items():
         if old_price and old_price > 0:
             change = ((current - old_price) / old_price) * 100
             deltas[label] = round(change, 3)
-    
-    print(f"تحليل {symbol}: {deltas}")
-    
+
+    print(f"🔍 تحليل {symbol}:\n  🔸 السعر الحالي: {current}")
+    for label, change in deltas.items():
+        print(f"  🔸 {label}: {change}% (مقارنة بـ {prices[label]})")
+
     for label, change in deltas.items():
         if (label == "5s" and change >= 0.1) or \
            (label == "10s" and change >= 0.2) or \
            (label == "60s" and change >= 0.5) or \
            (label == "180s" and change >= 1.0):
+            notify_buy(symbol)
             return {
                 "tag": label,
                 "change": change,
@@ -105,6 +117,7 @@ def analyze_symbol(symbol):
             }
 
     return None
+
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
@@ -121,7 +134,8 @@ def collector_loop():
         prices = fetch_all_prices()
         if prices:
             store_prices(prices)
-            print(f"✅ تم تخزين {len(prices)} عملة.")
+            first = list(prices.items())[:3]
+            print(f"✅ تم تخزين {len(prices)} عملة. مثال: {first}")
         time.sleep(FETCH_INTERVAL)
 
 def print_summary():
