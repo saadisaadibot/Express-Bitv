@@ -59,7 +59,13 @@ def get_price_at(symbol, target_time):
     if results:
         return float(results[0][0])
     else:
-        print(f"⚠️ لم يتم العثور على سعر {symbol} في الوقت {target_time}")
+        # fallback: خذ أقرب سعر قبل الوقت المحدد
+        fallback = r.zrevrangebyscore(key, target_time, 0, start=0, num=1, withscores=True)
+        if fallback:
+            print(f"⚠️ استخدام fallback لـ {symbol} عند {target_time} → {fallback[0][1]}")
+            return float(fallback[0][0])
+        else:
+            print(f"⚠️ لا يوجد سعر لـ {symbol} في {target_time}")
     return None
 
 def notify_buy(symbol):
@@ -190,7 +196,14 @@ def telegram_webhook():
 
     return "ok", 200
 
+def clear_old_prices():
+    keys = r.keys("prices:*")
+    for k in keys:
+        r.delete(k)
+    print("🧹 تم حذف جميع الأسعار القديمة من Redis.")
+    
 if __name__ == "__main__":
+    clear_old_prices()  # 🧹 حذف البيانات القديمة عند التشغيل
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=analyzer_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
