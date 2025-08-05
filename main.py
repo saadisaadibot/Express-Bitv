@@ -12,32 +12,13 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
+SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK")
 
-HISTORY_SECONDS = 2 * 60 * 60
+HISTORY_SECONDS = 30 * 60  # 30 دقيقة
 FETCH_INTERVAL = 5
-COOLDOWN = 60
+COOLDOWN = 60  # ثانية لكل عملة
 
-def fetch_all_prices():
-    try:
-        res = requests.get("https://api.bitvavo.com/v2/ticker/price")
-        data = res.json()
-        return {
-            item["market"].replace("-EUR", ""): float(item["price"])
-            for item in data if item["market"].endswith("-EUR")
-        }
-    except Exception as e:
-        print("❌ فشل جلب الأسعار:", e)
-        return {}
-
-def store_prices(prices):
-    now = int(time.time())
-    cutoff = now - HISTORY_SECONDS
-    for symbol, price in prices.items():
-        key = f"prices:{symbol}"
-        r.zadd(key, {price: now})
-        r.zremrangebyscore(key, 0, cutoff)
-
+# 🧠 قراءة السعر من Redis عند زمن معيّن
 def get_price_at(symbol, target_time):
     key = f"prices:{symbol}"
     results = r.zrangebyscore(key, target_time - 2, target_time + 2, withscores=True)
@@ -45,22 +26,27 @@ def get_price_at(symbol, target_time):
         return float(results[0][0])
     return None
 
+# 🚀 إرسال إشارة شراء إلى صقر وتلغرام
 def notify_buy(symbol):
     last_key = f"alerted:{symbol}"
     if r.get(last_key):
         return
     msg = f"اشتري {symbol}"
+    r.set(last_key, "1", ex=COOLDOWN)
+
     try:
-        r.set(last_key, "1", ex=COOLDOWN)
+        # إلى صقر
         requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
+        # إلى تلغرام
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"}
+            data={"chat_id": CHAT_ID, "text": f"🚀 انفجار {symbol}"}
         )
-        print(f"🚀 إشارة شراء: {msg}")
+        print("🚀", msg)
     except Exception as e:
-        print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
+        print(f"❌ فشل إرسال الإشعار لـ {symbol}: {e}")
 
+# 🔍 تحليل عملة واحدة
 def analyze_symbol(symbol):
     now = int(time.time())
     current = get_price_at(symbol, now)
@@ -68,100 +54,105 @@ def analyze_symbol(symbol):
         return
 
     checks = {
-        "5s": get_price_at(symbol, now - 5),
-        "10s": get_price_at(symbol, now - 10),
-        "60s": get_price_at(symbol, now - 60),
-        "180s": get_price_at(symbol, now - 180),
-        "300s": get_price_at(symbol, now - 300),
+        "5s": (now - 5, 2),
+        "10s": (now - 10, 3),
+        "60s": (now - 60, 5),
+        "180s": (now - 180, 8),
+        "300s": (now - 300, 10),
     }
 
-    for label, old_price in checks.items():
-        if not old_price:
+    for label, (past_time, threshold) in checks.items():
+        past = get_price_at(symbol, past_time)
+        if not past:
             continue
-        change = ((current - old_price) / old_price) * 100
-        if label == "5s" and change >= 2:
+        change = ((current - past) / past) * 100
+        if change >= threshold:
             notify_buy(symbol)
-        elif label == "10s" and change >= 3:
-            notify_buy(symbol)
-        elif label == "60s" and change >= 5:
-            notify_buy(symbol)
-        elif label == "180s" and change >= 8:
-            notify_buy(symbol)
-        elif label == "300s" and change >= 10:
-            notify_buy(symbol)
+            break
 
+# 🔁 تحليل مستمر
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
         symbols = [k.decode().split(":")[1] for k in keys]
-        for sym in symbols:
+        for symbol in symbols:
             try:
-                analyze_symbol(sym)
+                analyze_symbol(symbol)
             except Exception as e:
-                print(f"❌ تحليل {sym}:", e)
+                print(f"❌ {symbol}:", e)
         time.sleep(FETCH_INTERVAL)
 
-def collector_loop():
+# 💾 تخزين السعر كل 5 ثواني
+def fetch_and_store_loop():
     while True:
-        prices = fetch_all_prices()
-        if prices:
-            store_prices(prices)
-            print(f"✅ تم تخزين {len(prices)} عملة.")
+        try:
+            res = requests.get("https://api.bitvavo.com/v2/ticker/price")
+            data = res.json()
+            now = int(time.time())
+            cutoff = now - HISTORY_SECONDS
+
+            count = 0
+            for item in data:
+                if item["market"].endswith("-EUR"):
+                    symbol = item["market"].replace("-EUR", "")
+                    price = float(item["price"])
+                    key = f"prices:{symbol}"
+                    r.zadd(key, {price: now})
+                    r.zremrangebyscore(key, 0, cutoff)
+                    count += 1
+
+            print(f"✅ تخزين {count} عملة عند {now}")
+        except Exception as e:
+            print("❌ فشل جلب الأسعار:", e)
+
         time.sleep(FETCH_INTERVAL)
 
-def print_summary():
-    keys = r.keys("prices:*")
-    symbols = [k.decode().split(":")[1] for k in keys]
+# 📊 حساب التغير خلال دقائق
+def get_top_movers(minutes=5, top_n=5):
     now = int(time.time())
-    changes_5min = []
-    changes_10min = []
+    result = []
+    keys = r.keys("prices:*")
+    for key in keys:
+        symbol = key.decode().split(":")[1]
+        current = get_price_at(symbol, now)
+        past = get_price_at(symbol, now - minutes * 60)
+        if current and past:
+            change = ((current - past) / past) * 100
+            result.append((symbol, round(change, 2)))
+    result.sort(key=lambda x: x[1], reverse=True)
+    return result[:top_n]
 
-    for sym in symbols:
-        current = get_price_at(sym, now)
-        ago_5 = get_price_at(sym, now - 300)
-        ago_10 = get_price_at(sym, now - 600)
-
-        if current and ago_5:
-            change = ((current - ago_5) / ago_5) * 100
-            changes_5min.append((sym, round(change, 2)))
-
-        if current and ago_10:
-            change = ((current - ago_10) / ago_10) * 100
-            changes_10min.append((sym, round(change, 2)))
-
-    top5_5m = sorted(changes_5min, key=lambda x: x[1], reverse=True)[:5]
-    top5_10m = sorted(changes_10min, key=lambda x: x[1], reverse=True)[:5]
-
-    text = f"🧠 عدد العملات المخزنة: {len(symbols)}\n\n"
-    text += "📈 أعلى 5 خلال 5 دقائق:\n"
-    for sym, ch in top5_5m:
-        text += f"- {sym}: {ch:.2f}%\n"
-    text += "\n📈 أعلى 5 خلال 10 دقائق:\n"
-    for sym, ch in top5_10m:
-        text += f"- {sym}: {ch:.2f}%\n"
-
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text}
-    )
-
-@app.route("/")
-def home():
-    return "Sniper bot is alive ✅"
-
+# 📩 أمر /السجل من تلغرام
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.json
-    if "message" not in data:
-        return "no message", 200
-
-    text = data["message"].get("text", "").strip().lower()
+    message = data.get("message", {})
+    text = message.get("text", "").lower()
     if "السجل" in text:
-        print_summary()
+        total = len(r.keys("prices:*"))
+        movers_5 = get_top_movers(5)
+        movers_10 = get_top_movers(10)
 
-    return "ok", 200
+        response = f"📊 العملات المخزنة: {total}\n"
+        response += "\n🔥 أفضل 5 خلال 5 دقائق:\n"
+        for sym, ch in movers_5:
+            response += f"- {sym}: {ch:.2f}%\n"
+        response += "\n⚡️ أفضل 5 خلال 10 دقائق:\n"
+        for sym, ch in movers_10:
+            response += f"- {sym}: {ch:.2f}%\n"
 
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": response}
+            )
+        except Exception as e:
+            print("❌ فشل إرسال السجل:", e)
+
+    return "OK", 200
+
+# 🚀 التشغيل
 if __name__ == "__main__":
-    threading.Thread(target=collector_loop, daemon=True).start()
+    threading.Thread(target=fetch_and_store_loop, daemon=True).start()
     threading.Thread(target=analyzer_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=8000)
