@@ -81,7 +81,6 @@ def analyze_symbol(symbol):
             change = ((current - past) / past) * 100
             deltas[sec] = round(change, 3)
 
-    print(f"🔍 تحليل {symbol}: 🟧 السعر الحالي: {current}")
     for sec, change in deltas.items():
         print(f"⏱️ {sec}s: {change}% (مقارنة بـ {get_price_at(symbol, sec)})")
 
