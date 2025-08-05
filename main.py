@@ -92,7 +92,7 @@ def detect_explosions():
         time.sleep(60)
 
 def fetch_top_bitvavo():
-    symbols = list(fetch_bitvavo_symbols())
+    symbols = ["BTC", "ETH", "ADA", "XRP", "LINK", "DOGE"]
     changes = {}
 
     def fetch_change(symbol, interval):
@@ -100,18 +100,33 @@ def fetch_top_bitvavo():
             pair = f"{symbol}-EUR"
             url = f"https://api.bitvavo.com/v2/candles/{pair}/{interval}?limit=2"
             res = requests.get(url, timeout=3)
-            data = res.json()
-            if len(data) < 2:
-                print(f"⛔ {symbol}: شموع {interval} غير كافية.")
+
+            if not res.content or res.status_code != 200:
+                print(f"⛔ {symbol}: لا يوجد بيانات")
                 return None
+
+            data = res.json()
+            if not isinstance(data, list) or len(data) < 2:
+                print(f"⛔ {symbol}: شموع غير كافية")
+                return None
+
             open_price = float(data[-2][1])
             close_price = float(data[-2][4])
             change = ((close_price - open_price) / open_price) * 100
-            print(f"✅ {symbol}: تغيير {change:.2f}% في {interval}")
+            print(f"✅ {symbol}: تغيير {change:.2f}%")
             return (symbol, change)
+
         except Exception as e:
-            print(f"❌ {symbol}: فشل تحليل {interval}:", e)
+            print(f"❌ {symbol}: فشل التحليل:", e)
             return None
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        results = ex.map(lambda s: fetch_change(s, "5m"), symbols)
+        for res in results:
+            if res:
+                changes[res[0]] = res[1]
+
+    return sorted(changes.keys(), key=lambda x: changes[x], reverse=True)
 
     def collect(interval, count):
         local = []
