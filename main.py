@@ -6,6 +6,8 @@ import requests
 import threading
 from flask import Flask, request, jsonify
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+load_dotenv()
 
 app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
@@ -28,21 +30,26 @@ def fetch_bitvavo_symbols():
         res = requests.get("https://api.bitvavo.com/v2/markets")
         data = res.json()
         return set(m["market"].replace("-EUR", "").upper() for m in data if m["market"].endswith("-EUR"))
-    except:
+    except Exception as e:
+        print("❌ فشل في جلب الرموز:", e)
         return set()
 
 def get_change(symbol, minutes):
     try:
-        url = f"https://api.bitvavo.com/v2/candles/{symbol}-EUR/1m?limit={minutes+1}"
+        pair = f"{symbol}-EUR"
+        url = f"https://api.bitvavo.com/v2/candles/{pair}/1m?limit={minutes+1}"
         res = requests.get(url, timeout=3)
         data = res.json()
         if len(data) < minutes + 1:
+            print(f"⛔ {symbol}: عدد الشموع غير كافِ ({len(data)})")
             return None
         open_price = float(data[0][1])
         close_price = float(data[-1][4])
         change = ((close_price - open_price) / open_price) * 100
+        print(f"📈 {symbol}: تغيير {change:.2f}% خلال {minutes} دقيقة")
         return round(change, 2)
-    except:
+    except Exception as e:
+        print(f"❌ خطأ أثناء تحليل {symbol}: {e}")
         return None
 
 def detect_explosions():
@@ -77,16 +84,20 @@ def fetch_top_bitvavo():
 
     def fetch_change(symbol, interval):
         try:
-            url = f"https://api.bitvavo.com/v2/candles/{symbol}-EUR/{interval}?limit=2"
+            pair = f"{symbol}-EUR"
+            url = f"https://api.bitvavo.com/v2/candles/{pair}/{interval}?limit=2"
             res = requests.get(url, timeout=3)
             data = res.json()
             if len(data) < 2:
+                print(f"⛔ {symbol}: شموع {interval} غير كافية.")
                 return None
             open_price = float(data[-2][1])
             close_price = float(data[-2][4])
             change = ((close_price - open_price) / open_price) * 100
+            print(f"✅ {symbol}: تغيير {change:.2f}% في {interval}")
             return (symbol, change)
-        except:
+        except Exception as e:
+            print(f"❌ {symbol}: فشل تحليل {interval}:", e)
             return None
 
     def collect(interval, count):
@@ -101,9 +112,9 @@ def fetch_top_bitvavo():
         for sym, chg in top:
             changes[sym] = chg
 
-    collect("15m", 20)
-    collect("10m", 20)
-    collect("5m", 20)
+    collect("15m", 10)
+    collect("10m", 10)
+    collect("5m", 10)
 
     return sorted(changes.keys(), key=lambda x: changes[x], reverse=True)
 
