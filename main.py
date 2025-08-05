@@ -58,6 +58,8 @@ def get_price_at(symbol, target_time):
     results = r.zrangebyscore(key, target_time - 3, target_time + 3, withscores=True)
     if results:
         return float(results[0][0])
+    else:
+        print(f"⚠️ لم يتم العثور على سعر {symbol} في الوقت {target_time}")
     return None
 
 def notify_buy(symbol):
@@ -83,17 +85,23 @@ def analyze_symbol(symbol):
         return
 
     checks = {
-        "5s": get_price_at(symbol, now - 5),
-        "10s": get_price_at(symbol, now - 10),
-        "60s": get_price_at(symbol, now - 60),
-        "180s": get_price_at(symbol, now - 180),
-        "300s": get_price_at(symbol, now - 300),
+        "5s": now - 5,
+        "10s": now - 10,
+        "60s": now - 60,
+        "180s": now - 180,
+        "300s": now - 300,
     }
 
-    for label, old_price in checks.items():
+    for label, ts in checks.items():
+        old_price = get_price_at(symbol, ts)
         if not old_price:
+            print(f"❌ {symbol}: لا يوجد سعر في {label} (target={ts})")
             continue
+
+        diff_sec = now - ts
         change = ((current - old_price) / old_price) * 100
+        print(f"🔍 {symbol}: {label} | الآن={current:.6f}, قبل={old_price:.6f}, تغير={change:.2f}% خلال {diff_sec}ث")
+
         if label == "5s" and change >= 2:
             notify_buy(symbol)
         elif label == "10s" and change >= 3:
@@ -136,8 +144,6 @@ def print_summary():
         ago_5 = get_price_at(sym, now - 300)
         ago_10 = get_price_at(sym, now - 600)
 
-        print(f"{sym}: الآن={current}, قبل 5د={ago_5}, قبل 10د={ago_10}")
-        
         if current and ago_5:
             change = ((current - ago_5) / ago_5) * 100
             changes_5min.append((sym, round(change, 2)))
@@ -145,7 +151,10 @@ def print_summary():
         if current and ago_10:
             change = ((current - ago_10) / ago_10) * 100
             changes_10min.append((sym, round(change, 2)))
-            
+        
+        # طباعة للتحقق
+        print(f"📊 {sym}: الآن={current}, قبل5د={ago_5}, قبل10د={ago_10}")
+
     top5_5m = sorted(changes_5min, key=lambda x: x[1], reverse=True)[:5]
     top5_10m = sorted(changes_10min, key=lambda x: x[1], reverse=True)[:5]
 
@@ -157,10 +166,13 @@ def print_summary():
     for sym, ch in top5_10m:
         text += f"- {sym}: {ch:.2f}%\n"
 
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text}
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text}
+        )
+    except Exception as e:
+        print("❌ فشل إرسال السجل:", e)
 
 @app.route("/")
 def home():
