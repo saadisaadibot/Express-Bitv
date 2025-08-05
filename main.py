@@ -74,8 +74,7 @@ def analyze_symbol(symbol):
 
     deltas = {}
     intervals = [5, 10, 60, 180, 300]
-    thresholds = {5: 0.1, 10: 0.2, 60: 0.5, 180: 1.0, 300: 1.5}
-
+    thresholds = {5: 2.0, 10: 3.0, 60: 4.0}
     for sec in intervals:
         past = get_price_at(symbol, sec)
         if past and past > 0:
