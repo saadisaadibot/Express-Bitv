@@ -13,11 +13,12 @@ r = redis.from_url(os.getenv("REDIS_URL"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/"
-HISTORY_SECONDS = 20 * 60      # ⏳ احتفاظ بالبيانات 20 دقيقة
-FETCH_INTERVAL = 30            # ⏱️ تخزين كل 30 ثانية
-COOLDOWN = 60                  # 🧊 تجميد الإشعارات
 
-# 🔁 جلب الأسعار
+HISTORY_SECONDS = 20 * 60
+FETCH_INTERVAL = 30
+COOLDOWN = 60
+
+# ✅ جلب الأسعار من Bitvavo
 def fetch_all_prices():
     try:
         res = requests.get("https://api.bitvavo.com/v2/ticker/price")
@@ -30,39 +31,40 @@ def fetch_all_prices():
         print("❌ فشل جلب الأسعار:", e)
         return {}
 
-# 💾 تخزين الأسعار في Redis
+# ✅ تخزين الأسعار بشكل فريد
 def store_prices(prices):
     now = int(time.time())
     cutoff = now - HISTORY_SECONDS
     for symbol, price in prices.items():
         key = f"prices:{symbol}"
-        r.zadd(key, {price: now})
+        unique_price = f"{price}-{now}"  # يضمن التفرد
+        r.zadd(key, {unique_price: now})
         r.zremrangebyscore(key, 0, cutoff)
     print(f"✅ تم تخزين {len(prices)} عملة.")
 
-# 📦 جلب سعر قديم
+# ✅ جلب سعر قديم
 def get_price_at(symbol, seconds_ago):
     target = int(time.time()) - seconds_ago
     key = f"prices:{symbol}"
     result = r.zrangebyscore(key, target - 2, target + 2, withscores=False)
     if result:
-        return float(result[0])
+        return float(result[0].decode().split("-")[0])
     return None
 
-# 🚨 إشعار شراء
+# 🚨 إرسال إشارة شراء
 def notify_buy(symbol, percent, tag):
-    last_key = f"alerted:{symbol}"
-    if r.get(last_key):
+    key = f"alerted:{symbol}"
+    if r.get(key):
         return
-    r.set(last_key, "1", ex=COOLDOWN)
-    msg = f"اشتري {symbol}"
+    r.set(key, "1", ex=COOLDOWN)
 
+    msg = f"اشتري {symbol}"
     try:
-        # إلى صقر
+        # صقر
         saqar = requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
         print(">> صقر:", saqar.status_code, saqar.text)
 
-        # إلى تلغرام
+        # تلغرام
         text = f"🚀 {msg} (+{percent:.2f}%) #{tag}"
         tg = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": text})
@@ -70,14 +72,13 @@ def notify_buy(symbol, percent, tag):
     except Exception as e:
         print("❌ فشل إرسال الإشارة:", e)
 
-# 🔍 تحليل عملة
+# ✅ تحليل عملة واحدة
 def analyze_symbol(symbol):
     current = get_price_at(symbol, 0)
     if not current or current == 0:
         return
 
     checks = [(30, 0.1), (60, 3.0), (120, 4.0)]
-
     for sec, threshold in checks:
         past = get_price_at(symbol, sec)
         if past and past > 0:
@@ -87,7 +88,7 @@ def analyze_symbol(symbol):
                 notify_buy(symbol, change, sec)
                 break
 
-# 🧠 تحليل كل العملات
+# 🔁 تحليل كل العملات
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
@@ -99,7 +100,7 @@ def analyzer_loop():
                 print(f"❌ تحليل {sym}:", e)
         time.sleep(FETCH_INTERVAL)
 
-# ⏺️ تخزين كل الأسعار
+# 🔁 تخزين دوري للأسعار
 def collector_loop():
     while True:
         prices = fetch_all_prices()
@@ -107,11 +108,10 @@ def collector_loop():
             store_prices(prices)
         time.sleep(FETCH_INTERVAL)
 
-# 📊 سجل أفضل العملات
+# 📊 عرض السجل
 def print_summary():
     keys = r.keys("prices:*")
     symbols = [k.decode().split(":")[1] for k in keys]
-    now = int(time.time())
     changes_5min = []
     changes_10min = []
 
@@ -123,7 +123,6 @@ def print_summary():
         if current and ago_5:
             change = ((current - ago_5) / ago_5) * 100
             changes_5min.append((sym, round(change, 2)))
-
         if current and ago_10:
             change = ((current - ago_10) / ago_10) * 100
             changes_10min.append((sym, round(change, 2)))
@@ -142,7 +141,7 @@ def print_summary():
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data={"chat_id": CHAT_ID, "text": text})
 
-# 🚀 نقطة البداية + Webhook
+# 🛰️ Webhook تلغرام
 @app.route("/")
 def home():
     return "Sniper bot is alive ✅"
@@ -158,13 +157,14 @@ def telegram_webhook():
         print_summary()
     return "ok", 200
 
+# 🚀 تشغيل الخيوط
 if __name__ == "__main__":
-    # 🧹 تنظيف البيانات القديمة فقط
+    # 🧹 حذف البيانات القديمة
     for key in r.scan_iter("prices:*"):
         r.delete(key)
     for key in r.scan_iter("alerted:*"):
         r.delete(key)
-    print("🧹 تم حذف أسعار العملات والإشعارات السابقة من Redis.")
+    print("🧹 تم حذف بيانات Redis القديمة")
 
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=analyzer_loop, daemon=True).start()
