@@ -55,7 +55,7 @@ def store_prices_threaded(prices):
 
 def get_price_at(symbol, target_time):
     key = f"prices:{symbol}"
-    results = r.zrangebyscore(key, target_time - 2, target_time + 2, withscores=True)
+    results = r.zrangebyscore(key, target_time - 3, target_time + 3, withscores=True)
     if results:
         return float(results[0][0])
     return None
@@ -136,6 +136,8 @@ def print_summary():
         ago_5 = get_price_at(sym, now - 300)
         ago_10 = get_price_at(sym, now - 600)
 
+        print(f"{sym}: الآن={current}, قبل 5د={ago_5}, قبل 10د={ago_10}")
+        
         if current and ago_5:
             change = ((current - ago_5) / ago_5) * 100
             changes_5min.append((sym, round(change, 2)))
@@ -143,7 +145,7 @@ def print_summary():
         if current and ago_10:
             change = ((current - ago_10) / ago_10) * 100
             changes_10min.append((sym, round(change, 2)))
-
+            
     top5_5m = sorted(changes_5min, key=lambda x: x[1], reverse=True)[:5]
     top5_10m = sorted(changes_10min, key=lambda x: x[1], reverse=True)[:5]
 
