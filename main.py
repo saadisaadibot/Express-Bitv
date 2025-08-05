@@ -79,7 +79,7 @@ def analyze_symbol(symbol):
         if not old_price:
             continue
         change = ((current - old_price) / old_price) * 100
-        if label == "5s" and change >= 2:
+        if label == "5s" and change >= 0.1:
             notify_buy(symbol)
         elif label == "10s" and change >= 3:
             notify_buy(symbol)
