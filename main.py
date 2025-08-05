@@ -3,20 +3,21 @@ import time
 import redis
 import requests
 import threading
+from flask import Flask, request
 from dotenv import load_dotenv
 
 load_dotenv()
+app = Flask(__name__)
 r = redis.from_url(os.getenv("REDIS_URL"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SAQAR_WEBHOOK = "https://saadisaadibot-saqarxbo-production.up.railway.app/webhook"
 
-HISTORY_SECONDS = 2 * 60 * 60  # ساعتين
-FETCH_INTERVAL = 5  # كل 5 ثواني
-COOLDOWN = 60  # لا تكرار إشارة خلال دقيقة
+HISTORY_SECONDS = 2 * 60 * 60
+FETCH_INTERVAL = 5
+COOLDOWN = 60
 
-# 🟢 جلب جميع الأسعار من Bitvavo
 def fetch_all_prices():
     try:
         res = requests.get("https://api.bitvavo.com/v2/ticker/price")
@@ -29,7 +30,6 @@ def fetch_all_prices():
         print("❌ فشل جلب الأسعار:", e)
         return {}
 
-# 💾 تخزين السعر في Redis مع الحذف التلقائي
 def store_prices(prices):
     now = int(time.time())
     cutoff = now - HISTORY_SECONDS
@@ -38,7 +38,6 @@ def store_prices(prices):
         r.zadd(key, {price: now})
         r.zremrangebyscore(key, 0, cutoff)
 
-# 🧠 استرجاع السعر عند زمن معين
 def get_price_at(symbol, target_time):
     key = f"prices:{symbol}"
     results = r.zrangebyscore(key, target_time - 2, target_time + 2, withscores=True)
@@ -46,7 +45,6 @@ def get_price_at(symbol, target_time):
         return float(results[0][0])
     return None
 
-# 🚀 إرسال إشارة شراء إلى صقر وإلى تلغرام
 def notify_buy(symbol):
     last_key = f"alerted:{symbol}"
     if r.get(last_key):
@@ -54,9 +52,7 @@ def notify_buy(symbol):
     msg = f"اشتري {symbol}"
     try:
         r.set(last_key, "1", ex=COOLDOWN)
-        # إشعار إلى صقر
         requests.post(SAQAR_WEBHOOK, json={"message": {"text": msg}})
-        # إشعار إلى تلغرام مباشر
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": f"🚀 إشارة شراء: {msg}"}
@@ -65,7 +61,6 @@ def notify_buy(symbol):
     except Exception as e:
         print(f"❌ فشل إرسال الإشارة لـ {symbol}:", e)
 
-# 🔍 تحليل عملة واحدة
 def analyze_symbol(symbol):
     now = int(time.time())
     current = get_price_at(symbol, now)
@@ -95,7 +90,6 @@ def analyze_symbol(symbol):
         elif label == "300s" and change >= 10:
             notify_buy(symbol)
 
-# 🧠 خيط التحليل المستمر
 def analyzer_loop():
     while True:
         keys = r.keys("prices:*")
@@ -107,7 +101,6 @@ def analyzer_loop():
                 print(f"❌ تحليل {sym}:", e)
         time.sleep(FETCH_INTERVAL)
 
-# 🔄 خيط التخزين المستمر
 def collector_loop():
     while True:
         prices = fetch_all_prices()
@@ -116,7 +109,6 @@ def collector_loop():
             print(f"✅ تم تخزين {len(prices)} عملة.")
         time.sleep(FETCH_INTERVAL)
 
-# 📊 أمر السجل - يطبع عدد العملات وأقوى العملات آخر 5 و10 دقائق
 def print_summary():
     keys = r.keys("prices:*")
     symbols = [k.decode().split(":")[1] for k in keys]
@@ -148,20 +140,28 @@ def print_summary():
     for sym, ch in top5_10m:
         text += f"- {sym}: {ch:.2f}%\n"
 
-    # إرسال التقرير لتلغرام
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         data={"chat_id": CHAT_ID, "text": text}
     )
 
-# 🚀 التشغيل
+@app.route("/")
+def home():
+    return "Sniper bot is alive ✅"
+
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.json
+    if "message" not in data:
+        return "no message", 200
+
+    text = data["message"].get("text", "").strip().lower()
+    if "السجل" in text:
+        print_summary()
+
+    return "ok", 200
+
 if __name__ == "__main__":
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=analyzer_loop, daemon=True).start()
-
-    # مراقبة الأوامر من الكيبورد (محلي فقط)
-    while True:
-        cmd = input(">> ").strip().lower()
-        if cmd == "السجل":
-            print_summary()
-        time.sleep(1)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
