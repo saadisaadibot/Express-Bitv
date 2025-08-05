@@ -203,7 +203,14 @@ def clear_old_prices():
     print("🧹 تم حذف جميع الأسعار القديمة من Redis.")
     
 if __name__ == "__main__":
-    clear_old_prices()  # 🧹 حذف البيانات القديمة عند التشغيل
+    clear_old_prices()  # 🧹 حذف البيانات القديمة
+
     threading.Thread(target=collector_loop, daemon=True).start()
+
+    # ⏳ انتظر أول دفعة أسعار قبل بدء التحليل
+    while not r.keys("prices:*"):
+        print("⏳ في انتظار أول دفعة أسعار...")
+        time.sleep(1)
+
     threading.Thread(target=analyzer_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
