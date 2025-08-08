@@ -236,10 +236,19 @@ def monitor_loop():
             time.sleep(SCAN_INTERVAL)
 
 # ============== Webhook (اختياري للأوامر) ==============
+# ============== Webhook (اختياري للأوامر) ==============
 @app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json or {}
-    txt = (data.get("message", {}).get("text") or "").strip().lower()
+    try:
+        data = request.get_json(silent=True) or {}
+        txt = (data.get("message", {}).get("text") or "").strip().lower()
+    except Exception as e:
+        print("⚠️ Webhook parse error:", e)
+        return "ok", 200  # رجّع 200 حتى ما يعتبره تيليجرام فشل
+
+    # ... باقي منطق الأوامر ...
+    return "ok", 200
 
     if txt == "السجل":
         top_list = list(watch_topset)[:TOP_N]
