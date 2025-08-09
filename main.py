@@ -18,7 +18,7 @@ SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة 
 THREADS            = int(os.getenv("THREADS", 32))               # لدفعات التجميع
 
 TOP_PER_TF         = int(os.getenv("TOP_PER_TF", 5))             # Top من كل فريم (5m/15m/30m/1h)
-MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 10000))      # حد سيولة يومية
+MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 1000))      # حد سيولة يومية
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد 5 دقائق لكل عملة
 STEP_WINDOW_SEC    = int(os.getenv("STEP_WINDOW_SEC", 180))      # نافذة نمط 1%+1%
 STEP_PCT           = float(os.getenv("STEP_PCT", 1.0))           # كل خطوة 1%
