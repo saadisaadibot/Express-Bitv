@@ -12,7 +12,7 @@ from datetime import datetime
 BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # 15 دقيقة
 ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # 3 ساعات
 TOP_MERGED         = int(os.getenv("TOP_MERGED", 20))            # توب 20 للغرفة
-SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة كل 5 ثواني
+SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة كل 5 ثوانٍ
 CANDLE_TIMEOUT     = int(os.getenv("CANDLE_TIMEOUT", 10))
 TICKER_TIMEOUT     = int(os.getenv("TICKER_TIMEOUT", 6))
 THREADS            = int(os.getenv("THREADS", 32))               # توازي دفعة الشموع
@@ -54,6 +54,7 @@ KEY_24H_CACHE     = f"{NS}:24h"                         # كاش سيولة 24h
 # =========================
 price_hist    = defaultdict(lambda: deque(maxlen=360))  # (ts, price) كل 5ث ≈ 30د
 metrics_cache = {}  # sym -> {"ts":..., "ch5":..., "spike":..., "close":..., "high30":...}
+_bg_started   = False  # لمنع تشغيل الخيوط مرتين
 
 # =========================
 # 📮 مراسلة
@@ -401,21 +402,23 @@ def webhook():
         return "ok", 200
 
 # =========================
-# 🚀 تشغيل الخلفيات تحت Gunicorn/Flask
+# 🚀 تشغيل الخلفيات بطريقة آمنة (Flask 2.3+/Gunicorn)
 # =========================
 def start_background():
-    if getattr(app, "_bg_started", False):
+    global _bg_started
+    if _bg_started:
         return
-    app._bg_started = True
+    _bg_started = True
     Thread(target=batch_loop, daemon=True).start()
     Thread(target=monitor_room, daemon=True).start()
+    print("Background loops started.")
 
-@app.before_first_request
-def _kickoff():
+# شغّل الخيوط فور استيراد التطبيق (يعمل مع Gunicorn/Procfile)
+if os.getenv("DISABLE_AUTO_START", "0") != "1":
     start_background()
 
 # للتطوير المحلي فقط
 if __name__ == "__main__":
-    start_background()
+    # عند التشغيل المحلي، الخيوط شغّالة أصلاً من start_background()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
