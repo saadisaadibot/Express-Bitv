@@ -382,27 +382,27 @@ def webhook():
         if txt in ("ابدأ","start"):
             start_background(); tg("✅ تم تشغيل غرفة العمليات.")
         elif txt in ("السجل","log"):
-        syms = room_members()
-        rows = []
-        now = int(time.time())
-        for s in syms:
-            d = r.hgetall(KEY_COIN_HASH(s))
-            pts = float(d.get(b"pts", b"0").decode() or "0")
-            seq = int(d.get(b"seq", b"0").decode() or "0")
-            last_add = int(d.get(b"last_pts_add", b"0").decode() or "0")
-            last_ts  = int(d.get(b"last_pts_ts", b"0").decode() or "0")
-            recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)  # اعتبرها “دفعة حالية”
-            rows.append((s, pts, seq, last_add, recent))
+            syms = room_members()
+            rows = []
+            now = int(time.time())
+            for s in syms:
+                d = r.hgetall(KEY_COIN_HASH(s))
+                pts = float(d.get(b"pts", b"0").decode() or "0")
+                seq = int(d.get(b"seq", b"0").decode() or "0")
+                last_add = int(d.get(b"last_pts_add", b"0").decode() or "0")
+                last_ts  = int(d.get(b"last_pts_ts", b"0").decode() or "0")
+                recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)  # اعتبرها “دفعة حالية”
+                rows.append((s, pts, seq, last_add, recent))
 
     # رتّب بالنقاط نزولاً
-        rows.sort(key=lambda x: x[1], reverse=True)
+            rows.sort(key=lambda x: x[1], reverse=True)
 
-        lines = [f"📊 مراقبة {len(rows)} عملة:"]
-        for i,(s,pts,seq,last_add,recent) in enumerate(rows, start=1):
-            flag = " 🆕" if recent and last_add > 0 else ""
-            delta = f" +{last_add}" if last_add > 0 else ""
-            lines.append(f"{i}. {s} / {int(round(pts))} نقاط  [#{seq}{delta}]{flag}")
-        tg("\n".join(lines))
+            lines = [f"📊 مراقبة {len(rows)} عملة:"]
+            for i,(s,pts,seq,last_add,recent) in enumerate(rows, start=1):
+                flag = " 🆕" if recent and last_add > 0 else ""
+                delta = f" +{last_add}" if last_add > 0 else ""
+                lines.append(f"{i}. {s} / {int(round(pts))} نقاط  [#{seq}{delta}]{flag}")
+            tg("\n".join(lines))
         elif txt in ("مسح","reset"):
             _do_reset(full=True); tg("🧹 تم مسح الغرفة والكاش.")
         return "ok", 200
