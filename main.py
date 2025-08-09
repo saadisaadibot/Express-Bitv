@@ -204,32 +204,41 @@ def room_members():
 # =========================
 def batch_collect():
     try:
-        markets = r.get(KEY_MARKETS_CACHE)
-        if markets: markets = json.loads(markets)
+        # أسواق EUR (كاش ساعة)
+        markets_b = r.get(KEY_MARKETS_CACHE)
+        if markets_b:
+            markets = json.loads(markets_b.decode() if isinstance(markets_b, (bytes, bytearray)) else markets_b)
         else:
             markets = get_markets_eur()
             r.setex(KEY_MARKETS_CACHE, 3600, json.dumps(markets))
 
-        vol24 = r.get(KEY_24H_CACHE)
-        if vol24: vol24 = json.loads(vol24)
+        # سيولة 24h (كاش 5 د)
+        vol24_b = r.get(KEY_24H_CACHE)
+        if vol24_b:
+            vol24 = json.loads(vol24_b.decode() if isinstance(vol24_b, (bytes, bytearray)) else vol24_b)
         else:
             vol24 = get_24h_stats_eur()
-            r.setex(KEY_24H_CACHE, 300, json.dumps(vol24))  # كل 5 دقائق
+            r.setex(KEY_24H_CACHE, 300, json.dumps(vol24))
 
-        # جلب شموع 1m/60 لكل زوج (دفعات)
+        vol_filter_active = bool(vol24)  # لو فاضية لا نفلتر
+
         def fetch_one(market):
             c = get_candles_1m(market, limit=60)
             d = changes_from_1m(c)
-            if not d: return None
-            if vol24.get(market, 0.0) < MIN_24H_EUR: return None
+            if not d:
+                return None
+            if vol_filter_active and vol24.get(market, 0.0) < MIN_24H_EUR:
+                return None
             return market, d
 
         rows = []
         with ThreadPoolExecutor(max_workers=THREADS) as ex:
             for res in ex.map(fetch_one, markets):
                 if res: rows.append(res)
+
         if not rows:
-            print("batch_collect: no rows"); return
+            print(f"batch_collect: no rows (markets={len(markets)}, vol24={'ok' if vol_filter_active else 'empty'})")
+            return
 
         # ترتيب Top5 لكل فريم
         ranks = {"5m":[], "15m":[], "30m":[], "1h":[]}
@@ -242,18 +251,18 @@ def batch_collect():
             ranks[k].sort(key=lambda x: x[1], reverse=True)
             ranks[k] = ranks[k][:TOP_PER_TF]
 
-        # حساب "النقاط" = عدد الفريمات التي ظهرت فيها العملة (1–4)
-        points = defaultdict(int)  # sym -> pts
-        pick_map = {}              # sym -> (market, d) لأخذ سعر الدخول
-        for tf, arr in ranks.items():
+        # نقاط = عدد الفريمات التي ظهرت فيها العملة
+        from collections import defaultdict
+        points = defaultdict(int)
+        pick_map = {}
+        for arr in ranks.values():
             for market, _, d in arr:
-                sym = market.replace("-EUR", "")
+                sym = market.replace("-EUR","")
                 points[sym] += 1
                 pick_map.setdefault(sym, (market, d))
 
         merged_syms = list(points.keys())
 
-        # إدخال المرشحين للغرفة مع النقاط
         for sym in merged_syms:
             mkt, d = pick_map[sym]
             entry_price = get_ticker_price(mkt) or d["close"]
