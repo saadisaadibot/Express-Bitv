@@ -12,13 +12,13 @@ load_dotenv()
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # كل 15 دقيقة نجمع المرشحين
+BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 300))   # كل 15 دقيقة نجمع المرشحين
 ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # المرشح يبقى 3 ساعات
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة الغرفة كل 5 ثوانٍ
 THREADS            = int(os.getenv("THREADS", 32))               # لدفعات التجميع
 
 TOP_PER_TF         = int(os.getenv("TOP_PER_TF", 5))             # Top من كل فريم (5m/15m/30m/1h)
-MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 1000))      # حد سيولة يومية
+MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 3000))      # حد سيولة يومية
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد 5 دقائق لكل عملة
 STEP_WINDOW_SEC    = int(os.getenv("STEP_WINDOW_SEC", 180))      # نافذة نمط 1%+1%
 STEP_PCT           = float(os.getenv("STEP_PCT", 1.0))           # كل خطوة 1%
