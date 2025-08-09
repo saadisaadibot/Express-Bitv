@@ -235,35 +235,46 @@ def monitor_loop():
             print("monitor error:", e)
             time.sleep(SCAN_INTERVAL)
 
-# ============== Webhook (اختياري للأوامر) ==============
+# ============== Healthcheck ==============
+@app.route("/", methods=["GET"])
+def alive():
+    return "Nems bot is alive ✅", 200
+
+# ============== Webhook (تيليجرام) ==============
+# استقبل "/" و "/webhook" لتفادي عدم التطابق
+@app.route("/webhook", methods=["POST"])
 @app.route("/", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
         txt = (data.get("message", {}).get("text") or "").strip().lower()
+
+        if not txt:
+            return "ok", 200
+
+        if txt == "السجل":
+            top_list = list(watch_topset)[:TOP_N]
+            lines = [f"📈 مراقبة Top{TOP_N} 5m:"]
+            for m in top_list:
+                ch, p, vsp = compute_5m_change(m)
+                if ch is None:
+                    continue
+                lines.append(f"- {m}: {ch:+.2f}% | €{p:.5f} | spike≈{vsp:.1f}x")
+            send_telegram("\n".join(lines))
+            return "ok", 200
+
+        elif txt.startswith("ابدأ"):
+            Thread(target=monitor_loop, daemon=True).start()
+            send_telegram("✅ تم تشغيل مراقبة التريند المبكر.")
+            return "ok", 200
+
+        # أوامر أخرى...
+        return "ok", 200
+
     except Exception as e:
-        print("⚠️ Webhook parse error:", e)
-        return "ok", 200  # رجّع 200 حتى ما يعتبره تيليجرام فشل
-
-    # ... باقي منطق الأوامر ...
-    return "ok", 200
-
-    if txt == "السجل":
-        top_list = list(watch_topset)[:TOP_N]
-        lines = ["📈 مراقبة Top{} 5m:".format(TOP_N)]
-        for m in top_list:
-            ch, p, vsp = compute_5m_change(m)
-            if ch is None: continue
-            lines.append(f"- {m}: {ch:+.2f}% | €{p:.5f} | spike≈{vsp:.1f}x")
-        send_telegram("\n".join(lines))
+        print("⚠️ Webhook error:", e)
+        # نرجّع 200 حتى ما يعتبره تيليجرام فشل
         return "ok", 200
-
-    elif txt.startswith("ابدأ"):
-        Thread(target=monitor_loop, daemon=True).start()
-        send_telegram("✅ تم تشغيل مراقبة التريند المبكر.")
-        return "ok", 200
-
-    return "ok", 200
 
 # ============== تشغيل ==============
 if __name__ == "__main__":
