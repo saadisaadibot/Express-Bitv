@@ -1,83 +1,78 @@
 # -*- coding: utf-8 -*-
 import os, time, json, math, requests, redis
 from flask import Flask, request
-from collections import deque, defaultdict
 from threading import Thread, Lock
-from dotenv import load_dotenv
-
-load_dotenv()
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque, defaultdict
+from datetime import datetime
 
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 10))     # كل كم ثانية نفحص
-TOP_N_PREWATCH       = int(os.getenv("TOP_N_PREWATCH", 25))    # حجم مجموعة المراقبة المبدئية (5m)
-VOL_SPIKE_MULT       = float(os.getenv("VOL_SPIKE_MULT", 1.4)) # مضاعفة حجم الدقيقة
-MIN_DAILY_EUR        = float(os.getenv("MIN_DAILY_EUR", 10000))# حد أدنى لقيمة تداول يومية €
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 360)) # منع تكرار الإشعار لنفس العملة
-RANK_JUMP_STEPS      = int(os.getenv("RANK_JUMP_STEPS", 15))   # قفزة ترتيب مطلوبة
-RANK_REFRESH_SEC     = int(os.getenv("RANK_REFRESH_SEC", 30))  # كل كم ثانية نعيد حساب ترتيب السوق
-STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))  # نافذة نمط السلّم
-STEP_PCT             = float(os.getenv("STEP_PCT", 0.8))       # حجم كل خطوة في السلّم %
-STEP_BACKDRIFT       = float(os.getenv("STEP_BACKDRIFT", 0.3)) # السماح بهبوط عكسي بين الخطوتين %
-BREAKOUT_LOOKBACK_M  = int(os.getenv("BREAKOUT_LOOKBACK_M", 10))# قمة محلية: آخر N دقائق
-BREAKOUT_BUFFER_PCT  = float(os.getenv("BREAKOUT_BUFFER_PCT", 0.7)) # تجاوز القمة %
+BATCH_INTERVAL_SEC    = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # كل 15 دقيقة نجمع المرشحين
+ROOM_TTL_SEC          = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # المرشح يبقى 3 ساعات
+TOP_MERGED            = int(os.getenv("TOP_MERGED", 20))            # عدد المرشحين لدخول الغرفة
+SCAN_INTERVAL_SEC     = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة الغرفة كل 5 ثواني
+CANDLE_TIMEOUT        = int(os.getenv("CANDLE_TIMEOUT", 10))
+TICKER_TIMEOUT        = int(os.getenv("TICKER_TIMEOUT", 6))
+THREADS               = int(os.getenv("THREADS", 32))               # لدفعات التجميع
+MIN_24H_EUR           = float(os.getenv("MIN_24H_EUR", 10000))      # فلتر سيولة يومية
+COOLDOWN_SEC          = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد 5 دقائق لكل عملة
+SPIKE_WEAK            = float(os.getenv("SPIKE_WEAK", 1.3))         # spike خفيف
+SPIKE_STRONG          = float(os.getenv("SPIKE_STRONG", 1.6))       # spike قوي
+JUMP_5M_PCT           = float(os.getenv("JUMP_5M_PCT", 1.5))        # قفزة 5 دقائق
+BREAKOUT_30M_PCT      = float(os.getenv("BREAKOUT_30M_PCT", 0.8))   # كسر قمة 30 دقيقة
+LEADER_MIN_PCT        = float(os.getenv("LEADER_MIN_PCT", 5.0))     # حد القائد منذ الدخول
+WEIGHTS_T             = (0.45, 0.35, 0.20)  # 1h, 30m, 15m
+WEIGHTS_A             = (0.40, 0.45, 0.15)  # 15m, 5m, 1m
 
 # =========================
-# 🧹 إعدادات تنظيف الذاكرة
-# =========================
-CLEAN_ON_BOOT        = int(os.getenv("CLEAN_ON_BOOT", "1"))     # 1 = امسح عند الإقلاع
-STATE_TTL_SEC        = int(os.getenv("STATE_TTL_SEC", "3600"))  # حد صلاحية الحالات المؤقتة
-GC_INTERVAL_SEC      = int(os.getenv("GC_INTERVAL_SEC", "300")) # كل كم ثانية نجري GC
-REDIS_NS             = os.getenv("REDIS_NS", "trend")           # بادئة مفاتيح ريديس لهاد البوت فقط
-
-# =========================
-# 🔐 تكاملات
+# 🔐 مفاتيح التشغيل
 # =========================
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_ID       = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK")  # مثال: https://your-app/endpoint
 REDIS_URL     = os.getenv("REDIS_URL")
+SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK")
 
-app = Flask(__name__)
-r = redis.from_url(REDIS_URL) if REDIS_URL else None
+app  = Flask(__name__)
+r    = redis.from_url(REDIS_URL) if REDIS_URL else None
+sess = requests.Session()
 lock = Lock()
 
 # =========================
-# 🧠 حالات داخلية
+# 🗃️ مفاتيح Redis
 # =========================
-supported    = set()                      # رموز EUR المدعومة
-step_state   = {}                         # sym -> {"base":price, "p1":(price,t), "t0":ts}
-last_alert   = {}                         # sym -> ts
-vol_cache    = defaultdict(lambda: deque(maxlen=20))  # (ts, close, vol_1m)
-rank_map     = {}                         # market -> rank على 5m
-info_map     = {}                         # market -> (ch5, price, vspike)
-last_rank    = {}                         # market -> (rank, ts)
-high10       = defaultdict(lambda: deque(maxlen=BREAKOUT_LOOKBACK_M))  # لكل عملة: [(ts, close)]
-last_touch   = {}                         # لمتابعة صلاحيات GC
-last_rank_refresh = 0.0                   # آخر تحديث لترتيب السوق
+NS                = os.getenv("REDIS_NS", "room")       # بادئة كل المفاتيح
+KEY_WATCH_SET     = f"{NS}:watch"                       # SET للأعضاء (أسماء فقط)
+KEY_COIN_HASH     = lambda s: f"{NS}:coin:{s}"          # HASH: entry_price, entry_ts, high, last_alert_ts
+KEY_COOLDOWN      = lambda s: f"{NS}:cool:{s}"          # تبريد الإشعارات
+KEY_MARKETS_CACHE = f"{NS}:markets"                     # كاش الأسواق EUR
+KEY_24H_CACHE     = f"{NS}:24h"                         # كاش سيولة 24h
+
+# =========================
+# 🧠 هياكل داخلية خفيفة
+# =========================
+price_hist  = defaultdict(lambda: deque(maxlen=360))    # (ts, price) كل 5 ثواني ≈ 30 دقيقة
+metrics_cache = {}  # sym -> {"ts":..., "ch5":..., "spike":..., "close":..., "high30":...}
+supported   = set()
 
 # =========================
 # 📮 مراسلة
 # =========================
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
+def tg(msg: str):
+    if not BOT_TOKEN or not CHAT_ID: return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text}, timeout=8
-        )
+        sess.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  data={"chat_id": CHAT_ID, "text": msg}, timeout=8)
     except Exception as e:
         print("TG error:", e)
 
-def send_to_saqr(symbol):
-    if not SAQAR_WEBHOOK:
-        return
+def notify_saqr(sym: str):
+    if not SAQAR_WEBHOOK: return
     try:
-        payload = {"message": {"text": f"اشتري {symbol}"}}
-        resp = requests.post(SAQAR_WEBHOOK, json=payload, timeout=8)
-        print("Send Saqr:", resp.status_code, resp.text[:180])
+        payload = {"message": {"text": f"اشتري {sym.upper()}"}}
+        resp = sess.post(SAQAR_WEBHOOK, json=payload, timeout=8)
+        print("→ صقر:", resp.status_code, resp.text[:160])
     except Exception as e:
         print("Saqr error:", e)
 
@@ -85,364 +80,348 @@ def send_to_saqr(symbol):
 # 🔧 Bitvavo helpers
 # =========================
 def get_markets_eur():
-    global supported
     try:
-        res = requests.get("https://api.bitvavo.com/v2/markets", timeout=10).json()
-        supported = {m["market"].replace("-EUR","") for m in res if m.get("market","").endswith("-EUR")}
-        return [m["market"] for m in res if m.get("market","").endswith("-EUR")]
+        res = sess.get("https://api.bitvavo.com/v2/markets", timeout=CANDLE_TIMEOUT).json()
+        markets = [m["market"] for m in res if m.get("market","").endswith("-EUR")]
+        return markets
     except Exception as e:
-        print("markets error:", e)
-        return []
+        print("markets error:", e); return []
 
-def get_candles(market, interval="1m", limit=20):
+def get_candles_1m(market: str, limit: int = 60):
     try:
-        return requests.get(
-            f"https://api.bitvavo.com/v2/{market}/candles?interval={interval}&limit={limit}",
-            timeout=10
+        return sess.get(
+            f"https://api.bitvavo.com/v2/{market}/candles?interval=1m&limit={limit}",
+            timeout=CANDLE_TIMEOUT
         ).json()
     except Exception as e:
-        print("candles error:", market, e)
-        return []
+        print("candles error:", market, e); return []
 
-def get_24h_stats():
+def get_ticker_price(market: str):
     try:
-        arr = requests.get("https://api.bitvavo.com/v2/ticker/24h", timeout=10).json()
+        data = sess.get(f"https://api.bitvavo.com/v2/ticker/price?market={market}",
+                        timeout=TICKER_TIMEOUT).json()
+        return float(data.get("price", 0) or 0.0)
+    except Exception:
+        return 0.0
+
+def get_24h_stats_eur():
+    try:
+        arr = sess.get("https://api.bitvavo.com/v2/ticker/24h", timeout=10).json()
         out = {}
         for row in arr:
-            market = row.get("market")
-            if not market or not market.endswith("-EUR"): 
-                continue
+            m = row.get("market")
+            if not m or not m.endswith("-EUR"): continue
             vol_eur = float(row.get("volume", 0)) * float(row.get("last", 0))
-            out[market] = vol_eur
+            out[m] = vol_eur
         return out
     except Exception:
         return {}
 
-def compute_5m_change(market):
-    c = get_candles(market, "1m", 6)  # 6 شموع احتياط
-    if not isinstance(c, list) or len(c) < 5:
-        return None, None, None
-    closes = [float(x[4]) for x in c]
-    p_now = closes[-1]; p_5m = closes[0]
-    change = (p_now - p_5m) / p_5m * 100 if p_5m > 0 else 0.0
+# =========================
+# 🧮 حساب التغيرات من شموع 1m
+# =========================
+def pct(a, b):
+    return ((a-b)/b*100.0) if b > 0 else 0.0
 
-    c15 = get_candles(market, "1m", 16)
-    if not isinstance(c15, list) or len(c15) < 3:
-        v_spike = 1.0
-    else:
-        vol_last = float(c15[-1][5])
-        avg_prev = sum(float(x[5]) for x in c15[:-1]) / max(len(c15)-1, 1)
-        v_spike = (vol_last/avg_prev) if avg_prev > 0 else 1.0
-
-    return change, p_now, v_spike
-
-def compute_15m_change(market):
-    c = get_candles(market, "1m", 16)
-    if not isinstance(c, list) or len(c) < 15:
+def changes_from_1m(c):
+    # c: [[t,o,h,l,close,vol], ...] طولها >= 60
+    if not isinstance(c, list) or len(c) < 60:
         return None
-    close_now = float(c[-1][4]); close_15 = float(c[0][4])
-    return (close_now - close_15) / close_15 * 100 if close_15 > 0 else 0.0
+    closes = [float(x[4]) for x in c]
+    vols   = [float(x[5]) for x in c]
+    close  = closes[-1]
+    ch_1m  = pct(closes[-1], closes[-2])
+    ch_5m  = pct(closes[-1], closes[-6])
+    ch_15m = pct(closes[-1], closes[-16])
+    ch_30m = pct(closes[-1], closes[-31])
+    ch_1h  = pct(closes[-1], closes[-60])
+    # spike: آخر دقيقة/متوسط 15 دقيقة قبلها
+    avg15  = sum(vols[-16:-1]) / 15.0 if sum(vols[-16:-1]) > 0 else 0.0
+    spike  = (vols[-1] / avg15) if avg15 > 0 else 1.0
+    high30 = max(closes[-31:])  # أعلى إغلاق آخر 30 دقيقة
+    return {
+        "close": close,
+        "ch_1m": ch_1m,
+        "ch_5m": ch_5m,
+        "ch_15m": ch_15m,
+        "ch_30m": ch_30m,
+        "ch_1h": ch_1h,
+        "spike": spike,
+        "high30": high30
+    }
 
 # =========================
-# 🧮 ترتيب السوق (5m)
+# 🧪 ترجيح متعدد الفريمات
 # =========================
-def rank_all_5m(markets):
-    rows = []
-    for m in markets:
-        ch, p, vsp = compute_5m_change(m)
-        if ch is None:
-            continue
-        rows.append((m, ch, p, vsp))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rmap = {m:i+1 for i,(m,_,_,_) in enumerate(rows)}
-    imap = {m:(ch,p,vsp) for (m,ch,p,vsp) in rows}
-    return rmap, imap
+def rank_score_T(ch_1h, ch_30m, ch_15m):
+    # ترتيب كنقاط مباشرة (بدون RankPct لتبسيط وسرعة)
+    w1, w2, w3 = WEIGHTS_T
+    return w1*ch_1h + w2*ch_30m + w3*ch_15m
+
+def accel_score_A(ch_15m, ch_5m, ch_1m, spike):
+    w1, w2, w3 = WEIGHTS_A
+    bonus = 0.10 if spike >= SPIKE_STRONG else (0.05 if spike >= SPIKE_WEAK else 0.0)
+    return w1*ch_15m + w2*ch_5m + w3*ch_1m + 100*bonus  # نعظّم البونص ليظهر بوضوح
+
+def merged_score(T, A):
+    return 0.6*T + 0.4*A
 
 # =========================
-# 🧼 إدارة الحالة والتنظيف
+# 🧱 إدارة الغرفة (Redis)
 # =========================
-def touch(key):  # حدّث آخر استعمال لمفتاح حالة
-    last_touch[key] = time.time()
+def room_add(sym, entry_price):
+    hkey = KEY_COIN_HASH(sym)
+    now  = int(time.time())
+    pipe = r.pipeline()
+    pipe.hset(hkey, mapping={
+        "entry_price": f"{entry_price:.12f}",
+        "entry_ts": str(now),
+        "high": f"{entry_price:.12f}",
+    })
+    pipe.expire(hkey, ROOM_TTL_SEC)
+    pipe.sadd(KEY_WATCH_SET, sym)
+    pipe.execute()
 
-def reset_state():
-    step_state.clear()
-    last_alert.clear()
-    vol_cache.clear()
-    high10.clear()
-    last_rank.clear()
-    rank_map.clear()
-    info_map.clear()
-    last_touch.clear()
+def room_get(sym):
+    data = r.hgetall(KEY_COIN_HASH(sym))
+    if not data: return None
+    try:
+        return {
+            "entry_price": float(data.get(b"entry_price", b"0").decode()),
+            "entry_ts": int(data.get(b"entry_ts", b"0").decode()),
+            "high": float(data.get(b"high", b"0").decode())
+        }
+    except:
+        return None
 
-def clear_redis_namespace():
-    if not r:
-        return
-    patterns = [f"{REDIS_NS}:*", "alerted:*"]
-    for pat in patterns:
-        try:
-            for k in r.scan_iter(pat):
-                r.delete(k)
-        except Exception as e:
-            print("redis clear error:", e)
+def room_update_high(sym, new_high):
+    r.hset(KEY_COIN_HASH(sym), "high", f"{new_high:.12f}")
 
-def gc_loop():
+def in_cooldown(sym):
+    return bool(r.get(KEY_COOLDOWN(sym)))
+
+def mark_cooldown(sym):
+    r.setex(KEY_COOLDOWN(sym), COOLDOWN_SEC, 1)
+
+def room_members():
+    # نرجع فقط اللي مفاتيحهم موجودة (TTL ما انتهى)
+    syms = list(r.smembers(KEY_WATCH_SET))
+    out = []
+    for b in syms:
+        s = b.decode()
+        if r.exists(KEY_COIN_HASH(s)):
+            out.append(s)
+        else:
+            r.srem(KEY_WATCH_SET, s)  # تنظيف
+    return out
+
+# =========================
+# 🔁 مرحلة التجميع (كل 15 دقيقة)
+# =========================
+def batch_collect():
+    try:
+        markets = r.get(KEY_MARKETS_CACHE)
+        if markets:
+            markets = json.loads(markets)
+        else:
+            markets = get_markets_eur()
+            r.setex(KEY_MARKETS_CACHE, 3600, json.dumps(markets))
+
+        # سيولة يومية
+        vol24 = r.get(KEY_24H_CACHE)
+        if vol24:
+            vol24 = json.loads(vol24)
+        else:
+            vol24 = get_24h_stats_eur()
+            r.setex(KEY_24H_CACHE, 300, json.dumps(vol24))  # كل 5 دقائق
+
+        # نجلب شموع 1m/60 لكل زوج (دفعات)
+        def fetch_one(market):
+            c = get_candles_1m(market, limit=60)
+            d = changes_from_1m(c)
+            if not d: return None
+            # فلتر سيولة
+            if vol24.get(market, 0.0) < MIN_24H_EUR:
+                return None
+            return market, d
+
+        rows = []
+        with ThreadPoolExecutor(max_workers=THREADS) as ex:
+            for res in ex.map(fetch_one, markets):
+                if res: rows.append(res)
+
+        if not rows:
+            print("batch_collect: no rows"); return
+
+        # حساب درجات
+        scored = []
+        for market, d in rows:
+            T = rank_score_T(d["ch_1h"], d["ch_30m"], d["ch_15m"])
+            A = accel_score_A(d["ch_15m"], d["ch_5m"], d["ch_1m"], d["spike"])
+            S = merged_score(T, A)
+            scored.append((market, S, d))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:TOP_MERGED]
+
+        # إدخال للغرفة
+        for market, S, d in top:
+            sym = market.replace("-EUR", "")
+            entry_price = get_ticker_price(market) or d["close"]
+            room_add(sym, entry_price)
+
+        tg(f"✅ تحديث غرفة المرشحين: {len(top)} عملة | كل 15د | سيولة≥€{int(MIN_24H_EUR)}")
+        print(f"[batch] updated {len(top)} candidates")
+
+    except Exception as e:
+        print("batch_collect error:", e)
+
+def batch_loop():
+    while True:
+        t0 = time.time()
+        batch_collect()
+        spent = time.time() - t0
+        wait  = max(5.0, BATCH_INTERVAL_SEC - spent)
+        time.sleep(wait)
+
+# =========================
+# 👁️‍🗨️ مرحلة المراقبة (كل 5 ثواني)
+# =========================
+def ensure_metrics(sym):
+    now = time.time()
+    mkt = f"{sym}-EUR"
+    info = metrics_cache.get(sym)
+    # حدّث كل ~60 ثانية بالشموع 1m/31 (للـ 5m + spike + high30)
+    if not info or now - info["ts"] >= 60:
+        c = get_candles_1m(mkt, limit=31)
+        d = changes_from_1m(c + [c[-1]]) if isinstance(c, list) and len(c) >= 31 else None  # hack بسيط لضمان المفاتيح
+        if d:
+            metrics_cache[sym] = {
+                "ts": now,
+                "ch5": d["ch_5m"],
+                "spike": d["spike"],
+                "close": d["close"],
+                "high30": d["high30"]
+            }
+        else:
+            # fallback: سعر الآن فقط
+            price = get_ticker_price(mkt)
+            metrics_cache[sym] = {
+                "ts": now, "ch5": 0.0, "spike": 1.0, "close": price, "high30": price
+            }
+
+def monitor_room():
     while True:
         try:
-            now = time.time()
-            # نظف step_state
-            for sym in list(step_state.keys()):
-                k = f"step:{sym}"
-                if now - last_touch.get(k, 0) > STATE_TTL_SEC:
-                    step_state.pop(sym, None)
-            # نظف high10
-            for m in list(high10.keys()):
-                k = f"hi10:{m}"
-                if now - last_touch.get(k, 0) > STATE_TTL_SEC:
-                    high10.pop(m, None)
-            # نظف last_rank
-            for m in list(last_rank.keys()):
-                _, tsr = last_rank[m]
-                if now - tsr > STATE_TTL_SEC:
-                    last_rank.pop(m, None)
-        except Exception as e:
-            print("gc error:", e)
-        time.sleep(GC_INTERVAL_SEC)
+            syms = room_members()
+            now  = time.time()
+            for sym in syms:
+                mkt = f"{sym}-EUR"
+                # 1) تحديث المقاييس الثقيلة (كل ~60ث)
+                ensure_metrics(sym)
+                mc = metrics_cache.get(sym, {"ch5":0.0,"spike":1.0,"close":0.0,"high30":0.0})
 
-# =========================
-# 🧩 منطق الإشعار
-# =========================
-def should_alert(sym):
-    ts = time.time()
-    last = last_alert.get(sym, 0)
-    # تحقق من redis أيضاً إذا موجود
-    if r:
-        if r.get(f"alerted:{sym}"):
-            return False
-    return (ts - last) >= BUY_COOLDOWN_SEC
+                # 2) سعر الآن (خفيف) + تحديث سجل 5 ثواني
+                price = get_ticker_price(mkt) or mc["close"]
+                price_hist[sym].append((now, price))
 
-def mark_alerted(sym):
-    ts = time.time()
-    last_alert[sym] = ts
-    if r:
-        r.setex(f"alerted:{sym}", BUY_COOLDOWN_SEC, 1)
-
-def in_step_pattern(sym, price_now, ts):
-    """سلّم مرن: +STEP% ثم +STEP% ثانية ضمن نافذة STEP_WINDOW_SEC مع سماح هبوط عكسي."""
-    touch(f"step:{sym}")
-    st = step_state.get(sym)
-    if st is None:
-        step_state[sym] = {"base": price_now, "p1": None, "t0": ts}
-        return False, "init"
-
-    if ts - st["t0"] > STEP_WINDOW_SEC:
-        step_state[sym] = {"base": price_now, "p1": None, "t0": ts}
-        return False, "window_reset"
-
-    base = st["base"]
-    if base <= 0:
-        step_state[sym] = {"base": price_now, "p1": None, "t0": ts}
-        return False, "bad_base"
-
-    step_pct_now = (price_now - base) / base * 100
-
-    # هبوط عكسي كبير يلغي المسار
-    if step_pct_now < -STEP_BACKDRIFT:
-        step_state[sym] = {"base": price_now, "p1": None, "t0": ts}
-        return False, "dip_reset"
-
-    if not st["p1"]:
-        if step_pct_now >= STEP_PCT:
-            st["p1"] = (price_now, ts)
-            return False, "step1_ok"
-        return False, "progress"
-    else:
-        p1_price, _ = st["p1"]
-        if (price_now - p1_price) / p1_price * 100 >= STEP_PCT:
-            step_state[sym] = {"base": price_now, "p1": None, "t0": ts}
-            return True, "step2_ok"
-        return False, "waiting_step2"
-
-def is_rank_jump(market, rank_now, ts):
-    prev = last_rank.get(market)
-    last_rank[market] = (rank_now, ts)
-    if not prev:
-        return False
-    r_old, t_old = prev
-    return (r_old - rank_now) >= RANK_JUMP_STEPS and (ts - t_old) <= 180
-
-def update_high10(market, close, ts):
-    touch(f"hi10:{market}")
-    dq = high10[market]
-    # نخزن كل دقيقة تقريباً
-    if not dq or ts - dq[-1][0] >= 60:
-        dq.append((ts, close))
-
-def is_breakout_local(market, close_now):
-    dq = high10[market]
-    if len(dq) < max(3, BREAKOUT_LOOKBACK_M//2):
-        return False
-    high_local = max(x[1] for x in dq)
-    return (close_now - high_local) / high_local * 100 >= BREAKOUT_BUFFER_PCT
-
-# =========================
-# 🔁 حلقة المراقبة
-# =========================
-def monitor_loop():
-    global rank_map, info_map, last_rank_refresh
-    markets = get_markets_eur()
-    if not markets:
-        print("No markets found.")
-        return
-
-    vol24 = get_24h_stats()
-    rank_map, info_map = rank_all_5m(markets)
-    last_rank_refresh = time.time()
-
-    send_telegram("✅ تم تشغيل مراقبة التريند الذكي.")
-
-    while True:
-        try:
-            ts = time.time()
-
-            # تحديث حجم 24h كل ~5 دقائق
-            if int(ts) % 300 < SCAN_INTERVAL:
-                vol24 = get_24h_stats()
-
-            # تحديث ترتيب السوق كل RANK_REFRESH_SEC
-            if ts - last_rank_refresh >= RANK_REFRESH_SEC:
-                rank_map, info_map = rank_all_5m(markets)
-                last_rank_refresh = ts
-
-            # اختَر مجموعة عمل صغيرة: أعلى TOP_N_PREWATCH فقط لفحص مفصّل
-            # (لكن مسار A يعتمد على قفزة الترتيب حتى خارج هذه المجموعة)
-            prewatch = sorted(info_map.items(), key=lambda kv: rank_map.get(kv[0], 9999))[:TOP_N_PREWATCH]
-            prewatch_markets = set(m for m,_ in prewatch)
-
-            # امشِ على كامل السوق لتَرصُّد قفزات الترتيب (A)
-            for m,(ch5, price_now, vspike) in info_map.items():
-                sym = m.replace("-EUR","")
-                if sym not in supported:
+                # 3) بيانات الغرفة
+                st = room_get(sym)
+                if not st:
                     continue
+                entry_price = st["entry_price"]
+                entry_ts    = st["entry_ts"]
+                high_stored = st["high"]
 
-                # سيولة يومية
-                if vol24.get(m, 0.0) < MIN_DAILY_EUR:
-                    continue
+                # حدّث أعلى سعر منذ الدخول
+                if price > high_stored:
+                    room_update_high(sym, price)
+                    high_stored = price
 
-                # حدّث قمة 10د
-                update_high10(m, price_now, ts)
+                change_since_entry = pct(price, entry_price)
 
-                # مسار A: قفزة ترتيب + شروط خفيفة
-                condA = (
-                    is_rank_jump(m, rank_map.get(m, 9999), ts) and
-                    ch5 is not None and ch5 >= 1.2 and
-                    vspike is not None and vspike >= VOL_SPIKE_MULT
-                )
+                # هبوط آخر 15 دقيقة (من سجل 5 ثواني)
+                # نأخذ أعلى سعر خلال آخر 900ث ثم نقارن بالآن
+                high15 = None
+                for t, p in list(price_hist[sym])[::-1]:
+                    if now - t > 900: break
+                    if high15 is None or p > high15:
+                        high15 = p
+                dd_15 = pct(price, high15) if high15 else 0.0  # قيمة سالبة عند الهبوط
 
-                # المساران B و C نفحصهما فقط ضمن prewatch لتقليل الضغط
-                condB = condC = False
-                if m in prewatch_markets:
-                    ok_step, _ = in_step_pattern(sym, price_now, ts)
-                    condB = ok_step and rank_map.get(m, 9999) <= 30 and vspike >= VOL_SPIKE_MULT
+                # شروط الدخول:
+                cond_jump = (mc["ch5"] >= JUMP_5M_PCT and mc["spike"] >= SPIKE_WEAK)
+                cond_break = (mc["high30"] > 0 and pct(price, mc["high30"]) >= BREAKOUT_30M_PCT)
 
-                    ch15 = compute_15m_change(m)
-                    condC = (ch15 is not None and ch15 >= 3.0 and is_breakout_local(m, price_now))
+                # تصنيف
+                is_leader = (change_since_entry >= LEADER_MIN_PCT)
+                is_safe   = (change_since_entry >= 0.0)  # فوق دخول الغرفة
 
-                if (condA or condB or condC) and should_alert(sym):
-                    mark_alerted(sym)
-                    msg = f"🚀 {sym} | 5m {ch5:+.2f}% | r#{rank_map.get(m, '?')} | spike×{vspike:.1f}"
-                    try:
-                        ch15 = compute_15m_change(m)
-                        if ch15 is not None:
-                            msg += f" | 15m {ch15:+.2f}%"
-                    except:
-                        pass
-                    send_telegram(msg)
-                    send_to_saqr(sym)
-                    print("ALERT:", msg)
+                # حماية: لا نرسل إذا هبوط آخر 15د ≤ -1%
+                not_weak15 = (dd_15 >= -1.0)
 
-            time.sleep(SCAN_INTERVAL)
+                should_buy = (not_weak15 and is_safe and (cond_jump or cond_break))
+
+                if should_buy and not in_cooldown(sym):
+                    # تنسيق سطر واحد مختصر
+                    entered_at = datetime.fromtimestamp(entry_ts).strftime("%H:%M")
+                    reason = "قفزة5م+سبايك" if cond_jump else "كسر30د"
+                    msg = (f"🚀 {sym} | {reason} | منذ الدخول {change_since_entry:+.2f}% | "
+                           f"دخل {entered_at} | spike×{mc['spike']:.1f} | 5m {mc['ch5']:+.2f}%")
+                    tg(msg)
+                    notify_saqr(sym)
+                    mark_cooldown(sym)
+
+            time.sleep(SCAN_INTERVAL_SEC)
         except Exception as e:
-            print("monitor error:", e)
-            time.sleep(SCAN_INTERVAL)
+            print("monitor_room error:", e)
+            time.sleep(SCAN_INTERVAL_SEC)
 
 # =========================
-# 🌐 Healthcheck + Webhook
+# 🌐 Healthcheck + Webhook بسيط
 # =========================
 @app.route("/", methods=["GET"])
 def alive():
-    return "Nems Trend bot is alive ✅", 200
+    return "Room bot is alive ✅", 200
 
 @app.route("/webhook", methods=["POST"])
-@app.route("/", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
         txt = (data.get("message", {}).get("text") or "").strip().lower()
-        if not txt:
-            return "ok", 200
+        if txt in ("ابدأ","start"):
+            Thread(target=batch_loop, daemon=True).start()
+            Thread(target=monitor_room, daemon=True).start()
+            tg("✅ تم تشغيل غرفة العمليات.")
+        elif txt in ("السجل","log"):
+            syms = room_members()
+            tg("📋 غرفة المراقبة: " + (", ".join(sorted(syms)) if syms else "فارغة"))
+        elif txt in ("مسح","reset"):
+    # مسح المرشحين
+        syms = list(r.smembers(KEY_WATCH_SET))
+        for b in syms:
+            s = b.decode()
+            r.delete(KEY_COIN_HASH(s))
+            r.delete(KEY_COOLDOWN(s))
+            r.srem(KEY_WATCH_SET, s)
 
-        if txt in ("ابدأ", "start"):
-            Thread(target=monitor_loop, daemon=True).start()
-            send_telegram("✅ بدأ الرصد.")
-            return "ok", 200
+    # مسح أي كاش
+        r.delete(KEY_MARKETS_CACHE)
+        r.delete(KEY_24H_CACHE)
 
-        elif txt in ("السجل", "log"):
-            # اعرض أفضل 10 حالياً حسب 5m
-            if not info_map:
-                send_telegram("ℹ️ لا توجد بيانات بعد.")
-                return "ok", 200
-            top = sorted(info_map.items(), key=lambda kv: rank_map.get(kv[0], 9999))[:10]
-            lines = ["📈 أفضل 10 (5m):"]
-            for m,(ch,p,vsp) in top:
-                lines.append(f"- {m}: {ch:+.2f}% | €{p:.5f} | spike≈{vsp:.1f}x | r#{rank_map.get(m,'?')}")
-            send_telegram("\n".join(lines))
-            return "ok", 200
-
-        elif txt in ("مسح", "مسح الذاكرة", "reset"):
-            reset_state()
-            clear_redis_namespace()
-            send_telegram("🧹 تم مسح الذاكرة ومفاتيح Redis الخاصة. جلسة جديدة نظيفة.")
-            return "ok", 200
-
-        elif txt.startswith("اعدادات") or txt.startswith("settings"):
-            conf = {
-                "SCAN_INTERVAL": SCAN_INTERVAL,
-                "TOP_N_PREWATCH": TOP_N_PREWATCH,
-                "VOL_SPIKE_MULT": VOL_SPIKE_MULT,
-                "MIN_DAILY_EUR": MIN_DAILY_EUR,
-                "BUY_COOLDOWN_SEC": BUY_COOLDOWN_SEC,
-                "RANK_JUMP_STEPS": RANK_JUMP_STEPS,
-                "RANK_REFRESH_SEC": RANK_REFRESH_SEC,
-                "STEP_WINDOW_SEC": STEP_WINDOW_SEC,
-                "STEP_PCT": STEP_PCT,
-                "STEP_BACKDRIFT": STEP_BACKDRIFT,
-                "BREAKOUT_LOOKBACK_M": BREAKOUT_LOOKBACK_M,
-                "BREAKOUT_BUFFER_PCT": BREAKOUT_BUFFER_PCT,
-                "CLEAN_ON_BOOT": CLEAN_ON_BOOT,
-                "STATE_TTL_SEC": STATE_TTL_SEC,
-                "GC_INTERVAL_SEC": GC_INTERVAL_SEC,
-                "REDIS_NS": REDIS_NS,
-            }
-            send_telegram("⚙️ الإعدادات:\n" + json.dumps(conf, ensure_ascii=False, indent=2))
-            return "ok", 200
-
+        tg("🧹 تم مسح الغرفة وكل الكاش. بداية جديدة.")
         return "ok", 200
-
     except Exception as e:
-        print("⚠️ Webhook error:", e)
+        print("webhook error:", e)
         return "ok", 200
 
 # =========================
 # 🚀 الإقلاع
 # =========================
 def boot():
-    if CLEAN_ON_BOOT:
-        print("🧹 Fresh boot: clearing memory & redis namespace…")
-        reset_state()
-        clear_redis_namespace()
-    Thread(target=gc_loop, daemon=True).start()
-    # ابدأ المراقبة تلقائيًا عند الإقلاع (يمكنك تعطيلها إن أردت)
-    Thread(target=monitor_loop, daemon=True).start()
+    # بدء حلقات التشغيل تلقائيًا
+    Thread(target=batch_loop, daemon=True).start()
+    Thread(target=monitor_room, daemon=True).start()
 
 if __name__ == "__main__":
     boot()
