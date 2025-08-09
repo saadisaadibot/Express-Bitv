@@ -236,9 +236,7 @@ def monitor_loop():
             time.sleep(SCAN_INTERVAL)
 
 # ============== Webhook (اختياري للأوامر) ==============
-# ============== Webhook (اختياري للأوامر) ==============
 @app.route("/", methods=["POST"])
-@app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
