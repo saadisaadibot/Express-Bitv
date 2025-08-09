@@ -9,13 +9,13 @@ from datetime import datetime
 # =========================
 # إعدادات قابلة للتعديل
 # =========================
-BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # كل 15 دقيقة
+BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 300))   # كل 15 دقيقة
 ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # بقاء العملة في الغرفة
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة كل 5 ثواني
 THREADS            = int(os.getenv("THREADS", 32))
 CANDLE_TIMEOUT     = int(os.getenv("CANDLE_TIMEOUT", 10))
 TICKER_TIMEOUT     = int(os.getenv("TICKER_TIMEOUT", 6))
-MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 10000))      # فلترة سيولة يومية
+MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 3000))      # فلترة سيولة يومية
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد إشعار لكل عملة
 REARM_PCT          = float(os.getenv("REARM_PCT", 1.5))          # إعادة تسليح بعد +1.5%
 SPIKE_WEAK         = float(os.getenv("SPIKE_WEAK", 1.3))
