@@ -9,22 +9,22 @@ from datetime import datetime
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # كل 15 دقيقة نجمع المرشحين
-ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # المرشح يبقى 3 ساعات
-TOP_MERGED         = int(os.getenv("TOP_MERGED", 20))            # عدد المرشحين لدخول الغرفة
-SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة الغرفة كل 5 ثوانٍ
+BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 900))   # 15 دقيقة
+ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # 3 ساعات
+TOP_MERGED         = int(os.getenv("TOP_MERGED", 20))            # توب 20 للغرفة
+SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة كل 5 ثواني
 CANDLE_TIMEOUT     = int(os.getenv("CANDLE_TIMEOUT", 10))
 TICKER_TIMEOUT     = int(os.getenv("TICKER_TIMEOUT", 6))
-THREADS            = int(os.getenv("THREADS", 32))               # لدفعات التجميع
-MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 10000))      # فلتر سيولة يومية
-COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد 5 دقائق لكل عملة
-SPIKE_WEAK         = float(os.getenv("SPIKE_WEAK", 1.3))         # spike خفيف
-SPIKE_STRONG       = float(os.getenv("SPIKE_STRONG", 1.6))       # spike قوي
-JUMP_5M_PCT        = float(os.getenv("JUMP_5M_PCT", 1.5))        # قفزة 5 دقائق
-BREAKOUT_30M_PCT   = float(os.getenv("BREAKOUT_30M_PCT", 0.8))   # كسر قمة 30 دقيقة
-LEADER_MIN_PCT     = float(os.getenv("LEADER_MIN_PCT", 5.0))     # حد القائد منذ الدخول
-WEIGHTS_T          = (0.45, 0.35, 0.20)  # 1h, 30m, 15m
-WEIGHTS_A          = (0.40, 0.45, 0.15)  # 15m, 5m, 1m
+THREADS            = int(os.getenv("THREADS", 32))               # توازي دفعة الشموع
+MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 10000))      # حد سيولة يومية
+COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد 5 دقائق/عملة
+SPIKE_WEAK         = float(os.getenv("SPIKE_WEAK", 1.3))
+SPIKE_STRONG       = float(os.getenv("SPIKE_STRONG", 1.6))
+JUMP_5M_PCT        = float(os.getenv("JUMP_5M_PCT", 1.5))        # قفزة 5م
+BREAKOUT_30M_PCT   = float(os.getenv("BREAKOUT_30M_PCT", 0.8))   # كسر قمة 30د
+LEADER_MIN_PCT     = float(os.getenv("LEADER_MIN_PCT", 5.0))     # معلومة/إحصاء فقط
+WEIGHTS_T          = (0.45, 0.35, 0.20)  # 1h, 30m, 15m (اتجاه)
+WEIGHTS_A          = (0.40, 0.45, 0.15)  # 15m, 5m, 1m (تسارع)
 
 # =========================
 # 🔐 مفاتيح التشغيل
@@ -52,7 +52,7 @@ KEY_24H_CACHE     = f"{NS}:24h"                         # كاش سيولة 24h
 # =========================
 # 🧠 هياكل داخلية خفيفة
 # =========================
-price_hist    = defaultdict(lambda: deque(maxlen=360))  # (ts, price) كل 5 ثوانٍ ≈ 30 دقيقة
+price_hist    = defaultdict(lambda: deque(maxlen=360))  # (ts, price) كل 5ث ≈ 30د
 metrics_cache = {}  # sym -> {"ts":..., "ch5":..., "spike":..., "close":..., "high30":...}
 
 # =========================
@@ -118,14 +118,11 @@ def get_24h_stats_eur():
 # =========================
 # 🧮 حساب التغيرات من شموع 1m (مرنة)
 # =========================
-def pct(a, b):  # نسبة مئوية بين سعرين
+def pct(a, b):  # نسبة مئوية
     return ((a-b)/b*100.0) if b > 0 else 0.0
 
 def changes_from_1m(c):
-    """
-    c: [[t,o,h,l,close,vol], ...] — مرنة: تحسب المتاح حسب طول القائمة.
-    ترجع dict بالمفاتيح المطلوبة دائمًا.
-    """
+    """مرنة: تحسب المتاح حسب طول القائمة."""
     if not isinstance(c, list) or len(c) < 6:
         return None
 
@@ -137,8 +134,8 @@ def changes_from_1m(c):
         return ((closes[-1] - closes[-idx]) / closes[-idx] * 100.0) if closes[-idx] > 0 else 0.0
 
     close  = closes[-1]
-    ch_1m  = safe_pct(2) if n >= 2  else 0.0
-    ch_5m  = safe_pct(6) if n >= 6  else 0.0
+    ch_1m  = safe_pct(2)  if n >= 2  else 0.0
+    ch_5m  = safe_pct(6)  if n >= 6  else 0.0
     ch_15m = safe_pct(16) if n >= 16 else 0.0
     ch_30m = safe_pct(31) if n >= 31 else 0.0
     ch_1h  = safe_pct(60) if n >= 60 else 0.0
@@ -150,22 +147,17 @@ def changes_from_1m(c):
     else:
         spike = 1.0
 
-    look = min(31, n)
+    look   = min(31, n)
     high30 = max(closes[-look:]) if look > 0 else close
 
     return {
         "close": close,
-        "ch_1m": ch_1m,
-        "ch_5m": ch_5m,
-        "ch_15m": ch_15m,
-        "ch_30m": ch_30m,
-        "ch_1h": ch_1h,
-        "spike": spike,
-        "high30": high30
+        "ch_1m": ch_1m, "ch_5m": ch_5m, "ch_15m": ch_15m,
+        "ch_30m": ch_30m, "ch_1h": ch_1h, "spike": spike, "high30": high30
     }
 
 # =========================
-# 🧪 ترجيح متعدد الفريمات
+# 🧪 الترجيح ودمج التوب
 # =========================
 def rank_score_T(ch_1h, ch_30m, ch_15m):
     w1, w2, w3 = WEIGHTS_T
@@ -244,7 +236,7 @@ def batch_collect():
             r.setex(KEY_24H_CACHE, 300, json.dumps(vol24))  # كاش 5 دقائق
 
         def fetch_one(market):
-            c = get_candles_1m(market, limit=60)
+            c = get_candles_1m(market, limit=60)  # مباشرة من Bitvavo
             d = changes_from_1m(c)
             if not d: return None
             if vol24.get(market, 0.0) < MIN_24H_EUR:
@@ -258,13 +250,13 @@ def batch_collect():
         if not rows:
             print("batch_collect: no rows"); return
 
+        # احسب الدرجات واطلع توب 20
         scored = []
         for market, d in rows:
             T = rank_score_T(d["ch_1h"], d["ch_30m"], d["ch_15m"])
             A = accel_score_A(d["ch_15m"], d["ch_5m"], d["ch_1m"], d["spike"])
             S = merged_score(T, A)
             scored.append((market, S, d))
-
         scored.sort(key=lambda x: x[1], reverse=True)
         top = scored[:TOP_MERGED]
 
@@ -325,8 +317,7 @@ def monitor_room():
                 price_hist[sym].append((now, price))
 
                 st = room_get(sym)
-                if not st:
-                    continue
+                if not st: continue
                 entry_price = st["entry_price"]
                 entry_ts    = st["entry_ts"]
                 high_stored = st["high"]
@@ -374,6 +365,18 @@ def monitor_room():
 def alive():
     return "Room bot is alive ✅", 200
 
+def _do_reset():
+    # مسح المرشحين
+    syms = list(r.smembers(KEY_WATCH_SET))
+    for b in syms:
+        s = b.decode()
+        r.delete(KEY_COIN_HASH(s))
+        r.delete(KEY_COOLDOWN(s))
+        r.srem(KEY_WATCH_SET, s)
+    # مسح أي كاش
+    r.delete(KEY_MARKETS_CACHE)
+    r.delete(KEY_24H_CACHE)
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -381,8 +384,7 @@ def webhook():
         txt = (data.get("message", {}).get("text") or "").strip().lower()
 
         if txt in ("ابدأ", "start"):
-            Thread(target=batch_loop, daemon=True).start()
-            Thread(target=monitor_room, daemon=True).start()
+            start_background()
             tg("✅ تم تشغيل غرفة العمليات.")
 
         elif txt in ("السجل", "log"):
@@ -390,16 +392,7 @@ def webhook():
             tg("📋 غرفة المراقبة: " + (", ".join(sorted(syms)) if syms else "فارغة"))
 
         elif txt in ("مسح", "reset"):
-            # مسح المرشحين
-            syms = list(r.smembers(KEY_WATCH_SET))
-            for b in syms:
-                s = b.decode()
-                r.delete(KEY_COIN_HASH(s))
-                r.delete(KEY_COOLDOWN(s))
-                r.srem(KEY_WATCH_SET, s)
-            # مسح أي كاش
-            r.delete(KEY_MARKETS_CACHE)
-            r.delete(KEY_24H_CACHE)
+            _do_reset()
             tg("🧹 تم مسح الغرفة وكل الكاش. بداية جديدة.")
 
         return "ok", 200
@@ -408,13 +401,21 @@ def webhook():
         return "ok", 200
 
 # =========================
-# 🚀 الإقلاع
+# 🚀 تشغيل الخلفيات تحت Gunicorn/Flask
 # =========================
-def boot():
+def start_background():
+    if getattr(app, "_bg_started", False):
+        return
+    app._bg_started = True
     Thread(target=batch_loop, daemon=True).start()
     Thread(target=monitor_room, daemon=True).start()
 
+@app.before_first_request
+def _kickoff():
+    start_background()
+
+# للتطوير المحلي فقط
 if __name__ == "__main__":
-    boot()
+    start_background()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
