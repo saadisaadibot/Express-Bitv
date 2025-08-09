@@ -116,22 +116,37 @@ def changes_from_1m(c):
             "ch_30m": ch_30m, "ch_1h": ch_1h, "spike": spike, "high30": high30}
 
 # ===== إدارة الغرفة =====
+# أعلى التعاريف
+KEY_SEQ = f"{NS}:seq"  # عدّاد تسلسلي عام
+
 def room_add(sym, entry_price, pts_add=0):
     hkey = KEY_COIN_HASH(sym)
     now  = int(time.time())
+
     if r.exists(hkey):
+        # تحديث نقاط تراكمية + نقاط هذه الدفعة وتوقيتها
         try: cur = float(r.hget(hkey, "pts") or b"0")
         except Exception: cur = 0.0
-        r.hset(hkey, "pts", f"{cur + float(pts_add):.4f}")
+        r.hset(hkey, mapping={
+            "pts": f"{cur + float(pts_add):.4f}",
+            "last_pts_add": str(int(pts_add)),
+            "last_pts_ts": str(now),
+        })
         r.expire(hkey, ROOM_TTL_SEC)
         r.sadd(KEY_WATCH_SET, sym)
         return
+
+    # أول دخول: خذ رقم تسلسلي ثابت
+    seq = r.incr(KEY_SEQ)
     p = r.pipeline()
     p.hset(hkey, mapping={
         "entry_price": f"{entry_price:.12f}",
         "entry_ts": str(now),
         "high": f"{entry_price:.12f}",
         "pts": f"{float(pts_add):.4f}",
+        "seq": str(seq),
+        "last_pts_add": str(int(pts_add)),
+        "last_pts_ts": str(now),
     })
     p.expire(hkey, ROOM_TTL_SEC)
     p.sadd(KEY_WATCH_SET, sym)
@@ -146,8 +161,12 @@ def room_get(sym):
             "entry_ts": int(data.get(b"entry_ts", b"0").decode() or "0"),
             "high": float(data.get(b"high", b"0").decode() or "0"),
             "pts": float(data.get(b"pts", b"0").decode() or "0"),
+            "seq": int(data.get(b"seq", b"0").decode() or "0"),
+            "last_pts_add": int(data.get(b"last_pts_add", b"0").decode() or "0"),
+            "last_pts_ts": int(data.get(b"last_pts_ts", b"0").decode() or "0"),
         }
-    except Exception: return None
+    except Exception:
+        return None
 
 def room_update_high(sym, v): r.hset(KEY_COIN_HASH(sym), "high", f"{v:.12f}")
 def in_cooldown(sym): return bool(r.get(KEY_COOLDOWN(sym)))
@@ -363,17 +382,27 @@ def webhook():
         if txt in ("ابدأ","start"):
             start_background(); tg("✅ تم تشغيل غرفة العمليات.")
         elif txt in ("السجل","log"):
-            syms = room_members()
-            rows = []
-            for s in syms:
-                d = r.hgetall(KEY_COIN_HASH(s))
-                pts = float(d.get(b"pts", b"0").decode() or "0")
-                rows.append((s, pts))
-            rows.sort(key=lambda x: x[1], reverse=True)
-            lines = [f"📊 مراقبة {len(rows)} عملة:"]
-            for i,(s,pts) in enumerate(rows, start=1):
-                lines.append(f"{i}. {s} / {int(round(pts))} نقاط")
-            tg("\n".join(lines))
+        syms = room_members()
+        rows = []
+        now = int(time.time())
+        for s in syms:
+            d = r.hgetall(KEY_COIN_HASH(s))
+            pts = float(d.get(b"pts", b"0").decode() or "0")
+            seq = int(d.get(b"seq", b"0").decode() or "0")
+            last_add = int(d.get(b"last_pts_add", b"0").decode() or "0")
+            last_ts  = int(d.get(b"last_pts_ts", b"0").decode() or "0")
+            recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)  # اعتبرها “دفعة حالية”
+            rows.append((s, pts, seq, last_add, recent))
+
+    # رتّب بالنقاط نزولاً
+        rows.sort(key=lambda x: x[1], reverse=True)
+
+        lines = [f"📊 مراقبة {len(rows)} عملة:"]
+        for i,(s,pts,seq,last_add,recent) in enumerate(rows, start=1):
+            flag = " 🆕" if recent and last_add > 0 else ""
+            delta = f" +{last_add}" if last_add > 0 else ""
+            lines.append(f"{i}. {s} / {int(round(pts))} نقاط  [#{seq}{delta}]{flag}")
+        tg("\n".join(lines))
         elif txt in ("مسح","reset"):
             _do_reset(full=True); tg("🧹 تم مسح الغرفة والكاش.")
         return "ok", 200
