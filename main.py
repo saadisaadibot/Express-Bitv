@@ -13,9 +13,9 @@ SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", 10))    # كل كم ثاني
 TOP_N              = int(os.getenv("TOP_N", 10))            # نراقب دخول جديد إلى Top N بفريم 5m
 STEP_WINDOW_SEC    = int(os.getenv("STEP_WINDOW_SEC", 180)) # نافذة نمط 1%+1% (ثواني)
 STEP_PCT           = float(os.getenv("STEP_PCT", 1.0))      # كل خطوة 1%
-VOL_SPIKE_MULT     = float(os.getenv("VOL_SPIKE_MULT", 2.5))# مضاعفة حجم الدقيقة
+VOL_SPIKE_MULT     = float(os.getenv("VOL_SPIKE_MULT", 1.8))# مضاعفة حجم الدقيقة
 BUY_COOLDOWN_SEC   = int(os.getenv("BUY_COOLDOWN_SEC", 900))# منع تكرار الإشعار لنفس العملة
-MIN_DAILY_EUR      = float(os.getenv("MIN_DAILY_EUR", 50000)) # حد أدنى لقيمة تداول يومية €
+MIN_DAILY_EUR      = float(os.getenv("MIN_DAILY_EUR", 30000)) # حد أدنى لقيمة تداول يومية €
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
