@@ -277,7 +277,11 @@ def webhook():
         return "ok", 200
 
 # ============== تشغيل ==============
+# ============== تشغيل ==============
 if __name__ == "__main__":
-    # محليًا فقط
+    # شغّل المونيتور بخيط منفصل
     Thread(target=monitor_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+
+    # لازم نستخدم المنفذ الذي يرسله Railway
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
