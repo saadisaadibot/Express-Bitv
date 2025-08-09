@@ -398,18 +398,18 @@ def webhook():
             tg("📋 غرفة المراقبة: " + (", ".join(sorted(syms)) if syms else "فارغة"))
         elif txt in ("مسح","reset"):
     # مسح المرشحين
-        syms = list(r.smembers(KEY_WATCH_SET))
-        for b in syms:
-            s = b.decode()
-            r.delete(KEY_COIN_HASH(s))
-            r.delete(KEY_COOLDOWN(s))
-            r.srem(KEY_WATCH_SET, s)
+            syms = list(r.smembers(KEY_WATCH_SET))
+            for b in syms:
+                s = b.decode()
+                r.delete(KEY_COIN_HASH(s))
+                r.delete(KEY_COOLDOWN(s))
+                r.srem(KEY_WATCH_SET, s)
 
     # مسح أي كاش
-        r.delete(KEY_MARKETS_CACHE)
-        r.delete(KEY_24H_CACHE)
+            r.delete(KEY_MARKETS_CACHE)
+            r.delete(KEY_24H_CACHE)
 
-        tg("🧹 تم مسح الغرفة وكل الكاش. بداية جديدة.")
+            tg("🧹 تم مسح الغرفة وكل الكاش. بداية جديدة.")
         return "ok", 200
     except Exception as e:
         print("webhook error:", e)
