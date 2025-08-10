@@ -7,7 +7,7 @@ from flask import Flask, request
 # =========================
 # 📌 إعدادات الإشعار (عدّلها بسهولة)
 # =========================
-TRUST_TOP_N              = int(os.getenv("TRUST_TOP_N", 10))
+TRUST_TOP_N              = int(os.getenv("TRUST_TOP_N", 20))
 TRUST_WARMUP_SCANS       = int(os.getenv("TRUST_WARMUP_SCANS", 3))
 TRUST_CH5_DELTA          = float(os.getenv("TRUST_CH5_DELTA", -0.3))
 TRUST_SPIKE_DELTA        = float(os.getenv("TRUST_SPIKE_DELTA", -0.2))
