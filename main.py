@@ -64,11 +64,18 @@ def send_msg(text):
 def get_markets_eur():
     r = requests.get(f"{BV}/markets", timeout=20)
     r.raise_for_status()
-    out = []
+    all_markets = []
     for m in r.json():
         if m.get("status") == "trading" and m.get("quote") == "EUR":
-            out.append(m["market"])
-    return out
+            market = m["market"]
+            # تحقق من دعم الشموع
+            try:
+                test = requests.get(f"{BV}/candles", params={"market": market, "interval": "1m", "limit": 1}, timeout=10)
+                if test.status_code == 200:
+                    all_markets.append(market)
+            except:
+                pass
+    return all_markets
 
 def get_candles_1m(market, start_ms=None, end_ms=None, limit=1200):
     params = {"market": market, "interval": "1m", "limit": limit}
