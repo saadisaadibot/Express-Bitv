@@ -88,6 +88,73 @@ def get_price(sym):
     except:
         return None
 
+def get_markets_eur_trading():
+    ok = []
+    try:
+        resp = requests.get(f"{BV}/markets", timeout=20)
+        resp.raise_for_status()
+        for m in resp.json():
+            if m.get("quote")=="EUR" and m.get("status")=="trading":
+                ok.append(m["market"].replace("-EUR",""))
+    except Exception as e:
+        print("markets err:", e)
+    return ok
+    
+def has_candles_1m(sym):
+    try:
+        t = requests.get(f"{BV}/candles",
+                         params={"market": f"{sym}-EUR","interval":"1m","limit":1},
+                         timeout=8)
+        return t.status_code==200 and isinstance(t.json(), list)
+    except:
+        return False
+
+def batch_collect_once():
+    try:
+        markets = get_markets_eur_trading()
+        # فلترة الأزواج التي لا تدعم الشموع لتجنب 404
+        filtered = [s for s in markets if has_candles_1m(s)]
+        ok_candles = 0
+        scored=[]
+        market_changes = {}
+
+        for sym in filtered:
+            c = get_candles(sym, limit=60)
+            if not c:
+                continue
+            ok_candles += 1
+            cc = changes_from_candles(c)
+            if cc: 
+                market_changes[sym] = cc
+
+        for tf, weight in [("ch5",0.5),("ch15",0.3),("ch30",0.2)]:
+            ranked = sorted(market_changes.items(), key=lambda kv: kv[1][tf], reverse=True)
+            for idx, (sym, c) in enumerate(ranked):
+                pts = weight * max(0, c[tf])
+                if idx < 5: pts += 1.0
+                scored.append((sym, pts, c))
+
+        final_scores = {}
+        for sym, pts, c in scored:
+            total, _ = final_scores.get(sym, (0, c))
+            final_scores[sym] = (total+pts, c)
+
+        sorted_final = sorted(final_scores.items(), key=lambda kv: kv[1][0], reverse=True)
+        added = 0
+        for sym, (pts, c) in sorted_final[:MAX_ROOM]:
+            if not r.exists(KEY_COIN_HASH(sym)):
+                room_add(sym,c["close"],pts)
+                added += 1
+            else:
+                r.hset(KEY_COIN_HASH(sym),"pts",pts)
+
+        # تشخيص أول دورة
+        scans = int(r.get(KEY_GLOBAL_SCANS) or 0)
+        if scans == 0:
+            tg(f"🔧 جمع أوّلي: markets={len(markets)} | tradable={len(filtered)} | ok_candles={ok_candles} | added={added}")
+    except Exception as e:
+        print("batch_collect error:",e)
+
 def changes_from_candles(c):
     if not c: return None
     try:
@@ -348,6 +415,10 @@ def webhook():
 
     if cmd in ("/start","ابدأ","start"):
         tg("✅ الصيّاد يعمل. أرسل /السجل لعرض التوب 10 (ترند نظيف).", chat_id)
+    elif cmd in ("/تشخيص","/diag"):
+        n_room = len(room_members())
+        tg(f"🔎 room={n_room} | scans={int(r.get(KEY_GLOBAL_SCANS) or 0)}", chat_id)
+    
     elif cmd in ("/السجل","السجل","/log","log","/snapshot","snapshot"):
         rows=[]
         for s in room_members():
