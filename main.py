@@ -39,18 +39,18 @@ REPLACE_MARGIN       = float(os.getenv("REPLACE_MARGIN", 0.0))     # سماحي�
 # ------------------------------
 ALERTS_TOP10_ONLY        = int(os.getenv("ALERTS_TOP10_ONLY", 1))  # لا إشعار إلا إذا كان rank5<=10
 STARTUP_MUTE_SEC         = int(os.getenv("STARTUP_MUTE_SEC", 120)) # صمت أول التشغيل
-ENTRY_MUTE_SEC           = int(os.getenv("ENTRY_MUTE_SEC", 90))    # صمت بعد دخول العملة للغرفة
-MIN_SCANS_IN_ROOM        = int(os.getenv("MIN_SCANS_IN_ROOM", 2))  # على الأقل دورتين مراقبة
+ENTRY_MUTE_SEC           = int(os.getenv("ENTRY_MUTE_SEC", 45))    # صمت بعد دخول العملة للغرفة
+MIN_SCANS_IN_ROOM        = int(os.getenv("MIN_SCANS_IN_ROOM", 1))  # على الأقل دورتين مراقبة
 GLOBAL_ALERT_COOLDOWN    = int(os.getenv("GLOBAL_ALERT_COOLDOWN", 20)) # حد أدنى بين أي إشعارين
 CONFIRM_WINDOW_SEC       = int(os.getenv("CONFIRM_WINDOW_SEC", 15)) # تأكيد مرحلتين
-MIN_MOVE_FROM_ENTRY      = float(os.getenv("MIN_MOVE_FROM_ENTRY", 0.4))# % من سعر دخول الغرفة
-MIN_CH5_FOR_ALERT        = float(os.getenv("MIN_CH5_FOR_ALERT", 1.2))   # حد أدنى 5m وقت الإرسال
-MIN_SPIKE_FOR_ALERT      = float(os.getenv("MIN_SPIKE_FOR_ALERT", 1.3)) # حد أدنى سبايك وقت الإرسال
+MIN_MOVE_FROM_ENTRY      = float(os.getenv("MIN_MOVE_FROM_ENTRY", 0.3))# % من سعر دخول الغرفة
+MIN_CH5_FOR_ALERT        = float(os.getenv("MIN_CH5_FOR_ALERT", 0.8))   # حد أدنى 5m وقت الإرسال
+MIN_SPIKE_FOR_ALERT      = float(os.getenv("MIN_SPIKE_FOR_ALERT", 1)) # حد أدنى سبايك وقت الإرسال
 REARM_PCT                = float(os.getenv("REARM_PCT", 1.5))           # إعادة تسليح بعد +1.5%
 COOLDOWN_SEC             = int(os.getenv("COOLDOWN_SEC", 300))          # تبريد إشعار للعملة
 
 # منطق الاختراق/القفزة داخل المراقبة
-BREAKOUT_30M_PCT         = float(os.getenv("BREAKOUT_30M_PCT", 0.8))    # % فوق high30
+BREAKOUT_30M_PCT         = float(os.getenv("BREAKOUT_30M_PCT", 0.6))    # % فوق high30
 ROOM_TTL_SEC             = int(os.getenv("ROOM_TTL_SEC", 3*3600))
 
 # مفاتيح التشغيل (تلغرام/ويبهوك)
