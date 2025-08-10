@@ -7,20 +7,19 @@ from flask import Flask, request
 # =========================
 # 📌 إعدادات الإشعار / النقاط (كما كانت)
 # =========================
-TRUST_TOP_N              = int(os.getenv("TRUST_TOP_N", 10))
-TRUST_WARMUP_SCANS       = int(os.getenv("TRUST_WARMUP_SCANS", 3))
-TRUST_CH5_DELTA          = float(os.getenv("TRUST_CH5_DELTA", -0.3))
-TRUST_SPIKE_DELTA        = float(os.getenv("TRUST_SPIKE_DELTA", -0.2))
-TRUST_MOVE_DELTA         = float(os.getenv("TRUST_MOVE_DELTA", -0.1))
-GLOBAL_WARMUP_CYCLES     = int(os.getenv("GLOBAL_WARMUP_CYCLES", 2))
-DROP_DEMERIT_PCT         = float(os.getenv("DROP_DEMERIT_PCT", -2.0))
-DROP_DEMERIT_POINTS      = float(os.getenv("DROP_DEMERIT_POINTS", 3.0))
-DROP_DEMERIT_COOLDOWN    = int(os.getenv("DROP_DEMERIT_COOLDOWN", 30))
-MIN_CH5_FOR_ALERT        = 0.7
-MIN_SPIKE_FOR_ALERT      = 1.1
-MIN_MOVE_FROM_ENTRY      = 0.25
-REMOVE_IF_LOST_PCT       = float(os.getenv("REMOVE_IF_LOST_PCT", 50.0))  # حذف إذا فقد 50% أو أكثر من نقاطه
-
+TRUST_TOP_N=12
+TRUST_WARMUP_SCANS=2
+TRUST_CH5_DELTA=-0.6
+TRUST_SPIKE_DELTA=-0.3
+TRUST_MOVE_DELTA=-0.1
+GLOBAL_WARMUP_CYCLES=1
+DROP_DEMERIT_PCT=-3.0
+DROP_DEMERIT_POINTS=2.0
+DROP_DEMERIT_COOLDOWN=45
+MIN_CH5_FOR_ALERT=0.4
+MIN_SPIKE_FOR_ALERT=1.0
+MIN_MOVE_FROM_ENTRY=0.10
+REMOVE_IF_LOST_PCT=60.0
 # =========================
 # 📌 إعدادات عامة
 # =========================
