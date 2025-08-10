@@ -2,6 +2,7 @@
 import os, time, requests, redis
 from threading import Thread
 from flask import Flask, request
+from waitress import serve
 
 # ========= إعدادات سريعة قابلة للتعديل =========
 NS                 = os.getenv("REDIS_NS", "mini")
