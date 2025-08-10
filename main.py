@@ -37,22 +37,23 @@ DECAY_VALUE          = float(os.getenv("DECAY_VALUE", 0.6))
 REPLACE_MARGIN       = float(os.getenv("REPLACE_MARGIN", 0.5))     # سماحية فرق نقاط لاستبدال الأضعف
 
 # ------------------------------
-# 🔔 سياسة إشعارات الشراء (Top10 فقط)
+# 🔔 سياسة إشعارات الشراء (Top10 فقط افتراضيًا)
 # ------------------------------
-ALERTS_TOP10_ONLY        = int(os.getenv("ALERTS_TOP10_ONLY", 1))  # لا إشعار إلا إذا كان rank5<=10
-STARTUP_MUTE_SEC         = int(os.getenv("STARTUP_MUTE_SEC", 120)) # صمت أول التشغيل
-ENTRY_MUTE_SEC           = int(os.getenv("ENTRY_MUTE_SEC", 45))    # صمت بعد دخول العملة للغرفة
-MIN_SCANS_IN_ROOM        = int(os.getenv("MIN_SCANS_IN_ROOM", 2))  # حد أدنى عدد لفّات داخل الغرفة
-GLOBAL_ALERT_COOLDOWN    = int(os.getenv("GLOBAL_ALERT_COOLDOWN", 20)) # حد أدنى بين أي إشعارين
-CONFIRM_WINDOW_SEC       = int(os.getenv("CONFIRM_WINDOW_SEC", 20)) # تأكيد مرحلتين
-MIN_MOVE_FROM_ENTRY      = float(os.getenv("MIN_MOVE_FROM_ENTRY", 0.3)) # % من سعر دخول الغرفة
-MIN_CH5_FOR_ALERT        = float(os.getenv("MIN_CH5_FOR_ALERT", 0.8))   # حد أدنى 5m وقت الإرسال
-MIN_SPIKE_FOR_ALERT      = float(os.getenv("MIN_SPIKE_FOR_ALERT", 1.0)) # حد أدنى سبايك وقت الإرسال
-REARM_PCT                = float(os.getenv("REARM_PCT", 1.5))           # إعادة تسليح بعد +1.5%
-COOLDOWN_SEC             = int(os.getenv("COOLDOWN_SEC", 300))          # تبريد إشعار للعملة
+ALERTS_TOP10_ONLY        = int(os.getenv("ALERTS_TOP10_ONLY", 1))   # لا إشعار إلا إذا كان rank5<=10
+STARTUP_MUTE_SEC         = int(os.getenv("STARTUP_MUTE_SEC", 60))   # صمت أول التشغيل (خفضناه لتقليل الفوات)
+ENTRY_MUTE_SEC           = int(os.getenv("ENTRY_MUTE_SEC", 20))     # صمت بعد دخول العملة للغرفة (خفّضناه)
+MIN_SCANS_IN_ROOM        = int(os.getenv("MIN_SCANS_IN_ROOM", 2))   # حد أدنى عدد لفّات داخل الغرفة
+GLOBAL_ALERT_COOLDOWN    = int(os.getenv("GLOBAL_ALERT_COOLDOWN", 15)) # حد أدنى بين أي إشعارين (خفّضناه)
+CONFIRM_WINDOW_SEC       = int(os.getenv("CONFIRM_WINDOW_SEC", 15)) # نافذة التأكيد
+RECONFIRM_DELTA_PCT      = float(os.getenv("RECONFIRM_DELTA_PCT", 0.15)) # لازم تكون الشمعة الثانية أعلى بـ %
+MIN_MOVE_FROM_ENTRY      = float(os.getenv("MIN_MOVE_FROM_ENTRY", 0.25))  # % من سعر دخول الغرفة
+MIN_CH5_FOR_ALERT        = float(os.getenv("MIN_CH5_FOR_ALERT", 0.7))     # حد أدنى 5m وقت الإرسال (خفض بسيط)
+MIN_SPIKE_FOR_ALERT      = float(os.getenv("MIN_SPIKE_FOR_ALERT", 1.1))   # حد أدنى سبايك وقت الإرسال (+10%)
+REARM_PCT                = float(os.getenv("REARM_PCT", 1.5))             # إعادة تسليح بعد +1.5%
+COOLDOWN_SEC             = int(os.getenv("COOLDOWN_SEC", 300))            # تبريد إشعار للعملة
 
 # منطق الاختراق/القفزة داخل المراقبة
-BREAKOUT_30M_PCT         = float(os.getenv("BREAKOUT_30M_PCT", 0.6))    # % فوق high30
+BREAKOUT_30M_PCT         = float(os.getenv("BREAKOUT_30M_PCT", 0.6))      # % فوق high30
 ROOM_TTL_SEC             = int(os.getenv("ROOM_TTL_SEC", 3*3600))
 
 # ====== Snapshot / Momentum (لتخفيف الضغط) ======
@@ -64,6 +65,16 @@ MOMENTUM_W60S         = float(os.getenv("MOMENTUM_W60S", 0.2))       # وزن ت
 MOMENTUM_MIN_FOR_KEEP = float(os.getenv("MOMENTUM_MIN_FOR_KEEP", -0.3)) # لو أقل من هيك لفترتين: شيل من الغرفة
 DROP_BELOW_ENTRY_PCT  = float(os.getenv("DROP_BELOW_ENTRY_PCT", -0.8))  # حذف لو هبط عن سعر الدخول بهذه النسبة
 
+# حارس استقرار مضاد للوهم
+MAX_DRAWDOWN_30S      = float(os.getenv("MAX_DRAWDOWN_30S", -0.4))   # لا إشعار إذا هبوط لحظي أسوأ من -0.4% خلال 30s
+
+# Fast-Lane لإلتقاط الفرص القوية سريعًا (Top3)
+FAST_LANE_ON          = int(os.getenv("FAST_LANE_ON", 1))
+FAST_LANE_RANK        = int(os.getenv("FAST_LANE_RANK", 3))          # لو ضمن Top3 يسمح بمسار سريع
+FAST_LANE_SPIKE       = float(os.getenv("FAST_LANE_SPIKE", 1.5))     # سبايك أقوى
+FAST_LANE_CH5         = float(os.getenv("FAST_LANE_CH5", 0.6))       # 5m أخف من المسار العادي
+FAST_LANE_MOVE        = float(os.getenv("FAST_LANE_MOVE", 0.2))      # تحرّك من سعر الدخول
+
 # كاش داخلي خفيف
 PRICE_CACHE_TTL   = int(os.getenv("PRICE_CACHE_TTL", 3))    # كاش الأسعار بالثواني
 CANDLES_CACHE_TTL = int(os.getenv("CANDLES_CACHE_TTL", 20)) # كاش الشموع 1m
@@ -71,8 +82,8 @@ CANDLES_CACHE_TTL = int(os.getenv("CANDLES_CACHE_TTL", 20)) # كاش الشمو�
 # مفاتيح التشغيل (تلغرام/ويبهوك)
 BOT_TOKEN     = os.getenv("BOT_TOKEN");   CHAT_ID = os.getenv("CHAT_ID")
 REDIS_URL     = os.getenv("REDIS_URL");   SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK")
+DEBUG_TG      = int(os.getenv("DEBUG_TG", 0))               # 1 لإرسال أسباب الرفض/القبول على الخاص
 # ============================================================
-
 
 # ============== تهيئة أساسية ==============
 app  = Flask(__name__)
@@ -97,17 +108,17 @@ KEY_24H_CACHE     = f"{NS}:24h"
 KEY_SEQ           = f"{NS}:seq"
 KEY_GLOBAL_ALERT_TS = f"{NS}:global:last_alert_ts"
 KEY_PENDING       = lambda s: f"{NS}:pending:{s}"
+KEY_PENDING_PRICE = lambda s: f"{NS}:pending_price:{s}"
 KEY_REASON        = lambda s: f"{NS}:reason:{s}"
 KEY_SCAN_COUNT    = lambda s: f"{NS}:scans:{s}"
 
 # كاش داخلي
-price_hist       = defaultdict(lambda: deque(maxlen=360))   # كل 5 ثواني ≈ 30 دقيقة (يُستخدم عند الحاجة)
+price_hist       = defaultdict(lambda: deque(maxlen=360))   # كل 5 ثواني ≈ 30 دقيقة
 metrics_cache    = {}                                       # sym -> آخر مقاييس
 last_price_cache = {}                                       # sym -> {"ts": float, "price": float}
 candles_cache    = {}                                       # market -> {"ts": float, "data": list}
 mom_hist         = defaultdict(lambda: deque(maxlen=120))   # لكل رمز: (ts, price) من Snapshot
 _bg_started      = False
-
 
 # ============== مراسلة ==============
 def tg(msg: str):
@@ -117,6 +128,10 @@ def tg(msg: str):
                   data={"chat_id": CHAT_ID, "text": msg}, timeout=8)
     except Exception as e: print("TG error:", e)
 
+def dbg(msg: str):
+    if DEBUG_TG: tg(f"🧪 {msg}")
+    else: print(msg)
+
 def notify_saqr(sym: str):
     if not SAQAR_WEBHOOK: return
     try:
@@ -124,7 +139,6 @@ def notify_saqr(sym: str):
         resp = sess.post(SAQAR_WEBHOOK, json=payload, timeout=8)
         print("→ صقر:", resp.status_code, resp.text[:160])
     except Exception as e: print("Saqr error:", e)
-
 
 # ============== Bitvavo helpers ==============
 def get_markets_eur():
@@ -155,7 +169,6 @@ def get_24h_stats_eur():
         for row in arr:
             m = row.get("market")
             if not m or not m.endswith("-EUR"): continue
-            # تقدير السيولة باليورو
             try:
                 vol_eur = float(row.get("volume", 0)) * float(row.get("last", 0))
             except:
@@ -166,7 +179,6 @@ def get_24h_stats_eur():
 
 # ============== Snapshot واسع + Momentum خفيف ==============
 def snapshot_all_markets():
-    """استدعاء واحد لكل السوق: يعيد dict sym->last price ويحدّث mom_hist + last_price_cache."""
     try:
         arr = sess.get("https://api.bitvavo.com/v2/ticker/24h", timeout=8).json()
     except Exception as e:
@@ -189,7 +201,6 @@ def snapshot_all_markets():
     return out
 
 def calc_momentum(sym):
-    """يحسب Momentum من السجل المحلي بدون شموع: مزيج 5s/30s/60s."""
     dq = mom_hist.get(sym)
     if not dq or len(dq) < 3: return 0.0
     now = dq[-1][0]; last = dq[-1][1]
@@ -198,8 +209,7 @@ def calc_momentum(sym):
         target = now - seconds
         base = None
         for ts, pr in reversed(dq):
-            if ts <= target:
-                base = pr; break
+            if ts <= target: base = pr; break
         if base and base > 0:
             return (last - base) / base * 100.0
         return 0.0
@@ -207,7 +217,6 @@ def calc_momentum(sym):
     ch5s  = pct_relago(5)
     ch30s = pct_relago(30)
     ch60s = pct_relago(60)
-
     momentum = MOMENTUM_W5S*ch5s + MOMENTUM_W30S*ch30s + MOMENTUM_W60S*ch60s
     return momentum
 
@@ -230,7 +239,6 @@ def get_ticker_price_cached(sym: str):
         last_price_cache[sym] = {"ts": now, "price": p}
     return p
 
-
 # ============== حسابات من 1m ==============
 def pct(a, b): return ((a-b)/b*100.0) if b > 0 else 0.0
 
@@ -250,6 +258,16 @@ def changes_from_1m(c):
     return {"close": close, "ch_1m": ch_1m, "ch_5m": ch_5m, "ch_15m": ch_15m,
             "ch_30m": ch_30m, "ch_1h": ch_1h, "spike": spike, "high30": high30}
 
+# ============== أدوات مساعدة للإستقرار (مضاد للوهم) ==============
+def recent_drawdown_pct(sym, seconds=30):
+    dq = price_hist.get(sym)
+    if not dq: return 0.0
+    now = time.time()
+    prices = [p for ts, p in dq if ts >= now - seconds]
+    if len(prices) < 2: return 0.0
+    cur = prices[-1]; mn = min(prices)
+    if mn <= 0: return 0.0
+    return (cur - mn) / mn * 100.0  # لو كان -0.5% → القيمة -0.5
 
 # ============== إدارة الغرفة ==============
 def room_add(sym, entry_price, pts_add=0, ranks_str=""):
@@ -281,7 +299,10 @@ def room_add(sym, entry_price, pts_add=0, ranks_str=""):
         "ranks": ranks_str,
         "rank5": "-1",
         "rank_ts": "0",
-        "mom_prev": "0"
+        "mom_prev": "0",
+        "last_alert_ts": "0",
+        "last_alert_price": "0",
+        "last_alert_reason": ""
     })
     p.expire(hkey, ROOM_TTL_SEC)
     p.sadd(KEY_WATCH_SET, sym)
@@ -305,7 +326,7 @@ def room_get(sym):
             "rank_ts": int(g(b"rank_ts", "0")),
             "last_alert_ts": int(g(b"last_alert_ts", "0")),
             "last_alert_price": float(g(b"last_alert_price", "0")),
-            "last_alert_reason": g(b"last_alert_reason", ""),
+            "last_alert_reason": g(b"last_alert_reason",""),
             "mom_prev": float(g(b"mom_prev","0"))
         }
     except Exception:
@@ -348,7 +369,7 @@ def try_admit(sym, entry_price, score, reason=""):
     if room_size() < MAX_ROOM:
         room_add(sym, entry_price, pts_add=score, ranks_str=reason); return True
     wsym, wpts, _ = weakest_member()
-    force = reason in ("top10", "top1_seed")  # ندفع Top10/Top1 بالقوة
+    force = reason in ("top10", "top1_seed")
     if wsym and (force or score >= wpts + REPLACE_MARGIN):
         r.delete(KEY_COIN_HASH(wsym)); r.srem(KEY_WATCH_SET, wsym)
         room_add(sym, entry_price, pts_add=score, ranks_str=reason); return True
@@ -363,7 +384,6 @@ def decay_room():
         if now - last >= DECAY_EVERY_SEC and pts > 0:
             r.hincrbyfloat(KEY_COIN_HASH(s), "pts", -DECAY_VALUE)
 
-
 # ============== لقطة حيّة بسيطة من الشموع أو السعر ==============
 def fresh_snapshot(sym):
     mkt = f"{sym}-EUR"
@@ -375,12 +395,12 @@ def fresh_snapshot(sym):
         return {"price": px, "ch5": d["ch_5m"], "spike": d["spike"], "high30": d["high30"], "close": d["close"]}
     return {"price": px or 0.0, "ch5": 0.0, "spike": 1.0, "high30": 0.0, "close": 0.0}
 
-
 # ============== تنظيف ديناميكي للأضعف ==============
 def maybe_drop_weak(sym, price, st):
     move_from_entry = pct(price, st["entry_price"])
     if move_from_entry <= DROP_BELOW_ENTRY_PCT:
         r.delete(KEY_COIN_HASH(sym)); r.srem(KEY_WATCH_SET, sym)
+        dbg(f"{sym}: خروج بسبب DROP_BELOW_ENTRY_PCT {move_from_entry:.2f}%")
         return True
     mom_now = calc_momentum(sym)
     prev_mom_b = r.hget(KEY_COIN_HASH(sym), "mom_prev")
@@ -388,6 +408,7 @@ def maybe_drop_weak(sym, price, st):
     r.hset(KEY_COIN_HASH(sym), "mom_prev", f"{mom_now:.4f}")
     if mom_now <= MOMENTUM_MIN_FOR_KEEP and prev_mom <= MOMENTUM_MIN_FOR_KEEP:
         r.delete(KEY_COIN_HASH(sym)); r.srem(KEY_WATCH_SET, sym)
+        dbg(f"{sym}: خروج بسبب تدهور Momentum ({prev_mom:.2f}→{mom_now:.2f})")
         return True
     if mom_now < 0:
         try:
@@ -395,11 +416,9 @@ def maybe_drop_weak(sym, price, st):
         except: pass
     return False
 
-
-# ============== دفعة التجميع: Top10 ديناميكي + ضغط منخفض ==============
+# ============== دفعة التجميع ==============
 def batch_collect():
     try:
-        # 1) أسواق + سيولة
         markets_b = r.get(KEY_MARKETS_CACHE)
         markets = json.loads(markets_b.decode() if isinstance(markets_b,(bytes,bytearray)) else markets_b) \
                   if markets_b else get_markets_eur()
@@ -411,7 +430,6 @@ def batch_collect():
         if not vol24_b: r.setex(KEY_24H_CACHE, VOL_CACHE_TTL, json.dumps(vol24))
         vol_filter_active = bool(vol24)
 
-        # 2) مرشّح أولي بالMomentum من snapshot (بدون شموع)
         all_syms = set(m.replace("-EUR","") for m in markets)
         def vol_ok(sym):
             if not vol_filter_active: return True
@@ -425,12 +443,10 @@ def batch_collect():
         scored.sort(key=lambda x: x[1], reverse=True)
         shortlist = [sym for sym,_ in scored[:SHORTLIST_SIZE]]
 
-        # 3) تأكيد المرشّحين فقط بالشموع 1m
         rows = []
         def confirm_one(sym):
             mkt = f"{sym}-EUR"
-            c = get_candles_1m_cached(mkt, limit=60)
-            d = changes_from_1m(c)
+            d = changes_from_1m(get_candles_1m_cached(mkt, limit=60))
             if not d: return None
             return (mkt, d)
 
@@ -439,7 +455,6 @@ def batch_collect():
                 if res: rows.append(res)
         if not rows: return
 
-        # 4) ترتيب لكل فريم + أخذ TopN
         ranks = {"5m":[], "15m":[], "30m":[], "1h":[]}
         for market, d in rows:
             ranks["5m"].append((market, d["ch_5m"], d))
@@ -450,14 +465,11 @@ def batch_collect():
             ranks[k].sort(key=lambda x: x[1], reverse=True)
             ranks[k] = ranks[k][:RANK_TOP.get(k, 5)]
 
-        # 5) حفظ rank5 الحالي في العملة
         nowi = int(time.time())
         for idx,(market,_,d) in enumerate(ranks["5m"]):
             sym = market.replace("-EUR","")
-            p = {"rank5": idx+1, "rank_ts": nowi}
-            r.hset(KEY_COIN_HASH(sym), mapping={k:str(v) for k,v in p.items()})
+            r.hset(KEY_COIN_HASH(sym), mapping={"rank5": str(idx+1), "rank_ts": str(nowi)})
 
-        # 6) حساب نقاط + بونص Top10
         score = defaultdict(float)
         best_refs = {}
         for tf in ["5m","15m","30m","1h"]:
@@ -469,31 +481,24 @@ def batch_collect():
                 score[sym] += w * pts
                 best_refs.setdefault(sym, (market, d))
 
-        # 7) ادخال Top10 دائمًا (لكن ديناميكي)
         top10_syms = [m.replace("-EUR","") for m,_,_ in ranks["5m"][:10]]
         for sym in top10_syms:
             mkt, d = best_refs.get(sym, (f"{sym}-EUR", {"close": get_ticker_price_cached(sym) or 0}))
             px = get_ticker_price_cached(sym) or d["close"]
-            if px > 0:
-                try_admit(sym, px, score.get(sym, 0), "top10")
+            if px > 0: try_admit(sym, px, score.get(sym, 0), "top10")
 
-        # 8) أكمل حتى MAX_ROOM بحسب السكور العام
         rest = [(sym,sc) for sym,sc in score.items()]
         rest.sort(key=lambda item: (-item[1],))
         for sym,sc in rest:
             if room_size() >= MAX_ROOM: break
             mkt, d = best_refs[sym]
             px = get_ticker_price_cached(sym) or d["close"]
-            if px > 0:
-                try_admit(sym, px, sc, "score")
+            if px > 0: try_admit(sym, px, sc, "score")
 
-        # 9) تدهور نقاط لفرز طبيعي
         decay_room()
-
-        tg(f"✅ Top10-Lite: غرفة {room_size()}/{MAX_ROOM} | تحديث ديناميكي منخفض الضغط.")
+        dbg(f"✅ Top10-Lite: غرفة {room_size()}/{MAX_ROOM} | تحديث ديناميكي منخفض الضغط.")
     except Exception as e:
         print("batch_collect error:", e)
-
 
 def batch_loop():
     while True:
@@ -501,15 +506,13 @@ def batch_loop():
         batch_collect()
         time.sleep(max(5.0, BATCH_INTERVAL_SEC - (time.time()-t0)))
 
-
-# ============== مراقبة حية + إشعار شراء (Top10 فقط) ==============
+# ============== مراقبة حية + إشعار شراء ==============
 def ensure_metrics(sym):
     now = time.time()
     info = metrics_cache.get(sym)
     if not info or now - info["ts"] >= 60:
         mkt = f"{sym}-EUR"
-        c = get_candles_1m_cached(mkt, limit=31)
-        d = changes_from_1m(c) if c else None
+        d = changes_from_1m(get_candles_1m_cached(mkt, limit=31))
         if d:
             metrics_cache[sym] = {"ts": now, "ch5": d["ch_5m"], "spike": d["spike"],
                                   "close": d["close"], "high30": d["high30"]}
@@ -517,13 +520,24 @@ def ensure_metrics(sym):
             p = get_ticker_price_cached(sym)
             metrics_cache[sym] = {"ts": now, "ch5": 0.0, "spike": 1.0, "close": p, "high30": p}
 
+def allowed_top_filter(rank5, rank_ts):
+    if not ALERTS_TOP10_ONLY: return True
+    fresh = (time.time() - rank_ts) <= (2*BATCH_INTERVAL_SEC + 15)
+    return (rank5 > 0 and rank5 <= 10 and fresh)
+
+def pass_stability_guard(sym):
+    dd30 = recent_drawdown_pct(sym, 30)  # قد تكون سالبة
+    if dd30 < 0 and dd30 <= MAX_DRAWDOWN_30S:
+        dbg(f"{sym}: رفض بسبب drawdown 30s = {dd30:.2f}% (حد {MAX_DRAWDOWN_30S}%)")
+        return False
+    return True
+
 def monitor_room():
     while True:
         try:
             syms = room_members()
             now  = time.time()
             for sym in syms:
-                mkt = f"{sym}-EUR"
                 ensure_metrics(sym)
                 mc = metrics_cache.get(sym, {"ch5":0.0,"spike":1.0,"close":0.0,"high30":0.0})
                 price = get_ticker_price_cached(sym) or mc["close"]
@@ -534,11 +548,9 @@ def monitor_room():
                 entry_price, entry_ts, high_stored, pts = st["entry_price"], st["entry_ts"], st["high"], st["pts"]
                 rank5, rank_ts = st["rank5"], st["rank_ts"]
 
-                # تحديث high
                 if price > high_stored:
                     room_update_high(sym, price); high_stored = price
 
-                # عدّاد لفّات داخل الغرفة (آمن)
                 try:
                     scans_val = r.get(KEY_SCAN_COUNT(sym))
                     scans = int(scans_val.decode()) if isinstance(scans_val,(bytes,bytearray)) else int(scans_val or 0)
@@ -546,83 +558,95 @@ def monitor_room():
                     scans = 0
                 r.incr(KEY_SCAN_COUNT(sym))
 
-                # تنظيف ديناميكي قبل أي إشعار
                 if maybe_drop_weak(sym, price, st):
                     continue
 
-                # شروط عامة للإشعار (داخل الغرفة فقط)
-                if time.time() - START_TS < STARTUP_MUTE_SEC:       # صمت بدء التشغيل
+                if time.time() - START_TS < STARTUP_MUTE_SEC:  # صمت بدء التشغيل
                     continue
-                if (time.time() - entry_ts) < ENTRY_MUTE_SEC:        # صمت دخول الغرفة
+                if (time.time() - entry_ts) < ENTRY_MUTE_SEC:  # صمت دخول الغرفة
                     continue
                 if scans < MIN_SCANS_IN_ROOM:
                     continue
-                if ALERTS_TOP10_ONLY:
-                    fresh = (time.time() - rank_ts) <= (2*BATCH_INTERVAL_SEC + 15)
-                    if not (rank5 > 0 and rank5 <= 10 and fresh):
-                        continue  # إشعار فقط لمن هو داخل Top10 (5m) حديثاً
+                if not allowed_top_filter(rank5, rank_ts):
+                    continue
 
-                # لقطة حيّة قبل الإرسال
+                # لقطة حيّة
                 snap = fresh_snapshot(sym)
-                price = snap["price"]; mc["ch5"] = snap["ch5"]; mc["spike"] = snap["spike"]; mc["high30"] = snap["high30"]
-
-                # تأكيد حركة/زخم داخلي
+                price = snap["price"]; ch5 = snap["ch5"]; spike = snap["spike"]; high30 = snap["high30"]
                 move_from_entry = pct(price, entry_price)
-                cond_ch5   = (mc["ch5"]   >= MIN_CH5_FOR_ALERT)
-                cond_spike = (mc["spike"] >= MIN_SPIKE_FOR_ALERT)
-                cond_break = (mc["high30"] > 0 and pct(price, mc["high30"]) >= BREAKOUT_30M_PCT)
-                reason = "قفزة5م+سبايك" if (cond_ch5 and cond_spike) else ("كسر30د" if cond_break else "")
+                cond_ch5   = (ch5   >= MIN_CH5_FOR_ALERT)
+                cond_spike = (spike >= MIN_SPIKE_FOR_ALERT)
+                cond_break = (high30 > 0 and pct(price, high30) >= BREAKOUT_30M_PCT)
 
-                if not reason:
+                # ===== Fast-Lane (Top3) =====
+                fast_ok = False
+                if FAST_LANE_ON and rank5 > 0 and rank5 <= FAST_LANE_RANK:
+                    if (spike >= FAST_LANE_SPIKE and ch5 >= FAST_LANE_CH5 and
+                        move_from_entry >= FAST_LANE_MOVE and pass_stability_guard(sym)):
+                        fast_ok = True
+
+                # ===== المسار العادي =====
+                normal_reason = "قفزة5م+سبايك" if (cond_ch5 and cond_spike) else ("كسر30د" if cond_break else "")
+                if not (fast_ok or normal_reason):
                     continue
                 if move_from_entry < MIN_MOVE_FROM_ENTRY:
                     continue
+                if not pass_stability_guard(sym):
+                    continue
 
-                # قفل عالمي لمنع الضجيج
+                # قفل عالمي
                 last_global_b = r.get(KEY_GLOBAL_ALERT_TS)
                 try:
                     last_global = float(last_global_b.decode()) if isinstance(last_global_b,(bytes,bytearray)) else float(last_global_b or 0)
                 except:
                     last_global = 0.0
-                if time.time() - last_global < GLOBAL_ALERT_COOLDOWN:
+                if time.time() - last_global < GLOBAL_ALERT_COOLDOWN and not fast_ok:
+                    # fast_ok يسمح بتجاوز بسيط للضجيج العالمي
                     continue
 
-                # تأكيد مرحلتين (نفس السبب ضمن مهلة)
-                pend_b = r.get(KEY_PENDING(sym))
-                pend_ts = float(pend_b.decode()) if isinstance(pend_b,(bytes,bytearray)) else float(pend_b or 0)
-                if pend_ts == 0:
-                    r.setex(KEY_PENDING(sym), CONFIRM_WINDOW_SEC, time.time())
-                    r.setex(KEY_REASON(sym),  CONFIRM_WINDOW_SEC, reason)
-                    continue
-                else:
-                    prev_reason = (r.get(KEY_REASON(sym)) or b"").decode()
-                    if prev_reason != reason:
-                        r.setex(KEY_PENDING(sym), CONFIRM_WINDOW_SEC, time.time())
-                        r.setex(KEY_REASON(sym),  CONFIRM_WINDOW_SEC, reason)
-                        continue
-
-                # إعادة تسليح (لا نكرر إلا بعد ارتفاع جديد واضح أو مر الوقت)
+                # إعادة تسليح (لا نكرر إلا بعد ارتفاع جديد أو مر الوقت)
                 la_ts, la_price, la_reason = st["last_alert_ts"], st["last_alert_price"], st["last_alert_reason"]
                 ok_time = (time.time() - la_ts) >= COOLDOWN_SEC
                 ok_move = (la_price == 0) or (price >= la_price * (1 + REARM_PCT/100.0))
                 if not (ok_time or ok_move):
                     continue
 
+                # ===== تأكيد مرحلتين (محافظ) أو تأكيد خفيف لـ Fast-Lane =====
+                pen_b = r.get(KEY_PENDING(sym))
+                pen_ts = float(pen_b.decode()) if isinstance(pen_b,(bytes,bytearray)) else float(pen_b or 0)
+                reason = normal_reason if not fast_ok else "FastLane"
+                if pen_ts == 0:
+                    r.setex(KEY_PENDING(sym), CONFIRM_WINDOW_SEC, time.time())
+                    r.setex(KEY_PENDING_PRICE(sym), CONFIRM_WINDOW_SEC, f"{price:.12f}")
+                    r.setex(KEY_REASON(sym),  CONFIRM_WINDOW_SEC, reason)
+                    dbg(f"{sym}: pending {reason} @ {price:.6f}")
+                    continue
+                else:
+                    prev_reason = (r.get(KEY_REASON(sym)) or b"").decode()
+                    prev_price_b = r.get(KEY_PENDING_PRICE(sym))
+                    prev_price = float(prev_price_b.decode()) if isinstance(prev_price_b,(bytes,bytearray)) else float(prev_price_b or 0)
+                    # للتفعيل: لازم السعر الحالي أعلى من السعر السابق بنسبة بسيطة (يمنع الوهْم)
+                    need = prev_price * (1 + RECONFIRM_DELTA_PCT/100.0)
+                    if reason != prev_reason or price < need:
+                        r.setex(KEY_PENDING(sym), CONFIRM_WINDOW_SEC, time.time())
+                        r.setex(KEY_PENDING_PRICE(sym), CONFIRM_WINDOW_SEC, f"{price:.12f}")
+                        r.setex(KEY_REASON(sym),  CONFIRM_WINDOW_SEC, reason)
+                        dbg(f"{sym}: re-pending {reason} need≥{need:.6f}, now {price:.6f}")
+                        continue
+
                 # أرسل
                 entered_at = datetime.fromtimestamp(entry_ts).strftime("%H:%M")
                 msg = (f"🚀 {sym} / {int(round(pts))} نقاط | {reason} | منذ الدخول {move_from_entry:+.2f}% | "
-                       f"دخل {entered_at} | spikex{mc['spike']:.1f} | 5m {mc['ch5']:+.2f}% | rank5 #{rank5}")
+                       f"دخل {entered_at} | spikex{spike:.1f} | 5m {ch5:+.2f}% | rank5 #{rank5}")
                 tg(msg); notify_saqr(sym)
                 mark_cooldown(sym)
                 set_last_alert(sym, int(time.time()), price, reason)
                 r.set(KEY_GLOBAL_ALERT_TS, time.time())
-                r.delete(KEY_PENDING(sym)); r.delete(KEY_REASON(sym))
-
+                r.delete(KEY_PENDING(sym)); r.delete(KEY_PENDING_PRICE(sym)); r.delete(KEY_REASON(sym))
             time.sleep(SCAN_INTERVAL_SEC)
         except Exception as e:
             print("monitor_room error:", e)
             time.sleep(SCAN_INTERVAL_SEC)
-
 
 # ============== حلقة Snapshot خفيفة ==============
 def snapshot_loop():
@@ -633,18 +657,17 @@ def snapshot_loop():
             print("snapshot_loop error:", e)
         time.sleep(SNAPSHOT_INTERVAL_SEC)
 
-
 # ============== HTTP + أوامر ==============
 @app.route("/", methods=["GET"])
 def alive():
-    return "Top10 Room bot (lite/strict) is alive ✅", 200
+    return "Top10 Room bot (lite/strict + fast-lane) is alive ✅", 200
 
 def _do_reset(full=False):
     syms = list(r.smembers(KEY_WATCH_SET))
     for b in syms:
         s = b.decode()
         r.delete(KEY_COIN_HASH(s)); r.delete(KEY_COOLDOWN(s)); r.srem(KEY_WATCH_SET, s)
-        r.delete(KEY_SCAN_COUNT(s)); r.delete(KEY_PENDING(s)); r.delete(KEY_REASON(s))
+        r.delete(KEY_SCAN_COUNT(s)); r.delete(KEY_PENDING(s)); r.delete(KEY_PENDING_PRICE(s)); r.delete(KEY_REASON(s))
     if full:
         r.delete(KEY_MARKETS_CACHE); r.delete(KEY_24H_CACHE); r.delete(KEY_SEQ); r.delete(KEY_GLOBAL_ALERT_TS)
     tg("🧹 تم مسح الغرفة والكاش." if full else "🧹 تم مسح الغرفة.")
@@ -655,32 +678,21 @@ def webhook():
         data = request.get_json(silent=True) or {}
         txt = (data.get("message", {}).get("text") or "").strip().lower()
         if txt in ("ابدأ","start"):
-            start_background(); tg("✅ تم تشغيل غرفة عمليات Top10-Lite (ديناميكية منخفضة الضغط).")
+            start_background(); tg("✅ تم تشغيل غرفة Top10-Lite (ديناميكية + Fast-Lane).")
         elif txt in ("السجل","log"):
             syms = room_members()
             rows = []
             now = int(time.time())
             for s in syms:
                 d = r.hgetall(KEY_COIN_HASH(s))
-                try:
-                    pts = float((d.get(b"pts") or b"0").decode() if isinstance(d.get(b"pts"),(bytes,bytearray)) else (d.get(b"pts") or 0))
-                except: pts = 0.0
-                try:
-                    seq = int((d.get(b"seq") or b"0").decode() if isinstance(d.get(b"seq"),(bytes,bytearray)) else (d.get(b"seq") or 0))
-                except: seq = 0
-                try:
-                    last_add = float((d.get(b"last_pts_add") or b"0").decode() if isinstance(d.get(b"last_pts_add"),(bytes,bytearray)) else (d.get(b"last_pts_add") or 0))
-                except: last_add = 0.0
-                try:
-                    last_ts  = int((d.get(b"last_pts_ts") or b"0").decode() if isinstance(d.get(b"last_pts_ts"),(bytes,bytearray)) else (d.get(b"last_pts_ts") or 0))
-                except: last_ts = 0
+                pts = float((d.get(b"pts") or b"0").decode() if isinstance(d.get(b"pts"),(bytes,bytearray)) else (d.get(b"pts") or 0))
+                seq = int((d.get(b"seq") or b"0").decode() if isinstance(d.get(b"seq"),(bytes,bytearray)) else (d.get(b"seq") or 0))
+                last_add = float((d.get(b"last_pts_add") or b"0").decode() if isinstance(d.get(b"last_pts_add"),(bytes,bytearray)) else (d.get(b"last_pts_add") or 0))
+                last_ts  = int((d.get(b"last_pts_ts") or b"0").decode() if isinstance(d.get(b"last_pts_ts"),(bytes,bytearray)) else (d.get(b"last_pts_ts") or 0))
+                rank5    = int((d.get(b"rank5") or b"-1").decode() if isinstance(d.get(b"rank5"),(bytes,bytearray)) else (d.get(b"rank5") or -1))
                 ranks    = (d.get(b"ranks") or b"").decode() if b"ranks" in d else ""
-                try:
-                    rank5    = int((d.get(b"rank5") or b"-1").decode() if isinstance(d.get(b"rank5"),(bytes,bytearray)) else (d.get(b"rank5") or -1))
-                except: rank5 = -1
                 recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)
                 rows.append((s, pts, seq, last_add, recent, ranks, rank5))
-            # ضع Top10 أعلى
             rows.sort(key=lambda x: (-1 if (1 <= x[6] <= 10) else 0, x[1]), reverse=True)
             lines = [f"📊 غرفة {len(rows)}/{MAX_ROOM} (Top10 أعلى القائمة):"]
             for i,(s,pts,seq,last_add,recent,ranks,rank5) in enumerate(rows, start=1):
@@ -696,7 +708,6 @@ def webhook():
     except Exception as e:
         print("webhook error:", e); return "ok", 200
 
-
 # ============== تشغيل الخلفيات ==============
 def start_background():
     global _bg_started
@@ -705,7 +716,7 @@ def start_background():
     Thread(target=snapshot_loop, daemon=True).start()
     Thread(target=batch_loop, daemon=True).start()
     Thread(target=monitor_room, daemon=True).start()
-    print("Background loops started (Top10 lite/strict).")
+    print("Background loops started (Top10 lite/strict + fast-lane).")
 
 # ابدأ تلقائيًا
 if os.getenv("DISABLE_AUTO_START", "0") != "1":
