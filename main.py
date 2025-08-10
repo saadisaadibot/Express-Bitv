@@ -1,49 +1,68 @@
 # -*- coding: utf-8 -*-
 import os, time, math, json, requests, threading
-from datetime import datetime, timedelta, timezone
-from collections import deque, defaultdict
+from datetime import datetime, timezone
+from flask import Flask, request
 
-# ========= إعدادات قابلة للتعديل =========
-TOP_N                = int(os.getenv("TOP_N", 10))
-REFRESH_DAILY_HHMM   = os.getenv("REFRESH_DAILY_HHMM", "00:05")   # توقيت بناء قائمة اليوم
-SCAN_INTERVAL_SEC    = int(os.getenv("SCAN_INTERVAL_SEC", 60))    # مراقبة كل دقيقة
-LOOKBACK_24H_MIN     = 24*60
-LOOKBACK_3H_MIN      = 180
-SLOPE_WINDOW_MIN     = 30
-VOL_SPIKE_WINDOW_MIN = 30        # مقارنة حجم آخر 30 دقيقة بمتوسط اليوم
-DROP_FROM_PEAK_PCT   = float(os.getenv("DROP_FROM_PEAK_PCT", -2.0))  # خروج إذا هبطت من قمتها اليومية بهذه النسبة
-MIN_PRICE_EUR        = float(os.getenv("MIN_PRICE_EUR", 0.0005))     # تجاهل القيعان الميّتة جداً
+# ======= إعدادات قابلة للتعديل =======
+TOP_N                  = int(os.getenv("TOP_N", 10))           # حجم الغرفة
+REFRESH_LOW_EVERY_SEC  = int(os.getenv("REFRESH_LOW_EVERY_SEC", 300))  # كل كم ثانية نعيد قيعان 12h
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", 15))       # تحديث الأسعار والترتيب
+MIN_PRICE_EUR          = float(os.getenv("MIN_PRICE_EUR", 0.0005))
+DROP_KICK_PCT          = float(os.getenv("DROP_KICK_PCT", -0.8))       # إخراج عند تراجع قصير
+SHORT_WINDOW_MIN       = int(os.getenv("SHORT_WINDOW_MIN", 2))         # نافذة التراجع القصير
+MAX_MARKETS_PER_TICK   = int(os.getenv("MAX_MARKETS_PER_TICK", 120))   # حد قراءة الأسعار
 
-# ========= مفاتيح تلغرام =========
+# فلترة “الترند النظيف” داخل السجل
+UP_CH1H_MIN      = float(os.getenv("UP_CH1H_MIN", 0.5))  # آخر ساعة ≥ +0.5%
+HL_MIN_GAP_PCT   = float(os.getenv("HL_MIN_GAP_PCT", 0.3))   # HL gap
+MAX_RED_CANDLE   = float(os.getenv("MAX_RED_CANDLE", -2.0))  # ممنوع شمعة <= -2% بآخر ساعة
+SWING_DEPTH      = int(os.getenv("SWING_DEPTH", 3))          # حساسية القيعان/القمم
+MIN_ABOVE_L2_PCT = float(os.getenv("MIN_ABOVE_L2_PCT", 0.5)) # فوق L2
+
+# تلغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
-# ========= Bitvavo API =========
+# Redis (اختياري) — لمسح كل شيء عند التشغيل
+r = None
+try:
+    import redis
+    if os.getenv("REDIS_URL"):
+        r = redis.from_url(os.getenv("REDIS_URL"))
+        r.flushdb()  # ← مسح كامل
+        print("Redis: database flushed at startup.")
+except Exception as e:
+    print("Redis not used or flush failed:", e)
+
+# Bitvavo API
 BV = "https://api.bitvavo.com/v2"
 
-# ========= حالة اليوم =========
-room = []                     # [ "COIN-EUR", ... ] العملات المختارة لليوم
-scores_today = {}             # "COIN-EUR" -> score
-peaks_today  = {}             # "COIN-EUR" -> أعلى سعر تحقق اليوم
-watch_pool   = []             # مرشحين احتياطيين مرتبين حسب السكور
+# ======= حالة داخلية =======
 lock = threading.Lock()
+markets_eur = []                        # ["ADA-EUR", ...]
+low12h      = {}                        # market -> أدنى سعر 12h
+last_prices = {}                        # market -> آخر سعر
+short_buf   = {}                        # market -> [(ts, price), ...] نافذة قصيرة
+room        = []                        # قائمة التوب 10 الحالية
+in_room_set = set()
+rank_table  = {}                        # market -> {"pct_from_low":x, "price":p, "low":l}
 
-# ========= أدوات مساعدة =========
-def now_utc():
-    return datetime.now(timezone.utc)
+# ======= أدوات عامة =======
+def now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
 
-def send_message(text):
-    if not BOT_TOKEN or not CHAT_ID: 
+def send_msg(text):
+    if not BOT_TOKEN or not CHAT_ID:
         print("TG:", text); return
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text})
+                      json={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
         print("Telegram error:", e)
 
+# ======= Bitvavo =======
 def get_markets_eur():
-    # يرجع كل الأسواق /EUR المفعّلة
-    r = requests.get(f"{BV}/markets")
+    r = requests.get(f"{BV}/markets", timeout=20)
     r.raise_for_status()
     out = []
     for m in r.json():
@@ -51,210 +70,257 @@ def get_markets_eur():
             out.append(m["market"])
     return out
 
-def get_candles(market, interval="1m", start_ms=None, end_ms=None, limit=1200):
-    params = {"market": market, "interval": interval, "limit": limit}
+def get_candles_1m(market, start_ms=None, end_ms=None, limit=1200):
+    params = {"market": market, "interval": "1m", "limit": limit}
     if start_ms: params["start"] = str(start_ms)
     if end_ms:   params["end"]   = str(end_ms)
-    r = requests.get(f"{BV}/candles", params=params, timeout=15)
+    r = requests.get(f"{BV}/candles", params=params, timeout=20)
     r.raise_for_status()
-    # كل عنصر: [time, open, high, low, close, volume]
-    return r.json()
+    return r.json()   # [time, open, high, low, close, volume]
 
-def pct(a, b):
-    try:
-        if b == 0: return 0.0
-        return (a - b) / b * 100.0
-    except: 
-        return 0.0
-
-def avg(x): 
-    return sum(x)/len(x) if x else 0.0
-
-def last_close(candles):
-    return float(candles[-1][4]) if candles else 0.0
-
-def series_from_candles(candles):
-    closes = [float(c[4]) for c in candles]
-    vols   = [float(c[5]) for c in candles]
-    return closes, vols
-
-def slope_pct(closes):
-    # ميل تقريبـي خلال النافذة: (C_last - C_first) / C_first
-    if len(closes) < 2 or closes[0] <= 0: return 0.0
-    return (closes[-1] - closes[0]) / closes[0] * 100.0
-
-def build_score(market):
-    # نجلب شموع 1m لـ 24h (حدود 1440 شمعة). نقسم القراءة لأجزاء مختصرة لتقليل الضغط.
-    end   = int(now_utc().timestamp()*1000)
-    start = end - LOOKBACK_24H_MIN*60*1000
-    candles = get_candles(market, "1m", start, end, limit=min(1440, LOOKBACK_24H_MIN+5))
-    if len(candles) < 60: 
-        return None
-
-    closes, vols = series_from_candles(candles)
-    price        = closes[-1]
-    if price < MIN_PRICE_EUR: 
-        return None
-
-    # Δ24h%
-    ch24 = pct(closes[-1], closes[0])
-
-    # Δ3h%
-    k3   = min(LOOKBACK_3H_MIN, len(closes)-1)
-    ch3h = pct(closes[-1], closes[-1-k3])
-
-    # Slope 30m
-    k30  = min(SLOPE_WINDOW_MIN, len(closes)-1)
-    sl30 = slope_pct(closes[-1-k30:])
-
-    # Vol spike: متوسط آخر 30 دقيقة مقابل متوسط اليوم
-    v30  = avg(vols[-min(VOL_SPIKE_WINDOW_MIN, len(vols)):])
-    vday = avg(vols)
-    vol_spike = (v30 / vday) if (vday and vday > 0) else 1.0
-    vol_component = (vol_spike-1.0)*100.0  # يحوّل المضاعِف لنقاط %
-
-    score = ch24 + 0.7*ch3h + 0.5*sl30 + 0.3*vol_component
-    return {
-        "market": market,
-        "price": price,
-        "ch24": ch24,
-        "ch3h": ch3h,
-        "sl30": sl30,
-        "volx": vol_spike,
-        "score": score
-    }
-
-def daily_top_list():
-    markets = get_markets_eur()
-    # ممكن يكون كتير—نخفف الضغط: نقي الفلاتر الأولية بسرعة بـ 5m تغيّر
-    top = []
-    for m in markets:
-        try:
-            # لقطة سريعة 5m (6 شموع 1m فقط) لتصفية السكون
-            snap = get_candles(m, "1m", limit=6)
-            if len(snap) < 6: 
-                continue
-            c = [float(x[4]) for x in snap]
-            if pct(c[-1], c[0]) < -5.0:    # هبوط قوي—تجاهل مبدأياً
-                continue
-            info = build_score(m)
-            if info:
-                top.append(info)
-            time.sleep(0.03)  # تهدئة بسيطة للـ API
-        except Exception as e:
-            print("score err", m, e)
-            time.sleep(0.05)
-    top.sort(key=lambda x: x["score"], reverse=True)
-    return top
-
-def reset_daily_room():
-    global room, scores_today, peaks_today, watch_pool
-    send_message("🔄 بدء مسح يومي… بناء Top10 على حركة السعر فقط.")
-    top = daily_top_list()
-    with lock:
-        watch_pool = [t for t in top]  # احتفظ بكل شيء كاحتياطي
-        room = [t["market"] for t in top[:TOP_N]]
-        scores_today = {t["market"]: t for t in top[:TOP_N]}
-        peaks_today  = {m: scores_today[m]["price"] for m in room}
-    names = ", ".join([m.split("-")[0] for m in room])
-    send_message(f"🎯 قائمة اليوم (Top{TOP_N}): {names}")
-
-def ensure_daily_refresh_thread():
-    def worker():
-        last_day = None
-        while True:
-            hhmm = now_utc().strftime("%H:%M")
-            day  = now_utc().date()
-            if (last_day != day and hhmm >= REFRESH_DAILY_HHMM) or not room:
-                try:
-                    reset_daily_room()
-                    last_day = day
-                except Exception as e:
-                    send_message(f"⚠️ فشل تحديث اليوم: {e}")
-            time.sleep(20)
-    threading.Thread(target=worker, daemon=True).start()
-
-def current_price(market):
+def get_price(market):
     r = requests.get(f"{BV}/ticker/price", params={"market": market}, timeout=10)
     r.raise_for_status()
     return float(r.json()["price"])
 
-def replace_weak_if_needed():
-    # إذا عملة في الغرفة هبطت -2% من قمتها اليومية → استبدلها بأقوى مرشح غير موجود
-    global room, watch_pool, peaks_today, scores_today
-    if not room: return
-
-    outlist = []
+# ======= بناء قيعان 12 ساعة =======
+def rebuild_12h_lows():
+    global low12h
+    end = int(datetime.now(timezone.utc).timestamp()*1000)
+    start = end - 12*60*60*1000
+    new_lows = {}
+    for i, m in enumerate(markets_eur):
+        try:
+            cs = get_candles_1m(m, start_ms=start, end_ms=end, limit=800)
+            if not cs: 
+                continue
+            lows = [float(c[3]) for c in cs]
+            closes = [float(c[4]) for c in cs]
+            last = closes[-1]
+            if last < MIN_PRICE_EUR: 
+                continue
+            new_lows[m] = min(lows)
+            with lock:
+                last_prices[m] = last
+                short_buf.setdefault(m, [])
+                short_buf[m].append((now_ts(), last))
+                _cut_short(m)
+        except Exception as e:
+            print("low12h err", m, e)
+        time.sleep(0.03 if (i % 40) else 0.4)
     with lock:
-        for m in list(room):
-            try:
-                p = current_price(m)
-                pk = peaks_today.get(m, p)
-                if p > pk: 
-                    peaks_today[m] = p
-                drop = pct(p, pk)
-                if drop <= DROP_FROM_PEAK_PCT:
-                    outlist.append((m, drop))
-            except Exception as e:
-                print("price err", m, e)
+        low12h = new_lows
 
-        # استبدالات
-        for (weak, drop) in outlist:
-            # اختر أول مرشح من الاحتياطي غير موجود في الغرفة
-            repl = None
-            for t in watch_pool:
-                if t["market"] not in room:
-                    repl = t; break
-            if not repl: 
-                # إن لم يوجد، أعد بناء احتياطي مختصر
-                candidates = daily_top_list()
-                repl = next((t for t in candidates if t["market"] not in room), None)
+# ======= نافذة تراجع قصير =======
+def _cut_short(market):
+    horizon = SHORT_WINDOW_MIN * 60
+    tnow = now_ts()
+    buf = short_buf.get(market, [])
+    short_buf[market] = [(t,p) for (t,p) in buf if tnow - t <= horizon]
 
-            if repl:
-                room.remove(weak)
-                room.append(repl["market"])
-                scores_today.pop(weak, None)
-                scores_today[repl["market"]] = repl
-                peaks_today.pop(weak, None)
-                peaks_today[repl["market"]] = repl["price"]
-                send_message(f"♻️ استبدال: خرجت {weak.split('-')[0]} (هبوط {abs(drop):.2f}%) ← دخلت {repl['market'].split('-')[0]}")
-            else:
-                # لا بديل متاح
-                room.remove(weak)
-                scores_today.pop(weak, None)
-                peaks_today.pop(weak, None)
-                send_message(f"⬇️ خروج: {weak.split('-')[0]} (هبوط {abs(drop):.2f}%).")
-
-def monitor_loop():
+# ======= تحديث الأسعار الحية بخفة =======
+def update_live_prices():
+    idx = 0
     while True:
         try:
-            if not room:
-                time.sleep(5); 
-                continue
-            with lock:
-                markets = list(room)
-            # تحديث قمم وإشعار عند قفزات ضمن الغرفة فقط
-            for m in markets:
+            batch = markets_eur[idx: idx + MAX_MARKETS_PER_TICK]
+            if not batch:
+                idx = 0
+                batch = markets_eur[:MAX_MARKETS_PER_TICK]
+            for m in batch:
                 try:
-                    p = current_price(m)
-                    pk = peaks_today.get(m, p)
-                    if p > pk:
-                        peaks_today[m] = p
-                        # قفزة 1% فوق آخر قمة → إشارة “قوة”
-                        if pct(p, pk) > 1.0:
-                            send_message(f"🚀 قوة مستمرة داخل الغرفة: {m.split('-')[0]} ارتفع فوق قمته اليومية.")
+                    p = get_price(m)
+                    with lock:
+                        last_prices[m] = p
+                        short_buf.setdefault(m, [])
+                        short_buf[m].append((now_ts(), p))
+                        _cut_short(m)
                 except Exception as e:
-                    print("monitor price err", m, e)
-                    time.sleep(0.05)
-            replace_weak_if_needed()
+                    print("price err", m, e)
+                time.sleep(0.025)
+            idx += MAX_MARKETS_PER_TICK
         except Exception as e:
-            print("monitor loop err:", e)
+            print("update_live_prices loop err:", e)
         time.sleep(SCAN_INTERVAL_SEC)
 
-def main():
-    ensure_daily_refresh_thread()
-    monitor_loop()
+# ======= ترتيب “الأبعد عن القاع” =======
+def compute_rank_table():
+    table = []
+    with lock:
+        lows = dict(low12h)
+        prices = dict(last_prices)
+    for m, l in lows.items():
+        p = prices.get(m)
+        if not p or p < MIN_PRICE_EUR or l <= 0: 
+            continue
+        pct_from_low = (p - l) / l * 100.0
+        table.append((m, pct_from_low, p, l))
+    table.sort(key=lambda x: x[1], reverse=True)
+    return table
 
+# ======= إخراج بالهبوط القصير =======
+def apply_drop_kick():
+    global room, in_room_set
+    kicked = []
+    with lock:
+        cur = list(room)
+    for m in cur:
+        buf = short_buf.get(m, [])
+        if len(buf) < 2: 
+            continue
+        p_now = buf[-1][1]
+        p_old = buf[0][1]
+        if p_old <= 0: 
+            continue
+        ch = (p_now - p_old)/p_old*100.0
+        if ch <= DROP_KICK_PCT:
+            kicked.append((m, ch))
+    if kicked:
+        with lock:
+            for m, _ in kicked:
+                in_room_set.discard(m)
+                if m in room: room.remove(m)
+        send_msg("⬇️ خروج بالتراجع القصير: " + ", ".join([k[0].split("-")[0] for k in kicked]))
+
+# ======= تحديث الغرفة من جدول الترتيب =======
+def rebuild_room_from_rank():
+    global room, in_room_set, rank_table
+    table = compute_rank_table()
+    new_room = [m for (m, pct, p, l) in table[:TOP_N]]
+    new_set  = set(new_room)
+    with lock:
+        removed = [m for m in room if m not in new_set]
+        added   = [m for m in new_room if m not in in_room_set]
+        room = new_room
+        in_room_set = new_set
+        rank_table = {m: {"pct_from_low": pct, "price": p, "low": l}
+                      for (m, pct, p, l) in table[:TOP_N]}
+    if removed:
+        send_msg("↘️ خرجت: " + ", ".join([x.split("-")[0] for x in removed]))
+    if added:
+        send_msg("↗️ دخلت: " + ", ".join([x.split("-")[0] for x in added]))
+
+# ======= كاشف القاعين HL + بدون كسر + صعود ساعة =======
+def _is_local_min(closes, i, depth):
+    left  = all(closes[i] <= closes[k] for k in range(max(0, i-depth), i))
+    right = all(closes[i] <= closes[k] for k in range(i+1, min(len(closes), i+1+depth)))
+    return left and right
+
+def _last_two_swings_low(closes, depth):
+    lows = []
+    for i in range(depth, len(closes)-depth):
+        if _is_local_min(closes, i, depth):
+            lows.append((i, closes[i]))
+    return lows[-2:] if len(lows) >= 2 else None
+
+def is_strong_clean_uptrend(market):
+    try:
+        cs = get_candles_1m(market, limit=90)        # ~90 دقيقة
+        if len(cs) < 30:
+            return False
+        closes = [float(c[4]) for c in cs]
+        p_now  = closes[-1]
+
+        # 1) آخر ساعة صاعدة
+        base = closes[-61] if len(closes) >= 62 else closes[0]
+        ch1h = (p_now - base) / base * 100.0
+        if ch1h < UP_CH1H_MIN: 
+            return False
+
+        # 2) لا شمعة <= -2% في آخر ساعة
+        start_idx = max(1, len(closes)-61)
+        for i in range(start_idx, len(closes)):
+            step = (closes[i] - closes[i-1]) / closes[i-1] * 100.0
+            if step <= MAX_RED_CANDLE:
+                return False
+
+        # 3) HL: قاع ثاني أعلى من الأول
+        swings = _last_two_swings_low(closes, SWING_DEPTH)
+        if not swings: 
+            return False
+        (i1, L1), (i2, L2) = swings
+        if (L2 - L1) / L1 * 100.0 < HL_MIN_GAP_PCT:
+            return False
+
+        # 4) بدون كسر L2 بعد تكوّنه
+        if any(p < L2 for p in closes[i2:]):
+            return False
+
+        # 5) السعر الحالي فوق L2 بهامش
+        if (p_now - L2) / L2 * 100.0 < MIN_ABOVE_L2_PCT:
+            return False
+
+        return True
+    except Exception:
+        return False
+
+# ======= نص السجل =======
+def snapshot_text():
+    lines = []
+    with lock:
+        items = [(m, rank_table.get(m, {}).get("pct_from_low", 0.0),
+                  rank_table.get(m, {}).get("price", 0.0)) for m in room]
+    rank = 1
+    for (m, pct_from_low, p) in items:
+        if not is_strong_clean_uptrend(m):
+            continue
+        coin = m.split("-")[0]
+        lines.append(f"{rank:02d}. ✅ {coin}  +{pct_from_low:.2f}% من قاع 12h | الآن {p:.6f}€")
+        rank += 1
+        if rank > TOP_N:
+            break
+    if not lines:
+        return "⚠️ لا توجد حالياً عملات مطابقة لشرط: HL + بدون كسر + صعود آخر ساعة."
+    return "📊 توب 10 (ترند نظيف دون كسر آخر ساعة):\n" + "\n".join(lines)
+
+# ======= اللوبات =======
+def lows_refresh_loop():
+    while True:
+        try:
+            rebuild_12h_lows()
+            rebuild_room_from_rank()
+        except Exception as e:
+            print("lows_refresh_loop err:", e)
+        time.sleep(REFRESH_LOW_EVERY_SEC)
+
+def ranking_loop():
+    while True:
+        try:
+            apply_drop_kick()
+            rebuild_room_from_rank()
+        except Exception as e:
+            print("ranking_loop err:", e)
+        time.sleep(SCAN_INTERVAL_SEC)
+
+def main_threads():
+    threading.Thread(target=update_live_prices, daemon=True).start()
+    threading.Thread(target=lows_refresh_loop, daemon=True).start()
+    threading.Thread(target=ranking_loop, daemon=True).start()
+
+# ======= Webhook بسيط (/السجل) =======
+app = Flask(__name__)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json or {}
+    text = (data.get("message", {}).get("text") or "").strip()
+    if text in ("/السجل", "/log"):
+        send_msg(snapshot_text())
+    elif text in ("/start", "ابدأ"):
+        send_msg("✅ الصيّاد يعمل. أرسل /السجل لعرض التوب 10.")
+    return "ok"
+
+def run_web():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+# ======= تشغيل =======
 if __name__ == "__main__":
-    send_message("✅ الصيّاد بدأ العمل (Top10 يومي — حركة سعر فقط).")
-    main()
+    send_msg("✅ الصيّاد بدأ: Top10 الأبعد عن قاع 12h (+ فلترة HL/بدون كسر/صعود 1h).")
+    markets_eur = get_markets_eur()
+    rebuild_12h_lows()
+    rebuild_room_from_rank()
+    main_threads()
+    # شغّل الويبهوك في خيط (أو شغّل بـ gunicorn في الإنتاج)
+    threading.Thread(target=run_web, daemon=True).start()
+    while True:
+        time.sleep(60)
