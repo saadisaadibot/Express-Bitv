@@ -7,19 +7,20 @@ from flask import Flask, request
 # =========================
 # 📌 إعدادات الإشعار / النقاط (كما كانت)
 # =========================
-TRUST_TOP_N=12
-TRUST_WARMUP_SCANS=2
-TRUST_CH5_DELTA=-0.6
-TRUST_SPIKE_DELTA=-0.3
-TRUST_MOVE_DELTA=-0.1
-GLOBAL_WARMUP_CYCLES=1
-DROP_DEMERIT_PCT=-3.0
-DROP_DEMERIT_POINTS=2.0
-DROP_DEMERIT_COOLDOWN=45
-MIN_CH5_FOR_ALERT=0.4
-MIN_SPIKE_FOR_ALERT=1.0
-MIN_MOVE_FROM_ENTRY=0.10
-REMOVE_IF_LOST_PCT=60.0
+# 📌 إعدادات يدوية مباشرة
+TRUST_TOP_N              = 12
+TRUST_WARMUP_SCANS       = 2
+TRUST_CH5_DELTA          = -0.6
+TRUST_SPIKE_DELTA        = -0.3
+TRUST_MOVE_DELTA         = -0.1
+GLOBAL_WARMUP_CYCLES     = 1
+DROP_DEMERIT_PCT         = -3.0
+DROP_DEMERIT_POINTS      = 2.0
+DROP_DEMERIT_COOLDOWN    = 45
+MIN_CH5_FOR_ALERT        = 0.4
+MIN_SPIKE_FOR_ALERT      = 1.0
+MIN_MOVE_FROM_ENTRY      = 0.10
+REMOVE_IF_LOST_PCT       = 60.0
 # =========================
 # 📌 إعدادات عامة
 # =========================
