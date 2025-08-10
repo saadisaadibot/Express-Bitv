@@ -9,18 +9,22 @@ from datetime import datetime
 # =========================
 # إعدادات قابلة للتعديل
 # =========================
-BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 300))   # كل 15 دقيقة
+BATCH_INTERVAL_SEC = int(os.getenv("BATCH_INTERVAL_SEC", 300))   # كل 5 دقائق
 ROOM_TTL_SEC       = int(os.getenv("ROOM_TTL_SEC", 3*3600))      # بقاء العملة في الغرفة
 SCAN_INTERVAL_SEC  = int(os.getenv("SCAN_INTERVAL_SEC", 5))      # مراقبة كل 5 ثواني
 THREADS            = int(os.getenv("THREADS", 32))
 CANDLE_TIMEOUT     = int(os.getenv("CANDLE_TIMEOUT", 10))
 TICKER_TIMEOUT     = int(os.getenv("TICKER_TIMEOUT", 6))
-MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 3000))      # فلترة سيولة يومية
+MIN_24H_EUR        = float(os.getenv("MIN_24H_EUR", 25000))      # فلترة سيولة يومية (رفعناها افتراضيًا)
 COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC", 300))         # تبريد إشعار لكل عملة
 REARM_PCT          = float(os.getenv("REARM_PCT", 1.5))          # إعادة تسليح بعد +1.5%
 SPIKE_WEAK         = float(os.getenv("SPIKE_WEAK", 1.3))
 JUMP_5M_PCT        = float(os.getenv("JUMP_5M_PCT", 1.5))        # قفزة 5م
 BREAKOUT_30M_PCT   = float(os.getenv("BREAKOUT_30M_PCT", 0.8))   # كسر قمة 30د
+
+# أوزان ومكافآت المراكز للفريمات
+WEIGHTS     = {"5m": 0.4, "15m": 0.3, "30m": 0.2, "1h": 0.1}
+RANK_POINTS = [5, 4, 3, 2, 1]   # للمراكز 1..5
 
 # مفاتيح التشغيل
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
@@ -41,6 +45,7 @@ KEY_COIN_HASH     = lambda s: f"{NS}:coin:{s}"        # HASH لكل عملة
 KEY_COOLDOWN      = lambda s: f"{NS}:cool:{s}"        # تبريد ثانوي
 KEY_MARKETS_CACHE = f"{NS}:markets"                   # كاش الأسواق ساعة
 KEY_24H_CACHE     = f"{NS}:24h"                       # كاش سيولة 5 د
+KEY_SEQ           = f"{NS}:seq"                       # عدّاد تسلسلي عام
 
 # هياكل داخلية
 price_hist    = defaultdict(lambda: deque(maxlen=360))  # (ts, price) كل 5 ثوانٍ ≈ 30د
@@ -108,35 +113,37 @@ def changes_from_1m(c):
     def safe(idx): return pct(closes[-1], closes[-idx]) if n >= idx and closes[-idx] > 0 else 0.0
     close  = closes[-1]
     ch_1m, ch_5m, ch_15m, ch_30m, ch_1h = safe(2), safe(6), safe(16), safe(31), safe(60)
+
+    # قمة 30 دقيقة "سابقة" بدون آخر شمعة لقياس اختراق حقيقي
+    window = min(31, n)
+    high30 = max(closes[-window:-1]) if n > 1 else close
+
     k = min(15, max(1, n-1))
     base = sum(vols[-(k+1):-1]) / k if n >= 3 else 0.0
     spike = (vols[-1]/base) if base > 0 else 1.0
-    high30 = max(closes[-min(31,n):]) if n else close
     return {"close": close, "ch_1m": ch_1m, "ch_5m": ch_5m, "ch_15m": ch_15m,
             "ch_30m": ch_30m, "ch_1h": ch_1h, "spike": spike, "high30": high30}
 
 # ===== إدارة الغرفة =====
-# أعلى التعاريف
-KEY_SEQ = f"{NS}:seq"  # عدّاد تسلسلي عام
-
-def room_add(sym, entry_price, pts_add=0):
+def room_add(sym, entry_price, pts_add=0, ranks_str=""):
     hkey = KEY_COIN_HASH(sym)
     now  = int(time.time())
 
     if r.exists(hkey):
-        # تحديث نقاط تراكمية + نقاط هذه الدفعة وتوقيتها
         try: cur = float(r.hget(hkey, "pts") or b"0")
         except Exception: cur = 0.0
-        r.hset(hkey, mapping={
+        p = r.pipeline()
+        p.hset(hkey, mapping={
             "pts": f"{cur + float(pts_add):.4f}",
-            "last_pts_add": str(int(pts_add)),
+            "last_pts_add": f"{float(pts_add):.4f}",
             "last_pts_ts": str(now),
+            "ranks": ranks_str
         })
-        r.expire(hkey, ROOM_TTL_SEC)
-        r.sadd(KEY_WATCH_SET, sym)
+        p.expire(hkey, ROOM_TTL_SEC)
+        p.sadd(KEY_WATCH_SET, sym)
+        p.execute()
         return
 
-    # أول دخول: خذ رقم تسلسلي ثابت
     seq = r.incr(KEY_SEQ)
     p = r.pipeline()
     p.hset(hkey, mapping={
@@ -145,8 +152,9 @@ def room_add(sym, entry_price, pts_add=0):
         "high": f"{entry_price:.12f}",
         "pts": f"{float(pts_add):.4f}",
         "seq": str(seq),
-        "last_pts_add": str(int(pts_add)),
+        "last_pts_add": f"{float(pts_add):.4f}",
         "last_pts_ts": str(now),
+        "ranks": ranks_str
     })
     p.expire(hkey, ROOM_TTL_SEC)
     p.sadd(KEY_WATCH_SET, sym)
@@ -162,8 +170,9 @@ def room_get(sym):
             "high": float(data.get(b"high", b"0").decode() or "0"),
             "pts": float(data.get(b"pts", b"0").decode() or "0"),
             "seq": int(data.get(b"seq", b"0").decode() or "0"),
-            "last_pts_add": int(data.get(b"last_pts_add", b"0").decode() or "0"),
+            "last_pts_add": float(data.get(b"last_pts_add", b"0").decode() or "0"),
             "last_pts_ts": int(data.get(b"last_pts_ts", b"0").decode() or "0"),
+            "ranks": data.get(b"ranks", b"").decode() if b"ranks" in data else ""
         }
     except Exception:
         return None
@@ -208,7 +217,7 @@ def fresh_snapshot(sym):
     return {"price": px or 0.0, "ch5": 0.0, "spike": 1.0, "high30": 0.0, "close": 0.0}
 
 # =========================
-# دفعة التجميع (Top5 من كل فريم)
+# دفعة التجميع (Top5 من كل فريم) بنقاط موزونة
 # =========================
 def batch_collect():
     try:
@@ -225,7 +234,7 @@ def batch_collect():
         if not vol24_b: r.setex(KEY_24H_CACHE, 300, json.dumps(vol24))
         vol_filter_active = bool(vol24)
 
-        # جلب الشموع
+        # جلب الشموع + تغييرات
         def fetch_one(market):
             c = get_candles_1m(market, limit=60)
             d = changes_from_1m(c)
@@ -241,7 +250,7 @@ def batch_collect():
             print(f"batch_collect: no rows (markets={len(markets)}, vol24={'ok' if vol_filter_active else 'empty'})")
             return
 
-        # تكوين Top5 لكل فريم
+        # رتب Top5 لكل فريم
         ranks = {"5m":[], "15m":[], "30m":[], "1h":[]}
         for market, d in rows:
             ranks["5m"].append((market, d["ch_5m"], d))
@@ -252,26 +261,53 @@ def batch_collect():
             ranks[k].sort(key=lambda x: x[1], reverse=True)
             ranks[k] = ranks[k][:5]
 
-        # نقاط الظهور 1..4
-        appear_pts = defaultdict(int)
-        pick_map   = {}
-        for arr in ranks.values():
-            for market, _, d in arr:
+        # حساب Breadth (سعة السوق) على 5m
+        pos5_count = sum(1 for _, d in rows if d["ch_5m"] > 0)
+        breadth = pos5_count / max(1, len(rows))
+
+        # نقاط موزونة بحسب المركز
+        score = defaultdict(float)
+        best_refs = {}             # sym -> (market, d)
+        rank_map  = defaultdict(dict)  # sym -> {"5m":1,...}
+
+        for tf in ["5m","15m","30m","1h"]:
+            for idx,(market, _, d) in enumerate(ranks[tf]):  # idx 0..4
                 sym = market.replace("-EUR","")
-                appear_pts[sym] += 1
-                pick_map.setdefault(sym, (market, d))
+                w   = WEIGHTS[tf]
+                pts = RANK_POINTS[idx]
+                score[sym] += w * pts
+                best_refs.setdefault(sym, (market, d))
+                rank_map[sym][tf] = idx + 1
 
-        merged_syms = list(appear_pts.keys())
+        # فلترة السوق الأحمر جدًا
+        filtered = []
+        for sym, sc in score.items():
+            mkt, d = best_refs[sym]
+            allow = True
+            if breadth < 0.2:  # سوق هابط بشدة
+                allow = (d["ch_5m"] > 0 and d["spike"] >= SPIKE_WEAK)
+            if allow:
+                filtered.append((sym, sc))
 
-        # إدخال/تحديث الغرفة + النقاط التراكمية
+        # ترتيب نهائي: مجموع النقاط -> 5m -> spike -> قرب من اختراق 30د
+        def sort_key(item):
+            sym, sc = item
+            _, d = best_refs[sym]
+            return (-sc, -d["ch_5m"], -d["spike"], -(pct(d["close"], d["high30"])))
+        filtered.sort(key=sort_key)
+
+        merged_syms = [sym for sym,_ in filtered]
+
+        # إدخال/تحديث الغرفة + النقاط + حفظ ranks للفريمات
         for sym in merged_syms:
-            mkt, d = pick_map[sym]
+            mkt, d = best_refs[sym]
             entry_price = get_ticker_price(mkt) or d["close"]
-            if entry_price > 0:
-                room_add(sym, entry_price, appear_pts[sym])
+            if entry_price <= 0: continue
+            ranks_txt = " ".join(f"{tf}:{rank_map[sym].get(tf)}" for tf in ["5m","15m","30m","1h"] if rank_map[sym].get(tf))
+            room_add(sym, entry_price, pts_add=score[sym], ranks_str=ranks_txt)
 
         tg(f"✅ تحديث المرشحين: {len(merged_syms)} عملة | Top5 لكل 5m/15m/30m/1h")
-        print(f"[batch] merged {len(merged_syms)} candidates")
+        print(f"[batch] merged {len(merged_syms)} candidates | breadth={breadth:.2f}")
 
     except Exception as e:
         print("batch_collect error:", e)
@@ -313,7 +349,7 @@ def monitor_room():
 
                 st = room_get(sym)
                 if not st: continue
-                entry_price, entry_ts, high_stored, pts = st["entry_price"], st["entry_ts"], st["high"], int(round(st["pts"]))
+                entry_price, entry_ts, high_stored, pts = st["entry_price"], st["entry_ts"], st["high"], st["pts"]
 
                 if price > high_stored:
                     room_update_high(sym, price)
@@ -348,7 +384,7 @@ def monitor_room():
 
                     if ok_time and (ok_move or ok_reason) and not in_cooldown(sym):
                         entered_at = datetime.fromtimestamp(entry_ts).strftime("%H:%M")
-                        msg = (f"🚀 {sym} / {pts} نقاط | {reason} | منذ الدخول {change_since_entry:+.2f}% | "
+                        msg = (f"🚀 {sym} / {int(round(pts))} نقاط | {reason} | منذ الدخول {change_since_entry:+.2f}% | "
                                f"دخل {entered_at} | spikex{mc['spike']:.1f} | 5m {mc['ch5']:+.2f}%")
                         tg(msg); notify_saqr(sym)
                         mark_cooldown(sym)
@@ -372,7 +408,7 @@ def _do_reset(full=False):
         s = b.decode()
         r.delete(KEY_COIN_HASH(s)); r.delete(KEY_COOLDOWN(s)); r.srem(KEY_WATCH_SET, s)
     if full:
-        r.delete(KEY_MARKETS_CACHE); r.delete(KEY_24H_CACHE)
+        r.delete(KEY_MARKETS_CACHE); r.delete(KEY_24H_CACHE); r.delete(KEY_SEQ)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -389,19 +425,20 @@ def webhook():
                 d = r.hgetall(KEY_COIN_HASH(s))
                 pts = float(d.get(b"pts", b"0").decode() or "0")
                 seq = int(d.get(b"seq", b"0").decode() or "0")
-                last_add = int(d.get(b"last_pts_add", b"0").decode() or "0")
+                last_add = float(d.get(b"last_pts_add", b"0").decode() or "0")
                 last_ts  = int(d.get(b"last_pts_ts", b"0").decode() or "0")
-                recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)  # اعتبرها “دفعة حالية”
-                rows.append((s, pts, seq, last_add, recent))
+                ranks    = d.get(b"ranks", b"").decode() if b"ranks" in d else ""
+                recent = (now - last_ts) <= (BATCH_INTERVAL_SEC + 120)
+                rows.append((s, pts, seq, last_add, recent, ranks))
 
-    # رتّب بالنقاط نزولاً
             rows.sort(key=lambda x: x[1], reverse=True)
 
             lines = [f"📊 مراقبة {len(rows)} عملة:"]
-            for i,(s,pts,seq,last_add,recent) in enumerate(rows, start=1):
+            for i,(s,pts,seq,last_add,recent,ranks) in enumerate(rows, start=1):
                 flag = " 🆕" if recent and last_add > 0 else ""
-                delta = f" +{last_add}" if last_add > 0 else ""
-                lines.append(f"{i}. {s} / {int(round(pts))} نقاط  [#{seq}{delta}]{flag}")
+                delta = f" +{int(round(last_add))}" if last_add > 0 else ""
+                ranks_str = f"[{ranks}]" if ranks else ""
+                lines.append(f"{i}. {s} / {int(round(pts))} نقاط  {ranks_str}  [#{seq}{delta}]{flag}")
             tg("\n".join(lines))
         elif txt in ("مسح","reset"):
             _do_reset(full=True); tg("🧹 تم مسح الغرفة والكاش.")
