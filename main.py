@@ -19,8 +19,15 @@ DROP_DEMERIT_COOLDOWN    = int(os.getenv("DROP_DEMERIT_COOLDOWN", 30))
 MIN_CH5_FOR_ALERT        = float(os.getenv("MIN_CH5_FOR_ALERT", 0.7))
 MIN_SPIKE_FOR_ALERT      = float(os.getenv("MIN_SPIKE_FOR_ALERT", 1.1))
 MIN_MOVE_FROM_ENTRY      = float(os.getenv("MIN_MOVE_FROM_ENTRY", 0.25))
-REMOVE_IF_LOST_PCT       = float(os.getenv("REMOVE_IF_LOST_PCT", 50.0)) # حذف >=50% من النقاط
+REMOVE_IF_LOST_PCT       = float(os.getenv("REMOVE_IF_LOST_PCT", 50.0)) # حذف ≥50% نقاط
 CURRENT_WEIGHT           = float(os.getenv("CURRENT_WEIGHT", 0.4))      # وزن الزخم اللحظي
+
+# تبريد ومنع الإشعار المكرر + Webhook صقر
+COOLDOWN_SEC             = int(os.getenv("COOLDOWN_SEC", 300))          # تبريد 5 دقائق
+REARM_PCT                = float(os.getenv("REARM_PCT", 1.5))           # إعادة تسليح +1.5%
+SAQAR_WEBHOOK            = os.getenv("SAQAR_WEBHOOK")
+
+# كاش حي
 PRICE_TTL                = int(os.getenv("PRICE_TTL", 3))               # كاش سعر
 CANDLE_TTL               = int(os.getenv("CANDLE_TTL", 15))             # كاش شموع 1m
 
@@ -63,6 +70,13 @@ def tg(msg):
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       data={"chat_id": CHAT_ID, "text": msg}, timeout=8)
     except: pass
+
+def notify_saqr(text: str):
+    if not SAQAR_WEBHOOK: return
+    try:
+        requests.post(SAQAR_WEBHOOK, json={"message": {"text": text}}, timeout=8)
+    except Exception as e:
+        print("Saqr webhook error:", e)
 
 def get_price_live(sym):
     now = time.time()
@@ -123,7 +137,9 @@ def room_add(sym, price, pts, extra=None):
         "pts": f"{pts}",
         "initial_pts": f"{pts}",
         "last_price": f"{price}",
-        "last_demerit_ts": "0"
+        "last_demerit_ts": "0",
+        "last_alert_ts": "0",
+        "last_alert_price": "0"
     }
     if extra: mp.update(extra)
     p = r.pipeline()
@@ -196,7 +212,7 @@ def batch_collect_loop():
         time.sleep(BATCH_INTERVAL_SEC)
 
 # =========================
-# 🔍 مراقبة حيّة + إشعارات Top10 موثوق
+# 🔍 مراقبة حيّة + إشعارات Top10 موثوق (مع تبريد/إعادة تسليح)
 # =========================
 def monitor_room_loop():
     while True:
@@ -214,7 +230,8 @@ def monitor_room_loop():
                 st = {
                     "entry_price": gf("entry_price"), "high": gf("high"),
                     "pts": gf("pts"), "initial_pts": gf("initial_pts"),
-                    "last_price": gf("last_price"), "ch5": gf("ch5"), "spike": gf("spike")
+                    "last_price": gf("last_price"), "ch5": gf("ch5"), "spike": gf("spike"),
+                    "last_alert_ts": gf("last_alert_ts"), "last_alert_price": gf("last_alert_price")
                 }
 
                 # تحديث حيّ للقيم
@@ -255,7 +272,21 @@ def monitor_room_loop():
 
                 move = pct(price, st["entry_price"])
                 if in_trusted and ch5 >= ch5_thr and spike >= spk_thr and move >= move_thr:
-                    tg(f"🚀 {sym} (موثوق) ch5={ch5:.2f}% spike={spike:.2f}× move={move:.2f}%")
+                    # تبريد + إعادة تسليح لمنع التكرار
+                    last_ts    = st["last_alert_ts"]
+                    last_price = st["last_alert_price"]
+                    ok_time = (time.time() - last_ts) >= COOLDOWN_SEC
+                    ok_move = (last_price == 0) or (price >= last_price * (1 + REARM_PCT/100.0))
+                    if not (ok_time or ok_move):
+                        continue
+
+                    msg = f"🚀 {sym} (موثوق) ch5={ch5:.2f}% spike={spike:.2f}× move={move:.2f}%"
+                    tg(msg)
+                    notify_saqr(f"اشتري {sym}")
+                    r.hset(KEY_COIN_HASH(sym), mapping={
+                        "last_alert_ts": str(int(time.time())),
+                        "last_alert_price": f"{price}"
+                    })
 
         except Exception as e:
             print("monitor error:", e)
