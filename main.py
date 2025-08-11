@@ -446,16 +446,18 @@ def analyzer():
 # =========================
 # 🌐 فحوصات
 # =========================
-@app.route("/", methods=["GET"])
-def health():
-    return "Predictor bot is alive ✅", 200
-
-@app.route("/stats", methods=["GET"])
-def stats():
+@app.route("/heat", methods=["GET"])
+def heat_info():
     return {
-        "watchlist": list(watchlist),
-        "heat": round(heat_ewma, 4),
-        "roomsz": len(watchlist)
+        "market_heat": round(heat_ewma, 4),      # حرارة السوق الحالية
+        "dyn_rank_limit": dyn_rank_filter(),     # الحد المسموح للرتبة حاليًا
+        "pattern_multiplier": adaptive_multipliers(), # معامل الأنماط الحالي
+        "watchlist": list(watchlist),             # قائمة العملات في الغرفة
+        "watchlist_size": len(watchlist),         # عدد العملات في الغرفة
+        "last_alerts": {
+            k: time.strftime('%H:%M:%S', time.localtime(v))
+            for k, v in last_alert.items()
+        }
     }, 200
 
 # =========================
