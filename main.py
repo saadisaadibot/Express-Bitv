@@ -490,21 +490,40 @@ def telegram_webhook():
     try:
         data = request.get_json(force=True, silent=True) or {}
         msg = data.get("message") or data.get("edited_message") or {}
-        chat_id = str((msg.get("chat", {}) or {}).get("id", ""))
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip()
 
-        # تقييد الأوامر على CHAT_ID إذا مضبوط
+        # ✅ طباعة لوج لكل رسالة داخلة
+        print(f"[TG] from={chat_id} text={repr(text)}")
+
+        # ✅ تقييد الشات (إن وُضع)
         if CHAT_ID and chat_id and chat_id != str(CHAT_ID):
             return {"ok": True}, 200
 
-        low = text.lower().replace("‏", "").strip()  # تنظيف بعض المحارف
-        if low in ["/افتح السجل", "افتح السجل", "/openlog", "openlog"]:
+        # ✅ تطبيع نص: حذف محارف خفية وتطبيع مسافات
+        HIDDEN = ["\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u200d", "\u061C", "ـ"]
+        low = text
+        for h in HIDDEN:
+            low = low.replace(h, "")
+        low = " ".join(low.split()).lower()
+
+        # خرائط أوامر واسعة
+        OPEN_ALIASES  = {"/افتح السجل","افتح السجل","/openlog","openlog"}
+        CLOSE_ALIASES = {"/اغلق السجل","اغلق السجل","/closelog","closelog"}
+        STATUS_ALIASES= {"/status","شو عم تعمل","/شو_عم_تعمل","شو عم_تعمل"}
+
+        if low in OPEN_ALIASES:
             set_log_stream(True)
-            send_message("📒 تم فتح السجل.\n" + dump_last_alerts_text(50))
-        elif low in ["/اغلق السجل", "اغلق السجل", "/closelog", "closelog"]:
+            send_message("📒 تم فتح السجل. (سيتم بث أي تنبيه جديد هنا)")
+            # استخدام إرسال طويل لتفادي حد 4096
+            send_long_message(dump_last_alerts_text(50))
+
+        elif low in CLOSE_ALIASES:
             set_log_stream(False)
-            send_message("✅ تم إغلاق السجل (لن يتم بث التنبيهات الجديدة هنا).")
-        elif low in ["/status", "شو عم تعمل", "/شو_عم_تعمل"]:
+            send_message("✅ تم إغلاق السجل.")
+
+        elif low in STATUS_ALIASES:
             m = adaptive_multipliers()
             with lock:
                 wl = list(watchlist)
@@ -515,7 +534,11 @@ def telegram_webhook():
                 f"- revive_only={bool(REVIVE_ONLY)} | lastday_skip={LASTDAY_SKIP_PCT}%\n"
                 f"- log_stream={'on' if is_log_stream_on() else 'off'}"
             )
-        # تجاهل أي نص آخر
+        else:
+            # رد لطيف إذا الأمر مش معروف (ليس ضروريًا؛ يفيد بالتحقق)
+            if low.startswith("/"):
+                send_message("❔ أمر غير معروف. جرّب: /افتح السجل أو /اغلق السجل أو /status")
+
     except Exception as e:
         print("telegram_webhook error:", e)
     return {"ok": True}, 200
