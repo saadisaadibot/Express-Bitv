@@ -67,6 +67,10 @@ last_bad_rank = {}                        # (2) تتبّع مدة سوء الر�
 heat_ewma = 0.0
 start_time = time.time()
 
+# 📝 سجل أفعال لحظي
+ACTION_LOG_MAX = int(os.getenv("ACTION_LOG_MAX", 300))  # أقصى عدد أسطر بالسجل
+action_log = deque(maxlen=ACTION_LOG_MAX)
+
 # =========================
 # 🛰️ Bitvavo helpers
 # =========================
@@ -148,7 +152,7 @@ def get_rank_from_bitvavo(coin):
     return {sym: i+1 for i, (sym, _) in enumerate(scores)}.get(coin, 999)
 
 # =========================
-# 📣 إشعارات
+# 📣 إشعارات + سجل
 # =========================
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -159,6 +163,15 @@ def send_message(text):
                       json={"chat_id": CHAT_ID, "text": text})
     except Exception as e:
         print("Telegram error:", e)
+
+def log_action(event, coin=None, extra=None):
+    ts = time.strftime('%H:%M:%S', time.localtime())
+    item = {"t": ts, "e": event}
+    if coin:
+        item["c"] = coin
+    if extra is not None:
+        item["x"] = extra
+    action_log.append(item)
 
 # (3) فلترة الرتبة ديناميكيًا بحسب حرارة السوق
 def dyn_rank_filter():
@@ -204,14 +217,15 @@ def notify_buy(coin, tag, change_text=None):
     if change_text:
         msg = f"🚀 {coin} {change_text} #top{rank}"
     send_message(msg)
+    log_action("alert", coin, {"tag": tag, "rank": rank})
 
     if SAQAR_WEBHOOK:
         try:
             requests.post(SAQAR_WEBHOOK,
                           json={"message": {"text": f"اشتري {coin}"}},
                           timeout=5)
-        except Exception:
-            pass
+        except Exception as e:
+            log_action("error_webhook", coin, str(e))
 
 # =========================
 # 🔥 حرارة السوق + التكييف
@@ -364,36 +378,46 @@ def room_refresher():
                 syms = syms[:SEED_ROOM_SIZE]
                 with lock:
                     for s in syms:
-                        watchlist.add(s)
+                        if s not in watchlist:
+                            watchlist.add(s)
+                            log_action("seed_add", s)
             else:
                 # السلوك الأصلي (Top 5m)
                 new_syms = get_5m_top_symbols(limit=MAX_ROOM)
                 with lock:
                     for s in new_syms:
-                        watchlist.add(s)
+                        if s not in watchlist:
+                            watchlist.add(s)
+                            log_action("room_add", s)
                     if len(watchlist) > MAX_ROOM:
                         ranked = sorted(list(watchlist), key=lambda c: get_rank_from_bitvavo(c))
                         watchlist.clear()
                         for c in ranked[:MAX_ROOM]:
                             watchlist.add(c)
+                        log_action("room_rebalance", extra={"size": len(watchlist)})
         except Exception as e:
             print("room_refresher error:", e)
+            log_action("error_room_refresher", extra=str(e))
         time.sleep(BATCH_INTERVAL_SEC)
 
 def price_poller():
     while True:
         now = time.time()
-        with lock:
-            syms = list(watchlist)
-        for s in syms:
-            pr = get_price(s)
-            if pr is None:
-                continue
-            dq = prices[s]
-            dq.append((now, pr))
-            cutoff = now - 1200  # 20 دقيقة
-            while dq and dq[0][0] < cutoff:
-                dq.popleft()
+        try:
+            with lock:
+                syms = list(watchlist)
+            for s in syms:
+                pr = get_price(s)
+                if pr is None:
+                    continue
+                dq = prices[s]
+                dq.append((now, pr))
+                cutoff = now - 1200  # 20 دقيقة
+                while dq and dq[0][0] < cutoff:
+                    dq.popleft()
+        except Exception as e:
+            print("price_poller error:", e)
+            log_action("error_price_poller", extra=str(e))
         time.sleep(SCAN_INTERVAL)
 
 def analyzer():
@@ -415,6 +439,7 @@ def analyzer():
                     if time.time() - last_bad_rank[s] >= EVICT_GRACE_SEC:
                         with lock:
                             watchlist.discard(s)
+                        log_action("evict_rank", s, {"rank": rk})
                         last_bad_rank.pop(s, None)
                         continue
                 else:
@@ -431,33 +456,58 @@ def analyzer():
                             and quiet <= REVIVE_MAX_STD_PCT
                             and ch1 >= REVIVE_1M_PCT and ch3 >= REVIVE_3M_PCT
                             and stable_lately(s)):
+                            log_action("revive_hit", s, {"ch1m": round(ch1,2),
+                                                         "ch3m": round(ch3,2),
+                                                         "quiet_std%": round(quiet,2)})
                             notify_buy(s, tag="revive")
                             continue
 
                 # اكتشاف الأنماط الأساسية
                 if check_top1_pattern(s, m):
+                    log_action("top1_hit", s, {"mult": m})
                     notify_buy(s, tag="top1"); continue
                 if check_top10_pattern(s, m):
+                    log_action("top10_hit", s, {"mult": m})
                     notify_buy(s, tag="top10")
         except Exception as e:
             print("analyzer error:", e)
+            log_action("error_analyzer", extra=str(e))
         time.sleep(1)
 
 # =========================
-# 🌐 فحوصات
+# 🌐 فحوصات + واجهات
 # =========================
+@app.route("/", methods=["GET"])
+def health():
+    return "Predictor bot is alive ✅", 200
+
 @app.route("/heat", methods=["GET"])
 def heat_info():
     return {
-        "market_heat": round(heat_ewma, 4),      # حرارة السوق الحالية
-        "dyn_rank_limit": dyn_rank_filter(),     # الحد المسموح للرتبة حاليًا
-        "pattern_multiplier": adaptive_multipliers(), # معامل الأنماط الحالي
-        "watchlist": list(watchlist),             # قائمة العملات في الغرفة
-        "watchlist_size": len(watchlist),         # عدد العملات في الغرفة
+        "market_heat": round(heat_ewma, 4),            # حرارة السوق الحالية
+        "dyn_rank_limit": dyn_rank_filter(),           # الحد المسموح للرتبة حاليًا
+        "pattern_multiplier": adaptive_multipliers(),  # معامل الأنماط الحالي
+        "watchlist": list(watchlist),                  # قائمة العملات في الغرفة
+        "watchlist_size": len(watchlist),              # عدد العملات في الغرفة
         "last_alerts": {
             k: time.strftime('%H:%M:%S', time.localtime(v))
             for k, v in last_alert.items()
         }
+    }, 200
+
+@app.route("/sajel", methods=["GET"])
+def trade_log():
+    # ?limit=50 للحد من النتائج (افتراضي 30)
+    try:
+        limit = int(request.args.get("limit", 30))
+    except:
+        limit = 30
+    limit = max(1, min(limit, ACTION_LOG_MAX))
+    data = list(action_log)[-limit:][::-1]  # أحدث أولاً
+    return {
+        "count": len(data),
+        "max": ACTION_LOG_MAX,
+        "items": data
     }, 200
 
 # =========================
