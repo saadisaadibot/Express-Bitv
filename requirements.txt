@@ -1,3 +1,4 @@
+gunicorn
 waitress
 Flask
 redis
