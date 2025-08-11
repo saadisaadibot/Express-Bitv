@@ -28,8 +28,8 @@ HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))     # كم % خلا
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))      # EWMA لنعومة الحرارة
 
 # منع السبام / تكرار التنبيهات
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))   # كولداون احتياطي (لن نستخدمه إذا فعّلنا التنبيه-مرة-واحدة)
-ALERT_EXPIRE_SEC     = int(os.getenv("ALERT_EXPIRE_SEC", 24*3600)) # مدة منع التكرار لكل عملة (افتراضي يوم كامل)
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))   # كولداون احتياطي
+ALERT_EXPIRE_SEC     = int(os.getenv("ALERT_EXPIRE_SEC", 24*3600)) # مرة واحدة/24h لكل عملة
 GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))   # مهلة إحماء بعد التشغيل
 
 # فلترة “انفجرت آخر يوم” و“الميتة تتنفس”
@@ -40,8 +40,8 @@ CANDLES_LIMIT_1H     = int(os.getenv("CANDLES_LIMIT_1H", 168))    # 7 أيام *
 
 # توصيلات
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
-CHAT_ID              = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK")  # اختياري: يرسل "اشتري COIN"
+CHAT_ID              = os.getenv("CHAT_ID")           # مفضل تقييد الأوامر لهذا الشات
+SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK")     # اختياري: يرسل "اشتري COIN"
 REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # =========================
@@ -56,7 +56,7 @@ heat_ewma = 0.0                         # حرارة السوق الملسّاة
 start_time = time.time()
 
 # =========================
-# 🛰️ دوال مساعدة (Bitvavo)
+# 🛰️ Bitvavo helpers
 # =========================
 BASE_URL = "https://api.bitvavo.com/v2"
 
@@ -68,22 +68,17 @@ def http_get(url, params=None, timeout=8):
             time.sleep(0.5)
     return None
 
-def get_price(symbol):  # symbol مثل "ADA"
+def get_price(symbol):  # مثل "ADA"
     market = f"{symbol}-EUR"
     resp = http_get(f"{BASE_URL}/ticker/price", {"market": market})
     if not resp or resp.status_code != 200:
         return None
     try:
-        data = resp.json()
-        return float(data["price"])
+        return float(resp.json()["price"])
     except Exception:
         return None
 
 def get_24h_change(symbol):
-    """
-    تغيّر 24h % من Bitvavo.
-    نُخزّنه 5 دقائق لتخفيف الضغط.
-    """
     ck = f"ch24:{symbol}"
     cached = r.get(ck)
     if cached is not None:
@@ -96,8 +91,7 @@ def get_24h_change(symbol):
     if not resp or resp.status_code != 200:
         return None
     try:
-        data = resp.json()
-        ch = float(data.get("priceChangePercentage", "0") or 0)
+        ch = float(resp.json().get("priceChangePercentage", "0") or 0)
         r.setex(ck, 300, str(ch))
         return ch
     except:
@@ -105,45 +99,31 @@ def get_24h_change(symbol):
 
 def get_candles_1h(symbol, limit=CANDLES_LIMIT_1H):
     market = f"{symbol}-EUR"
-    # Bitvavo: /markets/{market}/candles?interval=1h&limit=...
     resp = http_get(f"{BASE_URL}/markets/{market}/candles", {"interval": "1h", "limit": limit}, timeout=10)
     if not resp or resp.status_code != 200:
         return []
     try:
-        # كل شمعة: [timestamp, open, high, low, close, volume]
-        return resp.json()
+        return resp.json()  # [ts, open, high, low, close, vol]
     except:
         return []
 
 def is_recent_exploder(symbol):
-    """
-    True إذا كانت العملة 'منفجرة' خلال آخر 24 ساعة (≥ LASTDAY_SKIP_PCT).
-    """
     ch24 = get_24h_change(symbol)
     return (ch24 is not None) and (ch24 >= LASTDAY_SKIP_PCT)
 
 def is_reviving(symbol):
-    """
-    'ميّتة وعم تتنفس':
-    - خلال 7 أيام: لم تُظهر ارتفاعات حادة (هدوء/ركود) → max(returns) <= ~15%
-    - خلال 24h: ليست مرتفعة أصلاً (ch24 < 8%)
-    ملاحظة: شروط مرنة جدًا وقابلة للتعديل لاحقًا.
-    """
     key = f"revive:{symbol}"
     cached = r.get(key)
     if cached is not None:
         return cached.decode() == "1"
-
     candles = get_candles_1h(symbol)
-    if len(candles) < 24:  # بيانات قليلة => ما نحكم
+    if len(candles) < 24:
         r.setex(key, REVIVE_CACHE_SEC, "0")
         return False
-
     closes = [float(c[4]) for c in candles if len(c) >= 5]
     if len(closes) < 24:
         r.setex(key, REVIVE_CACHE_SEC, "0")
         return False
-
     base = closes[0]
     max_up = 0.0
     for c in closes[1:]:
@@ -151,20 +131,15 @@ def is_reviving(symbol):
             ch = (c - base) / base * 100.0
             if ch > max_up:
                 max_up = ch
-
     ch24 = get_24h_change(symbol) or 0.0
-    ok = (max_up <= 15.0) and (ch24 < 8.0)  # هادئة أسبوعيًا + ليست مرتفعة يوميًا
+    ok = (max_up <= 15.0) and (ch24 < 8.0)
     r.setex(key, REVIVE_CACHE_SEC, "1" if ok else "0")
     return ok
 
 def get_5m_top_symbols(limit=MAX_ROOM):
-    """
-    نجمع أفضل العملات بفريم 5m اعتمادًا على الشموع (فرق الإغلاق الحالي عن إغلاق قبل ~5m).
-    """
     resp = http_get(f"{BASE_URL}/markets")
     if not resp or resp.status_code != 200:
         return []
-
     symbols = []
     try:
         markets = resp.json()
@@ -175,7 +150,6 @@ def get_5m_top_symbols(limit=MAX_ROOM):
                     symbols.append(base)
     except Exception:
         pass
-
     now = time.time()
     changes = []
     for base in symbols:
@@ -188,27 +162,18 @@ def get_5m_top_symbols(limit=MAX_ROOM):
         cur = get_price(base)
         if cur is None:
             continue
-        if old:
-            ch = (cur - old) / old * 100.0
-        else:
-            ch = 0.0
+        ch = (cur - old) / old * 100.0 if old else 0.0
         changes.append((base, ch))
         dq.append((now, cur))
         cutoff = now - 900
         while dq and dq[0][0] < cutoff:
             dq.popleft()
-
     changes.sort(key=lambda x: x[1], reverse=True)
     return [c[0] for c in changes[:limit]]
 
 def get_rank_from_bitvavo(coin):
-    """
-    ترتيب العملة لحظيًا ضمن Top حسب تغيّر 5m المحلي (من deque).
-    إذا ما قدر يحدده، يرجع رقم كبير (خارج التوب).
-    """
     now = time.time()
     scores = []
-    # نوسع الترتيب على كل الغرفة وليس فقط العملة
     with lock:
         wl = list(watchlist)
     for c in wl:
@@ -228,22 +193,31 @@ def get_rank_from_bitvavo(coin):
     return rank_map.get(coin, 999)
 
 # =========================
-# 📣 إرسال الإشعارات + السجل
+# 📣 تلغرام + السجل
 # =========================
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
         print(f"[TG_DISABLED] {text}")
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=6)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=6
+        )
     except Exception as e:
         print("Telegram error:", e)
+
+def send_long_message(text):
+    # تقسيم الرسالة الطويلة لتجنب حد 4096
+    chunk = 3500
+    for i in range(0, len(text), chunk):
+        send_message(text[i:i+chunk])
 
 def log_alert(entry: dict):
     try:
         r.lpush("alerts", json.dumps(entry, ensure_ascii=False))
-        r.ltrim("alerts", 0, 49)  # احتفظ بآخر 50 فقط
+        r.ltrim("alerts", 0, 49)  # آخر 50
     except Exception as e:
         print("log_alert error:", e)
 
@@ -253,30 +227,55 @@ def already_alerted_today(coin):
 def mark_alerted_today(coin):
     r.setex(f"alerted:{coin}", ALERT_EXPIRE_SEC, "1")
 
+def is_log_stream_on():
+    return r.get("log_stream") == b"on"
+
+def set_log_stream(on: bool):
+    r.set("log_stream", "on" if on else "off")
+
+def format_alert_line(a, idx=None):
+    # a: {"ts":..., "coin":..., "rank":..., "tag":..., "heat":...}
+    ts = a.get("ts")
+    tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+    line = f"{tstr}  |  {a.get('coin','?'):>6}  |  #{a.get('rank','?'):<3}  |  {a.get('tag','?'):>6}  | heat={a.get('heat','?')}"
+    if idx is not None:
+        line = f"{idx:02d}. " + line
+    return line
+
+def dump_last_alerts_text(limit=50):
+    items = []
+    for raw in r.lrange("alerts", 0, limit-1):
+        try:
+            items.append(json.loads(raw))
+        except:
+            pass
+    if not items:
+        return "لا يوجد سجل بعد."
+    lines = ["📒 آخر التنبيهات:"]
+    for i, a in enumerate(items, 1):
+        lines.append(format_alert_line(a, i))
+    return "\n".join(lines)
+
 def notify_buy(coin, tag, change_text=None):
-    # منع التكرار “مرة واحدة باليوم”
+    # مرة واحدة/يوم
     if already_alerted_today(coin):
         return
-
-    # فلترة: إذا منفجرة آخر يوم → تجاهل
+    # تجاهل المنفجرة 24h
     if is_recent_exploder(coin):
         return
-
-    # فلترة “الميتة تتنفس”
+    # شرط revive
     revive_ok = is_reviving(coin)
     if REVIVE_ONLY and not revive_ok:
         return
-
+    # فلترة الترتيب
     rank = get_rank_from_bitvavo(coin)
     if rank > RANK_FILTER:
         return
-
-    # كولداون احتياطي (لن يعمل غالباً لأننا نستخدم once/day)
+    # كولداون احتياطي
     now = time.time()
     if coin in last_alert and now - last_alert[coin] < BUY_COOLDOWN_SEC:
         return
     last_alert[coin] = now
-
     mark_alerted_today(coin)
 
     tag_txt = f"{tag}"
@@ -286,7 +285,6 @@ def notify_buy(coin, tag, change_text=None):
     msg = f"🚀 {coin} {tag_txt} #top{rank}"
     if change_text:
         msg = f"🚀 {coin} {change_text} #top{rank}"
-
     send_message(msg)
 
     # إلى صقر (اختياري)
@@ -297,17 +295,14 @@ def notify_buy(coin, tag, change_text=None):
         except Exception:
             pass
 
-    # سجل
-    log_alert({
-        "ts": int(now),
-        "coin": coin,
-        "rank": rank,
-        "tag": tag_txt,
-        "heat": round(heat_ewma, 4)
-    })
+    # سجل + بث فوري إذا مفعل
+    entry = {"ts": int(now), "coin": coin, "rank": rank, "tag": tag_txt, "heat": round(heat_ewma, 4)}
+    log_alert(entry)
+    if is_log_stream_on():
+        send_message("🧾 " + format_alert_line(entry))
 
 # =========================
-# 🔥 حرارة السوق + تكييف العتبات
+# 🔥 حرارة السوق + تكييف
 # =========================
 def compute_market_heat():
     global heat_ewma
@@ -348,7 +343,7 @@ def adaptive_multipliers():
     return m
 
 # =========================
-# 🧩 منطق الأنماط (top10 / top1)
+# 🧩 أنماط (top10 / top1)
 # =========================
 def check_top10_pattern(coin, m):
     thresh = BASE_STEP_PCT * m
@@ -356,12 +351,10 @@ def check_top10_pattern(coin, m):
     dq = prices[coin]
     if len(dq) < 2:
         return False
-
     start_ts = now - STEP_WINDOW_SEC
     window = [(ts, p) for ts, p in dq if ts >= start_ts]
     if len(window) < 3:
         return False
-
     p0 = window[0][1]
     step1 = False
     last_p = p0
@@ -387,13 +380,11 @@ def check_top1_pattern(coin, m):
     dq = prices[coin]
     if len(dq) < 2:
         return False
-
     start_ts = now - SEQ_WINDOW_SEC
     window = [(ts, p) for ts, p in dq if ts >= start_ts]
     if len(window) < 3:
         return False
-
-    slack = 0.3 * m  # سماحية تراجع بسيطة
+    slack = 0.3 * m
     base_p = window[0][1]
     step_i = 0
     peak_after_step = base_p
@@ -455,20 +446,15 @@ def analyzer():
         if time.time() - start_time < GLOBAL_WARMUP_SEC:
             time.sleep(1)
             continue
-
         try:
             compute_market_heat()
             m = adaptive_multipliers()
-
             with lock:
                 syms = list(watchlist)
-
             for s in syms:
-                # نمط top1 أولًا (أقوى)
                 if check_top1_pattern(s, m):
                     notify_buy(s, tag="top1")
                     continue
-                # ثم top10
                 if check_top10_pattern(s, m):
                     notify_buy(s, tag="top10")
         except Exception as e:
@@ -476,25 +462,14 @@ def analyzer():
         time.sleep(1)
 
 # =========================
-# 🌐 مسارات مساعدة
+# 🌐 مسارات
 # =========================
 @app.route("/", methods=["GET"])
 def health():
     return "Predictor bot is alive ✅", 200
 
-@app.route("/stats", methods=["GET"])
-def stats():
-    with lock:
-        wl = list(watchlist)
-    return {
-        "watchlist": wl,
-        "heat": round(heat_ewma, 4),
-        "roomsz": len(wl)
-    }, 200
-
 @app.route("/status", methods=["GET"])
 def status():
-    # “شو عم يعمل؟” مختصر
     m = adaptive_multipliers()
     with lock:
         wl = list(watchlist)
@@ -505,19 +480,45 @@ def status():
         "watchlist_size": len(wl),
         "rank_filter": RANK_FILTER,
         "lastday_skip_pct": LASTDAY_SKIP_PCT,
-        "revive_only": bool(REVIVE_ONLY)
+        "revive_only": bool(REVIVE_ONLY),
+        "log_stream": is_log_stream_on()
     }, 200
 
-@app.route("/sajel", methods=["GET"])
-def sajel():
-    # يعرض آخر 50 تنبيه
-    items = []
-    for raw in r.lrange("alerts", 0, 49):
-        try:
-            items.append(json.loads(raw))
-        except:
-            pass
-    return {"alerts": items}, 200
+# ============== Webhook تلغرام (للأوامر) ==============
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        msg = data.get("message") or data.get("edited_message") or {}
+        chat_id = str((msg.get("chat", {}) or {}).get("id", ""))
+        text = (msg.get("text") or "").strip()
+
+        # تقييد الأوامر على CHAT_ID إذا مضبوط
+        if CHAT_ID and chat_id and chat_id != str(CHAT_ID):
+            return {"ok": True}, 200
+
+        low = text.lower().replace("‏", "").strip()  # تنظيف بعض المحارف
+        if low in ["/افتح السجل", "افتح السجل", "/openlog", "openlog"]:
+            set_log_stream(True)
+            send_message("📒 تم فتح السجل.\n" + dump_last_alerts_text(50))
+        elif low in ["/اغلق السجل", "اغلق السجل", "/closelog", "closelog"]:
+            set_log_stream(False)
+            send_message("✅ تم إغلاق السجل (لن يتم بث التنبيهات الجديدة هنا).")
+        elif low in ["/status", "شو عم تعمل", "/شو_عم_تعمل"]:
+            m = adaptive_multipliers()
+            with lock:
+                wl = list(watchlist)
+            send_message(
+                f"ℹ️ الحالة:\n"
+                f"- heat={round(heat_ewma,4)} | m={m}\n"
+                f"- watchlist={len(wl)} | rank_filter={RANK_FILTER}\n"
+                f"- revive_only={bool(REVIVE_ONLY)} | lastday_skip={LASTDAY_SKIP_PCT}%\n"
+                f"- log_stream={'on' if is_log_stream_on() else 'off'}"
+            )
+        # تجاهل أي نص آخر
+    except Exception as e:
+        print("telegram_webhook error:", e)
+    return {"ok": True}, 200
 
 # =========================
 # 🚀 التشغيل
@@ -526,5 +527,5 @@ if __name__ == "__main__":
     Thread(target=room_refresher, daemon=True).start()
     Thread(target=price_poller, daemon=True).start()
     Thread(target=analyzer, daemon=True).start()
-    # ملاحظة: لو على Railway/Gunicorn، يفضل عدم استخدام app.run()
+    # لبيئة Railway/Gunicorn: لا تستخدم app.run()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
