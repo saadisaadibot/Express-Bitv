@@ -445,6 +445,24 @@ def webhook():
                 coin=m.split("-")[0]
                 lines.append(f"{i:02d}. ✅ {coin} | score {s:.2f} | Δ15 {d15:.2f}% | Δ60 {d60:.2f}% | volZ {zv:.1f} | DD {dd:.2f}% | {p:.6f}€")
             send_msg("📊 Top10 (EMA + تأكيد) — ترند نظيف:\n" + "\n".join(lines), cid)
+    elif cmd in ("/topraw", "/raw"):
+    # أعلى 15 درجة ملساء مع الستريك
+        mkts = get_markets_eur()
+        rows=[]
+        for m in mkts:
+            s  = float((r.hget(KEY_STATE(m), "score_smooth") or b"0").decode() or 0)
+            up = int((r.hget(KEY_STATE(m), "up_streak") or b"0").decode() or 0)
+            dn = int((r.hget(KEY_STATE(m), "down_streak") or b"0").decode() or 0)
+            rows.append((m,s,up,dn))
+        rows.sort(key=lambda x:x[1], reverse=True)
+        lines=[f"{i+1:02d}. {m.split('-')[0]} s={s:.2f} up={u} dn={d}" for i,(m,s,u,d) in enumerate(rows[:15])]
+        send_msg("🧪 Top raw scores:\n" + "\n".join(lines), cid)
+
+    elif cmd in ("/profiles", "/pf"):
+    # كم بروفايل مبني فعليًا
+        n = sum(1 for _ in r.scan_iter(f"{NS}:profile:*"))
+        send_msg(f"📦 profiles_built={n}", cid)
+    
     elif cmd in ("/diag","تشخيص","/تشخيص"):
         rm = room_members()
         last_rb = int(r.get(KEY_LAST_REBUILD) or 0)
