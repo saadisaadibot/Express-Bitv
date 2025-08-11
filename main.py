@@ -22,7 +22,7 @@ BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")     # نمط top1: 
 SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))     # نافذة النمط القوي
 STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))    # نافذة 1% + 1%
 
-# تكييف حسب حرارة السوق
+# تكيّف حسب حرارة السوق
 HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))
 HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))
@@ -38,6 +38,16 @@ STABILITY_SEC        = int(os.getenv("STABILITY_SEC", 20))       # آخر كم �
 # (2) طرد المتأخرين
 RANK_EVICT           = int(os.getenv("RANK_EVICT", 20))          # إذا الرتبة أسوأ من هذا
 EVICT_GRACE_SEC      = int(os.getenv("EVICT_GRACE_SEC", 300))    # مهلة قبل الطرد
+
+# (3) كاشف الانتعاش (عملة ميتة تنتعش فجأة)
+REVIVE_ENABLE            = int(os.getenv("REVIVE_ENABLE", 1))
+REVIVE_QUIET_MINUTES     = int(os.getenv("REVIVE_QUIET_MINUTES", 20))   # هدوء سابق
+REVIVE_MAX_STD_PCT       = float(os.getenv("REVIVE_MAX_STD_PCT", 0.35)) # تذبذب ضعيف خلال الهدوء
+REVIVE_1M_PCT            = float(os.getenv("REVIVE_1M_PCT", 1.2))       # قفزة دقيقة
+REVIVE_3M_PCT            = float(os.getenv("REVIVE_3M_PCT", 2.5))       # قفزة 3 دقائق
+REVIVE_RANK_ALLOW        = int(os.getenv("REVIVE_RANK_ALLOW", 20))      # رتبة مسموحة للإشعار
+SEED_WARMUP_MINUTES      = int(os.getenv("SEED_WARMUP_MINUTES", 6))     # بذرة شاملة بالبداية
+SEED_ROOM_SIZE           = int(os.getenv("SEED_ROOM_SIZE", 120))        # عدد عملات البذرة
 
 # توصيلات
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
@@ -242,7 +252,7 @@ def adaptive_multipliers():
         return 1.25
 
 # =========================
-# 🧩 منطق الأنماط (كما هو)
+# 🧩 منطق الأنماط
 # =========================
 def check_top10_pattern(coin, m):
     thresh = BASE_STEP_PCT * m
@@ -305,21 +315,67 @@ def check_top1_pattern(coin, m):
                     step_i = 0
     return False
 
+# ======== أدوات كاشف الانتعاش ========
+def pct_change_over(coin, seconds):
+    now = time.time()
+    dq = prices[coin]
+    if not dq:
+        return None
+    cur_ts, cur_p = dq[-1]
+    base = None
+    for ts, pr in reversed(dq):
+        if now - ts >= seconds:
+            base = pr
+            break
+    if base is None or base <= 0:
+        return None
+    return (cur_p - base) / base * 100.0
+
+def std_pct_last(coin, seconds):
+    now = time.time()
+    vals = [p for (ts, p) in prices[coin] if now - ts <= seconds]
+    if len(vals) < 5:
+        return None
+    avg = sum(vals)/len(vals)
+    if avg <= 0:
+        return None
+    var = sum((p-avg)**2 for p in vals)/len(vals)
+    std = math.sqrt(var)
+    return (std/avg)*100.0
+
 # =========================
 # 🔁 العمال
 # =========================
+seed_until = time.time() + SEED_WARMUP_MINUTES*60
+
 def room_refresher():
     while True:
         try:
-            new_syms = get_5m_top_symbols(limit=MAX_ROOM)
-            with lock:
-                for s in new_syms:
-                    watchlist.add(s)
-                if len(watchlist) > MAX_ROOM:
-                    ranked = sorted(list(watchlist), key=lambda c: get_rank_from_bitvavo(c))
-                    watchlist.clear()
-                    for c in ranked[:MAX_ROOM]:
-                        watchlist.add(c)
+            if time.time() < seed_until:
+                # بذرة واسعة: أضف أكبر قدر من رموز EUR للتاريخ المبكّر
+                resp = http_get(f"{BASE_URL}/markets")
+                syms = []
+                if resp and resp.status_code == 200:
+                    for m in resp.json():
+                        if m.get("quote")=="EUR" and m.get("status")=="trading":
+                            b = m.get("base")
+                            if b and b.isalpha() and len(b)<=6:
+                                syms.append(b)
+                syms = syms[:SEED_ROOM_SIZE]
+                with lock:
+                    for s in syms:
+                        watchlist.add(s)
+            else:
+                # السلوك الأصلي (Top 5m)
+                new_syms = get_5m_top_symbols(limit=MAX_ROOM)
+                with lock:
+                    for s in new_syms:
+                        watchlist.add(s)
+                    if len(watchlist) > MAX_ROOM:
+                        ranked = sorted(list(watchlist), key=lambda c: get_rank_from_bitvavo(c))
+                        watchlist.clear()
+                        for c in ranked[:MAX_ROOM]:
+                            watchlist.add(c)
         except Exception as e:
             print("room_refresher error:", e)
         time.sleep(BATCH_INTERVAL_SEC)
@@ -364,7 +420,21 @@ def analyzer():
                 else:
                     last_bad_rank.pop(s, None)
 
-                # اكتشاف الأنماط
+                # --- Revive detector (عملة ميتة تنتعش فجأة) ---
+                if REVIVE_ENABLE:
+                    rk_allow = REVIVE_RANK_ALLOW
+                    if rk <= rk_allow:
+                        ch1 = pct_change_over(s, 60)    # دقيقة
+                        ch3 = pct_change_over(s, 180)   # 3 دقائق
+                        quiet = std_pct_last(s, REVIVE_QUIET_MINUTES*60)
+                        if (ch1 is not None and ch3 is not None and quiet is not None
+                            and quiet <= REVIVE_MAX_STD_PCT
+                            and ch1 >= REVIVE_1M_PCT and ch3 >= REVIVE_3M_PCT
+                            and stable_lately(s)):
+                            notify_buy(s, tag="revive")
+                            continue
+
+                # اكتشاف الأنماط الأساسية
                 if check_top1_pattern(s, m):
                     notify_buy(s, tag="top1"); continue
                 if check_top10_pattern(s, m):
