@@ -22,20 +22,20 @@ TICK_SEC            = float(os.getenv("TICK_SEC", 3.0))      # دورة المر
 EXCLUDE_24H_PCT     = float(os.getenv("EXCLUDE_24H_PCT", 12.0))  # استثناء رابحين 24h الكبار
 
 # عتبات التحمية
-PRE_R60             = float(os.getenv("PRE_R60", 0.40))      # %
-PRE_R20             = float(os.getenv("PRE_R20", 0.20))      # %
+PRE_R60             = float(os.getenv("PRE_R60", 0.30))      # %
+PRE_R20             = float(os.getenv("PRE_R20", 0.15))      # %
 PRE_NODIP           = float(os.getenv("PRE_NODIP", 0.25))    # %
 PRE_VOLBOOST        = float(os.getenv("PRE_VOLBOOST", 1.4))  # ×
 
 # عتبات التريغر (الانفجار)
-TRIG_R40            = float(os.getenv("TRIG_R40", 0.80))     # %
-TRIG_R120           = float(os.getenv("TRIG_R120", 1.60))    # %
-TRIG_R20HELP        = float(os.getenv("TRIG_R20HELP", 0.30)) # %
-TRIG_VOLZ           = float(os.getenv("TRIG_VOLZ", 1.2))     # Z-score
+TRIG_R40            = float(os.getenv("TRIG_R40", 0.60))     # %
+TRIG_R120           = float(os.getenv("TRIG_R120", 1.20))    # %
+TRIG_R20HELP        = float(os.getenv("TRIG_R20HELP", 0.25)) # %
+TRIG_VOLZ           = float(os.getenv("TRIG_VOLZ", 1.0))     # Z-score
 
-ALERT_COOLDOWN_SEC  = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
+ALERT_COOLDOWN_SEC  = int(os.getenv("ALERT_COOLDOWN_SEC", 120))
 SPREAD_MAX_BP       = int(os.getenv("SPREAD_MAX_BP", 30))    # 0.30% أقصى سبريد لحظة الإشارة
-COIN_SILENT_SEC     = int(os.getenv("COIN_SILENT_SEC", 10))  # صمت أولي لكل عملة بعد دخول الغرفة
+COIN_SILENT_SEC     = int(os.getenv("COIN_SILENT_SEC", 5))  # صمت أولي لكل عملة بعد دخول الغرفة
 
 # تلغرام/إشعارات (اختياري)
 BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
