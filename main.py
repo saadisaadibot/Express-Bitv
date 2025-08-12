@@ -35,6 +35,7 @@ TRIG_VOLZ           = float(os.getenv("TRIG_VOLZ", 1.2))     # Z-score
 
 ALERT_COOLDOWN_SEC  = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 SPREAD_MAX_BP       = int(os.getenv("SPREAD_MAX_BP", 30))    # 0.30% أقصى سبريد لحظة الإشارة
+COIN_SILENT_SEC     = int(os.getenv("COIN_SILENT_SEC", 10))  # صمت أولي لكل عملة بعد دخول الغرفة
 
 # تلغرام/إشعارات (اختياري)
 BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
@@ -55,7 +56,7 @@ MARKET_BLACKLIST = {
 # 🌐 HTTP Session + Retry بسيط
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"Nems-Sniper/1.2"})
+session.headers.update({"User-Agent":"Nems-Sniper/1.3"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
@@ -122,7 +123,8 @@ def is_supported_market(market: str) -> bool:
 class CoinState:
     __slots__ = ("symbol","market","entered_at","expires_at","preheat",
                  "last_alert_at","buffer","vol_hist","vol_mu","vol_sigma",
-                 "last_seen_price","last_seen_time","debounce_ok","promoted")
+                 "last_seen_price","last_seen_time","debounce_ok","promoted",
+                 "spread_bp","trig_debounce","silent_until")
 
     def __init__(self, symbol, market=None):
         self.symbol = (symbol or "").upper()
@@ -139,6 +141,10 @@ class CoinState:
         self.last_seen_price = None
         self.last_seen_time = 0
         self.debounce_ok = 0
+        # تحسينات:
+        self.spread_bp = 0.0
+        self.trig_debounce = 0
+        self.silent_until = self.entered_at + COIN_SILENT_SEC
 
     def renew(self):
         self.expires_at = now_ts() + TTL_MIN*60
@@ -307,12 +313,16 @@ def discovery_loop():
             )
             pick = sorted_top[:max(ROOM_CAP, 20)]
 
-            # حدّث الغرفة
+            # حدّث الغرفة + مرّر السبريد إلى الحالة
             with room_lock:
                 wanted = {p["market"] for p in pick}
+                # جدّد الموجود
                 for m, st in list(room.items()):
                     if m in wanted:
                         st.renew()
+                # خريطة السبريد للقائمة الحالية
+                spread_map = {x["market"]: x.get("spread_bp", 0.0) for x in pick}
+                # أدخل الجدد وحدّث السبريد
                 for p in pick:
                     m = p["market"]
                     sym = p["symbol"]
@@ -320,6 +330,10 @@ def discovery_loop():
                         st = CoinState(sym, m)
                         room[m] = st
                         watchlist.add(m)
+                    st = room.get(m)
+                    if st:
+                        st.spread_bp = float(spread_map.get(m, 0.0))
+                # قص الزائد
                 if len(room) > ROOM_CAP:
                     scored = []
                     for m, st in room.items():
@@ -431,13 +445,21 @@ def monitoring_loop():
                             st.preheat = False
                         st.debounce_ok = 0
 
-                    # -------- انفجار --------
-                    if st.preheat:
-                        trig_fast  = (r40 >= TRIG_R40 and dip20 <= (PRE_NODIP+0.05))
+                    # -------- انفجار (مع ديباونس + سبريد + سايلنت) --------
+                    if st.preheat and ts >= st.silent_until:
+                        trig_fast  = (r40 >= TRIG_R40 and r20 >= 0.15 and dip20 <= (PRE_NODIP+0.05))
                         trig_accum = (r120 >= TRIG_R120 and r20 >= TRIG_R20HELP)
-                        vol_ok     = (volZ >= TRIG_VOLZ)
+                        vol_ok     = (volZ >= TRIG_VOLZ) or (volZ >= 1.0 and r20 >= 0.35)
                         cooldown_ok = (ts - st.last_alert_at) >= ALERT_COOLDOWN_SEC
-                        if (trig_fast or trig_accum) and vol_ok and cooldown_ok:
+                        spread_ok   = (not st.spread_bp) or (st.spread_bp <= SPREAD_MAX_BP)
+
+                        if (trig_fast or trig_accum) and vol_ok and cooldown_ok and spread_ok:
+                            st.trig_debounce = min(2, st.trig_debounce + 1)
+                        else:
+                            st.trig_debounce = 0
+
+                        if st.trig_debounce >= 2:
+                            st.trig_debounce = 0
                             st.last_alert_at = ts
                             notify_explosion(st.symbol)
 
@@ -515,7 +537,8 @@ def send_status(chat_override=None):
     def line(tag, tup):
         m, st, r60, r120, vz, ttl = tup
         sym = st.symbol
-        return f"{tag} {sym:<7} r60={r60:+.2f}% r120={r120:+.2f}%  VolZ={vz:+.2f}  ⏳{ttl}"
+        spr = f"  sp={st.spread_bp:.0f}bp" if st.spread_bp else ""
+        return f"{tag} {sym:<7} r60={r60:+.2f}% r120={r120:+.2f}%  VolZ={vz:+.2f}{spr}  ⏳{ttl}"
 
     lines = []
     lines.append(f"📊 الحالة — غرفة: {len(items)}/{ROOM_CAP}  |  Backoff: {'ON' if backoff_mode else 'OFF'}")
