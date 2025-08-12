@@ -28,18 +28,16 @@ HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))     # كم % خلا
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))      # EWMA لنعومة الحرارة
 
 # منع السبام
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))   # كولداون لكل عملة داخل الجلسة
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))   # كولداون لكل عملة
 GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))   # مهلة إحماء بعد التشغيل
-ALERT_EXPIRE_SEC     = int(os.getenv("ALERT_EXPIRE_SEC", 24*3600)) # عدم تكرار الإشعار 24 ساعة
 
-# فلترة عملات ارتفعت آخر 12 ساعة
-SKIP_12H_PCT         = float(os.getenv("SKIP_12H_PCT", 15.0))    # تخطّي العملات إذا كان صعود 12h ≥ هذا
-SKIP_CACHE_SEC       = int(os.getenv("SKIP_CACHE_SEC", 3600))    # كاش نتيجة الفلتر 1 ساعة
+# فلتر آخر 24 ساعة
+LASTDAY_SKIP_PCT     = float(os.getenv("LASTDAY_SKIP_PCT", 15.0))  # تجاهل إذا تغيّر 24h ≥ هذا الحد
 
 # توصيلات
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
 CHAT_ID              = os.getenv("CHAT_ID")
-SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK")                # اختياري: يرسل "اشتري COIN"
+SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK")  # اختياري: يرسل "اشتري COIN"
 REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # =========================
@@ -49,7 +47,7 @@ r = redis.from_url(REDIS_URL)
 lock = Lock()
 watchlist = set()                       # رموز مثل "ADA"
 prices = defaultdict(lambda: deque())   # لكل رمز: deque[(ts, price)]
-last_alert = {}                         # coin -> ts (داخل الجلسة فقط)
+last_alert = {}                         # coin -> ts
 heat_ewma = 0.0                         # حرارة السوق الملسّاة
 start_time = time.time()
 
@@ -67,68 +65,56 @@ def http_get(url, params=None, timeout=8):
     return None
 
 def get_price(symbol):  # symbol مثل "ADA"
-    resp = http_get(f"{BASE_URL}/ticker/price", {"market": f"{symbol}-EUR"})
+    market = f"{symbol}-EUR"
+    resp = http_get(f"{BASE_URL}/ticker/price", {"market": market})
     if not resp or resp.status_code != 200:
         return None
     try:
-        return float(resp.json()["price"])
+        data = resp.json()
+        return float(data["price"])
     except Exception:
         return None
 
-# شموع 1h الصحيحة لحساب صعود آخر 12 ساعة
-def get_candles_1h(symbol, limit=13):
-    resp = http_get(f"{BASE_URL}/candles",
-                    {"market": f"{symbol}-EUR", "interval": "1h", "limit": limit},
-                    timeout=10)
+# تغيّر آخر 24 ساعة (٪)
+def get_24h_change(symbol):
+    resp = http_get(f"{BASE_URL}/ticker/24h", {"market": f"{symbol}-EUR"})
     if not resp or resp.status_code != 200:
-        return []
+        return None
     try:
-        return resp.json()  # [ts, open, high, low, close, vol]
+        data = resp.json()
+        # Bitvavo يرجّع priceChangePercentage كنص
+        return float(data.get("priceChangePercentage", "0") or 0)
     except Exception:
-        return []
+        return None
 
-def rose_last_12h(symbol):
-    """
-    يرجع True إذا كان التغير (close_now / close_قبل 12 ساعة - 1)*100 ≥ SKIP_12H_PCT
-    فيه كاش بالريدز لتخفيف الطلبات.
-    """
-    ck = f"skip12h:{symbol}"
-    c = r.get(ck)
-    if c is not None:
-        return c == b"1"
-    candles = get_candles_1h(symbol, limit=13)
-    ok = False
-    try:
-        closes = [float(c[4]) for c in candles if len(c) >= 5]
-        if len(closes) >= 2 and closes[0] > 0:
-            ch = (closes[-1] - closes[0]) / closes[0] * 100.0
-            ok = (ch >= SKIP_12H_PCT)
-    except Exception:
-        ok = False
-    r.setex(ck, SKIP_CACHE_SEC, "1" if ok else "0")
-    return ok
+def exploded_last_24h(symbol):
+    """True إذا تغيّر 24h ≥ LASTDAY_SKIP_PCT."""
+    ch = get_24h_change(symbol)
+    return (ch is not None) and (ch >= LASTDAY_SKIP_PCT)
 
 def get_5m_top_symbols(limit=MAX_ROOM):
     """
-    نجمع أفضل العملات بفريم 5m اعتمادًا على الشموع المحلية (فرق الإغلاق الحالي عن إغلاق قبل ~5m).
+    نجمع أفضل العملات بفريم 5m اعتمادًا على الشموع (فرق الإغلاق الحالي عن إغلاق قبل ~5m)،
+    مع استثناء العملات التي انفجرت 24h.
     """
-    # نجلب كل الأسواق مقابل اليورو
     resp = http_get(f"{BASE_URL}/markets")
     if not resp or resp.status_code != 200:
         return []
 
     symbols = []
     try:
-        for m in resp.json():
+        markets = resp.json()
+        for m in markets:
             if m.get("quote") == "EUR" and m.get("status") == "trading":
                 base = m.get("base")
-                # لا نستبعد عملات فيها أرقام (1000SATS...) – خلّيها مفتوحة
-                if base:
+                if base and base.isalpha() and len(base) <= 6:
+                    # فلتر انفجار 24h
+                    if exploded_last_24h(base):
+                        continue
                     symbols.append(base)
     except Exception:
         pass
 
-    # نحسب تغيّر 5m بالاعتماد على سعر الآن وسعر محفوظ قبل ~270ث
     now = time.time()
     changes = []
     for base in symbols:
@@ -144,29 +130,15 @@ def get_5m_top_symbols(limit=MAX_ROOM):
         ch = (cur - old) / old * 100.0 if old else 0.0
         changes.append((base, ch))
 
-        # حدّث السلسلة
         dq.append((now, cur))
-        cutoff = now - 900   # ~15 دقيقة
+        cutoff = now - 900
         while dq and dq[0][0] < cutoff:
             dq.popleft()
 
-    # تخلّص من العملات التي ارتفعت 12h (من الآن) قبل إدخالها الغرفة
-    filtered = []
-    for sym, ch in changes:
-        try:
-            if rose_last_12h(sym):
-                continue
-        except Exception:
-            pass
-        filtered.append((sym, ch))
-
-    filtered.sort(key=lambda x: x[1], reverse=True)
-    return [c[0] for c in filtered[:limit]]
+    changes.sort(key=lambda x: x[1], reverse=True)
+    return [c[0] for c in changes[:limit]]
 
 def get_rank_from_bitvavo(coin):
-    """
-    ترتيب العملة ضمن الغرفة حسب تغيّر 5m المحلي.
-    """
     now = time.time()
     scores = []
     for c in list(watchlist):
@@ -181,9 +153,9 @@ def get_rank_from_bitvavo(coin):
             continue
         ch = (cur - old) / old * 100.0 if old else 0.0
         scores.append((c, ch))
-
     scores.sort(key=lambda x: x[1], reverse=True)
-    return {sym:i+1 for i,(sym,_) in enumerate(scores)}.get(coin, 999)
+    rank_map = {sym:i+1 for i,(sym,_) in enumerate(scores)}
+    return rank_map.get(coin, 999)
 
 # =========================
 # 📣 إرسال الإشعارات
@@ -194,56 +166,54 @@ def send_message(text):
         return
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=8)
+                      json={"chat_id": CHAT_ID, "text": text})
     except Exception as e:
         print("Telegram error:", e)
 
-def already_alerted_today(coin):  # عدم تكرار الإشعار 24 ساعة
+# منع تكرار الإشعار "إلى الأبد" عبر Redis Set
+def already_notified(coin):
     try:
-        return r.exists(f"alerted:{coin}") == 1
+        return r.sismember("alerted_forever", coin)
     except Exception:
         return False
 
-def mark_alerted_today(coin):
+def mark_notified(coin):
     try:
-        r.setex(f"alerted:{coin}", ALERT_EXPIRE_SEC, "1")
+        r.sadd("alerted_forever", coin)
     except Exception:
         pass
 
 def notify_buy(coin, tag, change_text=None):
-    # فلتر 12h: لا ترسل إشعار على عملة صاعدة بقوة خلال 12 ساعة
-    if rose_last_12h(coin):
+    if exploded_last_24h(coin):  # فلتر 24h قبل كل شيء
+        return
+    if already_notified(coin):   # لا نعيد الإشعار أبداً
         return
 
     rank = get_rank_from_bitvavo(coin)
     if rank > RANK_FILTER:
         return
 
-    # كولداون داخل الجلسة + عدم تكرار خلال 24h
+    # كولداون داخل الجلسة (زيادة أمان، ما بتأثر على "أبداً")
     now = time.time()
     if coin in last_alert and now - last_alert[coin] < BUY_COOLDOWN_SEC:
         return
-    if already_alerted_today(coin):
-        return
     last_alert[coin] = now
-    mark_alerted_today(coin)
+    mark_notified(coin)
 
     msg = f"🚀 {coin} {tag} #top{rank}"
     if change_text:
         msg = f"🚀 {coin} {change_text} #top{rank}"
     send_message(msg)
 
-    # إلى صقر (اختياري)
     if SAQAR_WEBHOOK:
         try:
-            requests.post(SAQAR_WEBHOOK,
-                          json={"message": {"text": f"اشتري {coin}"}},
-                          timeout=5)
+            payload = {"message": {"text": f"اشتري {coin}"}}
+            requests.post(SAQAR_WEBHOOK, json=payload, timeout=5)
         except Exception:
             pass
 
 # =========================
-# 🔥 حرارة السوق + تكييف
+# 🔥 حرارة السوق + تكييف العتبات
 # =========================
 def compute_market_heat():
     global heat_ewma
@@ -271,10 +241,11 @@ def compute_market_heat():
 
 def adaptive_multipliers():
     h = max(0.0, min(1.0, heat_ewma))
-    if h < 0.15:   return 0.75
-    if h < 0.35:   return 0.90
-    if h < 0.60:   return 1.00
-    return 1.25
+    if h < 0.15: m = 0.75
+    elif h < 0.35: m = 0.9
+    elif h < 0.6: m = 1.0
+    else: m = 1.25
+    return m
 
 # =========================
 # 🧩 أنماط (top10 / top1)
@@ -283,12 +254,10 @@ def check_top10_pattern(coin, m):
     thresh = BASE_STEP_PCT * m
     now = time.time()
     dq = prices[coin]
-    if len(dq) < 2:
-        return False
+    if len(dq) < 2: return False
     start_ts = now - STEP_WINDOW_SEC
     window = [(ts, p) for ts, p in dq if ts >= start_ts]
-    if len(window) < 3:
-        return False
+    if len(window) < 3: return False
 
     p0 = window[0][1]
     step1 = False
@@ -296,16 +265,12 @@ def check_top10_pattern(coin, m):
     for ts, pr in window[1:]:
         ch1 = (pr - p0) / p0 * 100.0
         if not step1 and ch1 >= thresh:
-            step1 = True
-            last_p = pr
-            continue
+            step1 = True; last_p = pr; continue
         if step1:
             ch2 = (pr - last_p) / last_p * 100.0
-            if ch2 >= thresh:
-                return True
+            if ch2 >= thresh: return True
             if (pr - last_p) / last_p * 100.0 <= -thresh:
-                step1 = False
-                p0 = pr
+                step1 = False; p0 = pr
     return False
 
 def check_top1_pattern(coin, m):
@@ -313,35 +278,26 @@ def check_top1_pattern(coin, m):
     seq_parts = [x * m for x in seq_parts]
     now = time.time()
     dq = prices[coin]
-    if len(dq) < 2:
-        return False
-
+    if len(dq) < 2: return False
     start_ts = now - SEQ_WINDOW_SEC
     window = [(ts, p) for ts, p in dq if ts >= start_ts]
-    if len(window) < 3:
-        return False
+    if len(window) < 3: return False
 
     slack = 0.3 * m
     base_p = window[0][1]
     step_i = 0
     peak_after_step = base_p
-
     for ts, pr in window[1:]:
         ch = (pr - base_p) / base_p * 100.0
         need = seq_parts[step_i]
         if ch >= need:
-            step_i += 1
-            base_p = pr
-            peak_after_step = pr
-            if step_i == len(seq_parts):
-                return True
+            step_i += 1; base_p = pr; peak_after_step = pr
+            if step_i == len(seq_parts): return True
         else:
             if peak_after_step > 0:
                 drop = (pr - peak_after_step) / peak_after_step * 100.0
                 if drop <= -(slack):
-                    base_p = pr
-                    peak_after_step = pr
-                    step_i = 0
+                    base_p = pr; peak_after_step = pr; step_i = 0
     return False
 
 # =========================
@@ -352,17 +308,8 @@ def room_refresher():
         try:
             new_syms = get_5m_top_symbols(limit=MAX_ROOM)
             with lock:
-                # أضف الجديد
                 for s in new_syms:
                     watchlist.add(s)
-                # نظّف الغرفة من العملات التي ارتفعت 12h
-                for s in list(watchlist):
-                    try:
-                        if rose_last_12h(s):
-                            watchlist.discard(s)
-                    except Exception:
-                        pass
-                # حافظ على الحجم
                 if len(watchlist) > MAX_ROOM:
                     ranked = sorted(list(watchlist), key=lambda c: get_rank_from_bitvavo(c))
                     watchlist.clear()
@@ -391,18 +338,14 @@ def price_poller():
 def analyzer():
     while True:
         if time.time() - start_time < GLOBAL_WARMUP_SEC:
-            time.sleep(1)
-            continue
+            time.sleep(1); continue
         try:
-            compute_market_heat()
-            m = adaptive_multipliers()
-
-            with lock:
-                syms = list(watchlist)
-
+            compute_market_heat(); m = adaptive_multipliers()
+            with lock: syms = list(watchlist)
             for s in syms:
-                # تخطّي العملات المرتفعة 12h
-                if rose_last_12h(s):
+                if exploded_last_24h(s):  # فلتر 24h عند التحليل أيضاً
+                    continue
+                if already_notified(s):
                     continue
                 if check_top1_pattern(s, m):
                     notify_buy(s, tag="top1"); continue
@@ -413,7 +356,7 @@ def analyzer():
         time.sleep(1)
 
 # =========================
-# 🌐 فحص بسيط
+# 🌐 مسارات فحص
 # =========================
 @app.route("/", methods=["GET"])
 def health():
@@ -427,6 +370,32 @@ def stats():
         "roomsz": len(watchlist)
     }, 200
 
+# امر الحالة: يعرض قائمة الغرفة مرتبة حسب تغيّر 5m الحالي (بسيط وخفيف)
+@app.route("/status", methods=["GET"])
+def status():
+    now = time.time()
+    rows = []
+    wl = list(watchlist)
+    for c in wl:
+        dq = prices[c]
+        if not dq: 
+            continue
+        cur = dq[-1][1]
+        old = None
+        for ts, pr in reversed(dq):
+            if now - ts >= 270:
+                old = pr; break
+        ch5m = ((cur - old) / old * 100.0) if (old and old > 0) else 0.0
+        rows.append((c, round(cur, 8), round(ch5m, 3)))
+    rows.sort(key=lambda x: x[2], reverse=True)
+    return {
+        "message": "OK",
+        "watchlist_size": len(wl),
+        "heat": round(heat_ewma, 4),
+        "lastday_skip_pct": LASTDAY_SKIP_PCT,
+        "list": [{"coin": c, "price": p, "ret_5m_pct": r} for c,p,r in rows]
+    }, 200
+
 # =========================
 # 🚀 التشغيل
 # =========================
@@ -434,5 +403,4 @@ if __name__ == "__main__":
     Thread(target=room_refresher, daemon=True).start()
     Thread(target=price_poller, daemon=True).start()
     Thread(target=analyzer, daemon=True).start()
-    # ملاحظة: لو على Railway/Gunicorn، عادةً يفضّل ترك app.run للـ dev فقط
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
