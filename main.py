@@ -6,9 +6,9 @@ Sniper (REST-only) — تحمية ⇢ انفجار
 - أمر تلغرام واحد: /الحالة
 """
 
-import os, time, math, json, threading, queue, random
-from collections import deque, defaultdict
-from datetime import datetime, timedelta
+import os, time, math, json, threading, random
+from collections import deque
+from datetime import datetime
 import requests
 from flask import Flask, request, jsonify
 
@@ -50,7 +50,7 @@ TIMEOUT             = float(os.getenv("HTTP_TIMEOUT", 8.0))
 # 🌐 HTTP Session + Retry بسيط
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"Nems-Sniper/1.0"})
+session.headers.update({"User-Agent":"Nems-Sniper/1.1"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
@@ -60,8 +60,7 @@ def http_get(path, params=None):
     try:
         r = session.get(url, params=params, timeout=TIMEOUT)
         if r.status_code == 429:
-            # Backoff بسيط
-            time.sleep(0.6 + random.random() * 0.6)
+            time.sleep(0.6 + random.random() * 0.6)  # Backoff بسيط
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -72,7 +71,6 @@ def http_get(path, params=None):
 # 🧰 أدوات مساعدة
 # =========================
 def pct(a, b):
-    """ نسبة تغير من b إلى a (بالمئة) """
     if b is None or b == 0:
         return 0.0
     return (a - b) / b * 100.0
@@ -90,6 +88,28 @@ def chunks(lst, n):
         yield lst[i:i+n]
 
 # =========================
+# ✅ أسواق مدعومة (حل مشكلة 404)
+# =========================
+SUPPORTED_MARKETS = set()
+
+def load_supported_markets():
+    """نجلب كل الماركتات مرة واحدة ونبني set لأزواج EUR فقط."""
+    global SUPPORTED_MARKETS
+    SUPPORTED_MARKETS.clear()
+    data = http_get("/v2/markets")
+    if not data:
+        print("[MARKETS] فشل جلب /v2/markets — سنحاول لاحقًا")
+        return
+    for m in data:
+        market = (m.get("market") or "").upper()
+        if market.endswith("-EUR"):
+            SUPPORTED_MARKETS.add(market)
+    print(f"[MARKETS] loaded {len(SUPPORTED_MARKETS)} EUR markets")
+
+def is_supported_market(market: str) -> bool:
+    return bool(market) and market.upper() in SUPPORTED_MARKETS
+
+# =========================
 # 🧠 حالة الغرفة
 # =========================
 class CoinState:
@@ -97,22 +117,21 @@ class CoinState:
                  "last_alert_at","buffer","vol_hist","vol_mu","vol_sigma",
                  "last_seen_price","last_seen_time","debounce_ok","promoted")
 
-    def __init__(self, symbol):
-        self.symbol = symbol                # e.g. "ADA"
-        self.market = f"{symbol}-EUR"
+    def __init__(self, symbol, market=None):
+        self.symbol = symbol.upper()
+        self.market = (market or f"{self.symbol}-EUR").upper()
         self.entered_at = now_ts()
         self.expires_at = self.entered_at + TTL_MIN*60
         self.preheat = False
-        self.promoted = False               # ليس لها استخدام كبير هنا لكنه جاهز
+        self.promoted = False
         self.last_alert_at = 0
         self.buffer = deque(maxlen=600)     # ~ آخر 30 دقيقة عند 3s
-        # حجم/Vol من شموع 1m (نحدثها دورياً)
-        self.vol_hist = deque(maxlen=20)    # آخر 20 دقيقة
+        self.vol_hist = deque(maxlen=20)    # آخر 20 دقيقة (1m volumes)
         self.vol_mu = 0.0
         self.vol_sigma = 0.0
         self.last_seen_price = None
         self.last_seen_time = 0
-        self.debounce_ok = 0                # تحمية تحتاج تكرار
+        self.debounce_ok = 0
 
     def renew(self):
         self.expires_at = now_ts() + TTL_MIN*60
@@ -123,24 +142,20 @@ class CoinState:
         self.buffer.append((ts, price))
 
     def r_change(self, seconds):
-        """ يحسب التغير خلال last seconds من buffer """
         if not self.buffer:
             return 0.0
         t_now, p_now = self.buffer[-1]
         t_target = t_now - seconds
         base = None
-        # ابحث عن أول نقطة ≤ t_target
         for (t, p) in reversed(self.buffer):
             if t <= t_target:
                 base = p
                 break
         if base is None:
-            # ما عندنا عمق كافٍ
             base = self.buffer[0][1]
         return pct(p_now, base)
 
     def drawdown_pct(self, seconds):
-        """ أكبر هبوط من أعلى سعر خلال النافذة """
         if not self.buffer:
             return 0.0
         t_now, _ = self.buffer[-1]
@@ -153,7 +168,7 @@ class CoinState:
                 last = p
         if hi < 0 or last is None:
             return 0.0
-        return pct(last, hi) * -1  # قيمة موجبة للهبوط
+        return pct(last, hi) * -1
 
     def volz(self):
         return zscore(self.vol_hist[-1] if self.vol_hist else 0.0, self.vol_mu, self.vol_sigma)
@@ -161,9 +176,9 @@ class CoinState:
 # ذاكرات عامة
 room_lock = threading.Lock()
 room: dict[str,CoinState] = {}     # market -> state
-watchlist: set[str] = set()        # markets تحت الإدارة
+watchlist: set[str] = set()
 last_discovery_at = 0
-backoff_mode = False               # لعرضه في /الحالة
+backoff_mode = False
 
 # =========================
 # 🔔 تلغرام / إشعارات
@@ -197,8 +212,8 @@ def read_ticker_24h():
         return []
     out = []
     for it in data:
-        market = it.get("market","")
-        if not market.endswith("-EUR"):   # نحصر على EUR
+        market = (it.get("market","") or "").upper()
+        if not market.endswith("-EUR"):
             continue
         last = float(it.get("last", it.get("lastPrice", 0.0)) or 0.0)
         openp = float(it.get("open", 0.0) or 0.0)
@@ -208,7 +223,7 @@ def read_ticker_24h():
         ask   = float(it.get("ask", 0.0) or 0.0)
         spread_bp = 0.0
         if bid and ask:
-            spread_bp = (ask - bid) / ((ask+bid)/2) * 10000  # basis points
+            spread_bp = (ask - bid) / ((ask+bid)/2) * 10000
         out.append({
             "market": market, "symbol": market.split("-")[0],
             "last": last, "open": openp, "volume": vol, "pct24": pct24,
@@ -217,19 +232,29 @@ def read_ticker_24h():
     return out
 
 def read_last_candles_1m(market, limit=10):
-    # Bitvavo: /v2/candles?market=BTC-EUR&interval=1m&limit=10
-    params = {"market": market, "interval":"1m", "limit": limit}
-    data = http_get("/v2/candles", params=params)
-    # عادة يرجّع [[time, open, high, low, close, volume], ...]
-    if not data or not isinstance(data, list):
+    """
+    يحاول مسارين:
+    1) /v2/candles?market=MARKET&interval=1m&limit=N
+    2) /v2/MARKET/candles?interval=1m&limit=N (fallback)
+    """
+    if not market:
         return []
-    return data
+    market = market.upper().strip()
+    if not is_supported_market(market):
+        return []
+    params = {"market": market, "interval":"1m", "limit": int(limit)}
+    data = http_get("/v2/candles", params=params)
+    if isinstance(data, list):
+        return data
+    alt_path = f"/v2/{market}/candles"
+    data2 = http_get(alt_path, params={"interval":"1m", "limit": int(limit)})
+    if isinstance(data2, list):
+        return data2
+    return []
 
 def compute_5m_change_from_candles(candles):
-    """ candles: آخر 10 شمعات 1m """
     if len(candles) < 6:
         return 0.0
-    # close الآن مقابل close قبل 5 دقائق
     c_now = float(candles[-1][4])
     c_5m  = float(candles[-6][4])
     return pct(c_now, c_5m)
@@ -240,12 +265,19 @@ def discovery_loop():
         t0 = now_ts()
         last_discovery_at = t0
         try:
+            # حمّل قائمة الأسواق مرة أولى وثم كل 30 دقيقة
+            if not SUPPORTED_MARKETS or (int(t0) % (30*60) < 2):
+                load_supported_markets()
+
             tick = read_ticker_24h()
             if not tick:
                 time.sleep(5); continue
 
-            # استثناء رابحين 24h الكبار
-            tick = [x for x in tick if x["pct24"] < EXCLUDE_24H_PCT]
+            # استثناء رابحين 24h الكبار + حصر على المدعوم فعلًا
+            tick = [
+                x for x in tick
+                if x["pct24"] < EXCLUDE_24H_PCT and is_supported_market(x["market"])
+            ]
 
             # تقدير سيولة باليورو ~ volume_base * last
             for x in tick:
@@ -259,18 +291,22 @@ def discovery_loop():
             five_map = {}
             for batch in chunks(top, 12):
                 for x in batch:
-                    cnd = read_last_candles_1m(x["market"], limit=10)
+                    m = x["market"]
+                    cnd = read_last_candles_1m(m, limit=10)
                     ch5 = compute_5m_change_from_candles(cnd)
-                    five_map[x["market"]] = ch5
-                time.sleep(0.35)  # لطف بسيط
+                    five_map[m] = ch5
+                time.sleep(0.35)
 
-            # خذ أفضل ROOM_CAP*1.1 تقريبًا
-            sorted_top = sorted(top, key=lambda x: five_map.get(x["market"], 0.0), reverse=True)
+            sorted_top = sorted(
+                (x for x in top if x["market"] in five_map),
+                key=lambda x: five_map.get(x["market"], 0.0),
+                reverse=True
+            )
             pick = sorted_top[:max(ROOM_CAP, 20)]
 
             # حدّث الغرفة
             with room_lock:
-                wanted = set(p["market"] for p in pick)
+                wanted = {p["market"] for p in pick}
                 # جدّد TTL لمن هم داخل & بقائمة توب5م
                 for m, st in list(room.items()):
                     if m in wanted:
@@ -279,27 +315,24 @@ def discovery_loop():
                 for p in pick:
                     m = p["market"]
                     sym = p["symbol"]
-                    if m not in room:
-                        st = CoinState(sym)
+                    if m not in room and is_supported_market(m):
+                        st = CoinState(sym, m)
                         room[m] = st
                         watchlist.add(m)
                 # قص الزائد
                 if len(room) > ROOM_CAP:
-                    # احذف الأضعف حسب r60 الحالي (إن لم يوجد يظل في الأسفل)
                     scored = []
                     for m, st in room.items():
                         r60 = st.r_change(60) if st.buffer else -999
                         scored.append((r60, m))
-                    scored.sort()  # الأقل أولاً
+                    scored.sort()
                     for _, m in scored[:len(room)-ROOM_CAP]:
                         room.pop(m, None)
                         watchlist.discard(m)
         except Exception as e:
             print("[DISCOVERY] error:", e)
-        # انتظر حتى الدورة القادمة
         slept = now_ts() - t0
-        wait = max(2.0, DISCOVERY_SEC - slept)
-        time.sleep(wait)
+        time.sleep(max(2.0, DISCOVERY_SEC - slept))
 
 # =========================
 # 📈 تحديث حجم 1m الدوري للغرفة (للـ VolZ)
@@ -314,7 +347,6 @@ def refresh_room_volume_loop():
                     cnd = read_last_candles_1m(m, limit=5)
                     if not cnd:
                         continue
-                    # استخدم آخر شمعة 1m كـ "حجم اللحظة" وابقِ تاريخ 20 دقيقة
                     vol_last = float(cnd[-1][5])
                     with room_lock:
                         st = room.get(m)
@@ -338,10 +370,9 @@ def fetch_price(market):
     data = http_get("/v2/ticker/price", params={"market": market})
     if not data: 
         return None
-    # {"market":"BTC-EUR","price":"xxxxx"}
     try:
         return float(data.get("price") or 0.0)
-    except:
+    except Exception:
         return None
 
 def monitoring_loop():
@@ -355,7 +386,6 @@ def monitoring_loop():
             if not markets:
                 time.sleep(TICK_SEC); continue
 
-            # جدولة مجزأة لكل تيك
             BATCH = max(8, min(12, len(markets)//2 + 1))
             slice_ = markets[rr_idx:rr_idx+BATCH]
             if not slice_:
@@ -376,7 +406,7 @@ def monitoring_loop():
                         continue
                     st.add_price(ts, p)
 
-                    # احذف المنتهية
+                    # حذف المنتهية
                     if ts >= st.expires_at:
                         room.pop(m, None)
                         watchlist.discard(m)
@@ -391,12 +421,12 @@ def monitoring_loop():
                     volZ  = st.volz()
 
                     # -------- تحمية --------
-                    if (r60 >= PRE_R60 and r20 >= PRE_R20 and dip20 <= PRE_NODIP and (st.vol_hist and (st.vol_hist[-1] >= PRE_VOLBOOST * (st.vol_mu or 0.0000001)))):
+                    vol_boost_ok = (st.vol_hist and (st.vol_hist[-1] >= PRE_VOLBOOST * (st.vol_mu or 0.0000001)))
+                    if (r60 >= PRE_R60 and r20 >= PRE_R20 and dip20 <= PRE_NODIP and vol_boost_ok):
                         st.debounce_ok = min(2, st.debounce_ok+1)
                         if st.debounce_ok >= 2:
                             st.preheat = True
                     else:
-                        # شطب تحمية إن ظهرت إشارة نفي
                         if r60 < 0 or dip20 > (PRE_NODIP*2) or (st.vol_hist and st.vol_hist[-1] < 1.1*(st.vol_mu or 0.0000001)):
                             st.preheat = False
                         st.debounce_ok = 0
@@ -409,15 +439,12 @@ def monitoring_loop():
                         cooldown_ok = (ts - st.last_alert_at) >= ALERT_COOLDOWN_SEC
                         if (trig_fast or trig_accum) and vol_ok and cooldown_ok:
                             st.last_alert_at = ts
-                            # مبدئيًا: لا نفحص السبريد لحظيًا (بياناته ليست آنية)، نكتفي بشرط عام
                             notify_explosion(st.symbol)
-            # Backoff لو في أخطاء كثيرة
             backoff_mode = (errors >= max(3, len(slice_)//3))
         except Exception as e:
             print("[MONITOR] error:", e)
             backoff_mode = True
 
-        # نوم مع Backoff عند الحاجة
         base = TICK_SEC if not backoff_mode else max(TICK_SEC, 5.0)
         jitter = random.uniform(0.05, 0.25)
         elapsed = now_ts() - t_start
@@ -434,7 +461,6 @@ def root():
 
 @app.route("/webhook", methods=["POST"])
 def tg_webhook():
-    # يدعم /الحالة فقط
     try:
         data = request.get_json(force=True, silent=True) or {}
         msg = data.get("message", {})
@@ -446,7 +472,6 @@ def tg_webhook():
         if cmd in ("/الحالة", "الحالة", "/status", "status"):
             return jsonify(ok=True), (send_status(chat_override=chat_id) or 200)
         else:
-            # تجاهل بقيّة الأوامر
             return jsonify(ok=True)
     except Exception as e:
         print("[TG] webhook err:", e)
@@ -462,13 +487,17 @@ def send_status(chat_override=None):
         items = list(room.items())
     if not items:
         text = "📊 الحالة: لا توجد عملات في الغرفة حاليًا."
-        tg_send(text) if (chat_override or CHAT_ID) else None
+        if chat_override:
+            try:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                session.post(url, json={"chat_id": chat_override, "text": text, "disable_web_page_preview": True}, timeout=8)
+            except Exception as e:
+                print("[TG] send status failed:", e)
+        else:
+            tg_send(text)
         return
 
-    # صنّف: انفجار جاهز ↗ تحمية ↗ عادي
-    ready = []
-    warm  = []
-    normal = []
+    ready, warm, normal = [], [], []
     nowt = now_ts()
     for m, st in items:
         r60  = st.r_change(60)
@@ -476,7 +505,6 @@ def send_status(chat_override=None):
         volZ = st.volz()
         ttl  = fmt_secs(int(st.expires_at - nowt))
         if (nowt - st.last_alert_at) < 10:
-            # أُرسل تواً
             ready.append((m, st, r60, r120, volZ, ttl))
         elif st.preheat:
             warm.append((m, st, r60, r120, volZ, ttl))
@@ -490,17 +518,15 @@ def send_status(chat_override=None):
 
     lines = []
     lines.append(f"📊 الحالة — غرفة: {len(items)}/{ROOM_CAP}  |  Backoff: {'ON' if backoff_mode else 'OFF'}")
-    # Ready
+
     if ready:
         lines.append("\n🚀 جاهزة:")
         for t in sorted(ready, key=lambda x: (x[2], x[3]), reverse=True)[:10]:
             lines.append(line("•", t))
-    # Warm
     if warm:
         lines.append("\n🔥 تحمية:")
         for t in sorted(warm, key=lambda x: (x[2], x[3]), reverse=True)[:10]:
             lines.append(line("•", t))
-    # Normal
     if normal:
         lines.append("\n🟢 مراقبة:")
         for t in sorted(normal, key=lambda x: (x[2], x[3]), reverse=True)[:10]:
@@ -527,10 +553,9 @@ def start_threads():
 # =========================
 # ▶️ الإقلاع
 # =========================
+# عند استخدام gunicorn: gunicorn -w 1 -b 0.0.0.0:8080 main:app
+load_supported_markets()
+start_threads()
+
 if __name__ == "__main__":
-    # شغّل كخدمة Flask عادية (للوكال). على Railway استعمل gunicorn.
-    start_threads()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-else:
-    # عند استخدام gunicorn: gunicorn -w 1 -b 0.0.0.0:8080 app:app
-    start_threads()
