@@ -89,8 +89,11 @@ def get_24h_change(symbol):
         return ch
     except: return None
 
+# ✅ FIX: مسار الشموع الصحيح
 def get_candles_1h(symbol, limit=CANDLES_LIMIT_1H):
-    resp = http_get(f"{BASE_URL}/markets/{symbol}-EUR/candles", {"interval":"1h","limit":limit}, timeout=10)
+    resp = http_get(f"{BASE_URL}/candles",
+                    {"market": f"{symbol}-EUR", "interval": "1h", "limit": limit},
+                    timeout=10)
     if not resp or resp.status_code != 200: return []
     try: return resp.json()  # [ts, open, high, low, close, vol]
     except: return []
@@ -136,55 +139,69 @@ def get_all_eur_bases():
             for m in resp.json():
                 if m.get("quote") == "EUR" and m.get("status") == "trading":
                     b = m.get("base")
-                    if b and b.isalpha() and len(b) <= 6:
+                    # ✅ FIX: لا تستبعد العملات التي تحتوي أرقام/شرطات
+                    if b and len(b) <= 12:
                         bases.append(b)
         except Exception:
             pass
-    # خزّن 10 دقائق
     try:
         r.setex(ck, 600, json.dumps(bases, ensure_ascii=False))
     except Exception:
         pass
     return bases
 
+def _safe_get_old_from_deque(dq, age_sec):
+    """قراءة آمنة لقيمة قديمة من deque تحت قفل مشدود."""
+    with lock:
+        if not dq: return None
+        now = time.time()
+        old = None
+        for ts, pr in reversed(dq):
+            if now - ts >= age_sec:
+                old = pr
+                break
+        return old
+
 def get_5m_top_symbols(limit=MAX_ROOM):
-    # 🔁 بدلًا من طلب /markets كل مرة، نستخدم الكاش
     symbols = get_all_eur_bases()
     if not symbols:
         return []
-
     now = time.time()
     changes = []
     for base in symbols:
-        dq = prices[base]
-        # نبحث عن نقطة قبل ~270ث
-        old = None
-        for ts, pr in reversed(dq):
-            if now - ts >= 270:
-                old = pr
-                break
+        old = _safe_get_old_from_deque(prices[base], 270)
         cur = get_price(base)
         if cur is None:
             continue
         ch = (cur - old) / old * 100.0 if old else 0.0
         changes.append((base, ch))
-        # حدّث السلسلة
-        dq.append((now, cur))
-        cutoff = now - 900
-        while dq and dq[0][0] < cutoff:
-            dq.pop(0)
+        # ✅ FIX: تحديث deque تحت قفل وبـ popleft
+        with lock:
+            dq = prices[base]
+            dq.append((now, cur))
+            cutoff = now - 900
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
     changes.sort(key=lambda x: x[1], reverse=True)
     return [c[0] for c in changes[:limit]]
 
 def get_rank_from_bitvavo(coin):
     now = time.time(); scores = []
-    with lock: wl = list(watchlist)
+    with lock:
+        wl = list(watchlist)
     for c in wl:
-        dq = prices[c]; old = None
-        for ts, pr in reversed(dq):
-            if now - ts >= 270: old = pr; break
-        cur = prices[c][-1][1] if dq else get_price(c)
-        if cur is None: continue
+        with lock:
+            dq = prices[c]
+            old = None
+            for ts, pr in reversed(dq):
+                if now - ts >= 270:
+                    old = pr
+                    break
+            cur = dq[-1][1] if dq else None
+        if cur is None:
+            cur = get_price(c)
+            if cur is None: 
+                continue
         ch = (cur - old) / old * 100.0 if old else 0.0
         scores.append((c, ch))
     scores.sort(key=lambda x: x[1], reverse=True)
@@ -269,11 +286,13 @@ def compute_market_heat():
     now = time.time(); moved = 0; total = 0
     with lock: wl = list(watchlist)
     for c in wl:
-        dq = prices[c]
-        if len(dq) < 2: continue
-        old = None; cur = dq[-1][1]
-        for ts, pr in reversed(dq):
-            if now - ts >= 60: old = pr; break
+        with lock:
+            dq = prices[c]
+            if len(dq) < 2: 
+                continue
+            old = None; cur = dq[-1][1]
+            for ts, pr in reversed(dq):
+                if now - ts >= 60: old = pr; break
         if old and old > 0:
             ret = (cur - old) / old * 100.0
             total += 1
@@ -292,15 +311,16 @@ def market_snapshot_5m():
     with lock:
         wl = list(watchlist)
     for c in wl:
-        dq = prices[c]
-        if not dq:
-            continue
-        cur = dq[-1][1]
-        old = None
-        for ts, pr in reversed(dq):
-            if now - ts >= 270:
-                old = pr
-                break
+        with lock:
+            dq = prices[c]
+            if not dq:
+                continue
+            cur = dq[-1][1]
+            old = None
+            for ts, pr in reversed(dq):
+                if now - ts >= 270:
+                    old = pr
+                    break
         if old and old > 0:
             ret = (cur - old) / old * 100.0
             snaps.append((c, ret))
@@ -320,10 +340,12 @@ def market_snapshot_5m():
 # =========================
 def check_top10_pattern(coin, m):
     thresh = BASE_STEP_PCT * m
-    now = time.time(); dq = prices[coin]
-    if len(dq) < 2: return False
-    start_ts = now - STEP_WINDOW_SEC
-    window = [(ts, p) for ts, p in dq if ts >= start_ts]
+    now = time.time()
+    with lock:
+        dq = prices[coin]
+        if len(dq) < 2: return False
+        start_ts = now - STEP_WINDOW_SEC
+        window = [(ts, p) for ts, p in dq if ts >= start_ts]
     if len(window) < 3: return False
     p0 = window[0][1]; step1 = False; last_p = p0
     for ts, pr in window[1:]:
@@ -340,10 +362,12 @@ def check_top10_pattern(coin, m):
 def check_top1_pattern(coin, m):
     seq_parts = [float(x.strip()) for x in BASE_STRONG_SEQ.split(",") if x.strip()]
     seq_parts = [x * m for x in seq_parts]
-    now = time.time(); dq = prices[coin]
-    if len(dq) < 2: return False
-    start_ts = now - SEQ_WINDOW_SEC
-    window = [(ts, p) for ts, p in dq if ts >= start_ts]
+    now = time.time()
+    with lock:
+        dq = prices[coin]
+        if len(dq) < 2: return False
+        start_ts = now - SEQ_WINDOW_SEC
+        window = [(ts, p) for ts, p in dq if ts >= start_ts]
     if len(window) < 3: return False
     slack = 0.3 * m; base_p = window[0][1]; step_i = 0; peak_after_step = base_p
     for ts, pr in window[1:]:
@@ -383,9 +407,11 @@ def price_poller():
             for s in syms:
                 pr = get_price(s)
                 if pr is None: continue
-                dq = prices[s]; dq.append((now, pr))
-                cutoff = now - 1200
-                while dq and dq[0][0] < cutoff: dq.popleft()
+                with lock:
+                    dq = prices[s]
+                    dq.append((now, pr))
+                    cutoff = now - 1200
+                    while dq and dq[0][0] < cutoff: dq.popleft()
             last_beats["price"] = time.time()
         except Exception as e:
             print("price_poller error:", e)
