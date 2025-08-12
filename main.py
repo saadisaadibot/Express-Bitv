@@ -446,10 +446,6 @@ def start_workers_once():
 # شغّلها عند الاستيراد + قبل أول طلب
 start_workers_once()
 
-@app.before_first_request
-def _kick_workers():
-    start_workers_once()
-
 # للتشغيل المحلي فقط
 if __name__ == "__main__":
     start_workers_once()
