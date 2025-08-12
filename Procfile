@@ -1,1 +1,1 @@
-web: gunicorn -w 1 -k gthread --threads 4 --timeout 120 --graceful-timeout 30 --keep-alive 30 --log-level info --bind 0.0.0.0:$PORT main:app
+web: python main.py
