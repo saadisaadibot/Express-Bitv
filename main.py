@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, json, requests, redis
+import os, time, json, requests, redis, unicodedata
 from collections import deque, defaultdict
 from threading import Thread, Lock
 from flask import Flask, request
@@ -89,7 +89,7 @@ def get_24h_change(symbol):
         return ch
     except: return None
 
-# ✅ FIX: مسار الشموع الصحيح
+# ✅ مسار الشموع الصحيح
 def get_candles_1h(symbol, limit=CANDLES_LIMIT_1H):
     resp = http_get(f"{BASE_URL}/candles",
                     {"market": f"{symbol}-EUR", "interval": "1h", "limit": limit},
@@ -139,8 +139,8 @@ def get_all_eur_bases():
             for m in resp.json():
                 if m.get("quote") == "EUR" and m.get("status") == "trading":
                     b = m.get("base")
-                    # ✅ FIX: لا تستبعد العملات التي تحتوي أرقام/شرطات
-                    if b and len(b) <= 12:
+                    # لا نستبعد عملات فيها أرقام/شرطات
+                    if b:
                         bases.append(b)
         except Exception:
             pass
@@ -151,7 +151,6 @@ def get_all_eur_bases():
     return bases
 
 def _safe_get_old_from_deque(dq, age_sec):
-    """قراءة آمنة لقيمة قديمة من deque تحت قفل مشدود."""
     with lock:
         if not dq: return None
         now = time.time()
@@ -175,7 +174,7 @@ def get_5m_top_symbols(limit=MAX_ROOM):
             continue
         ch = (cur - old) / old * 100.0 if old else 0.0
         changes.append((base, ch))
-        # ✅ FIX: تحديث deque تحت قفل وبـ popleft
+        # تحديث deque آمن
         with lock:
             dq = prices[base]
             dq.append((now, cur))
@@ -463,19 +462,32 @@ def status():
         "snapshot_5m": snap
     }, 200
 
-# ============== Webhook تلغرام (رد فوري + تنفيذ بالخلفية) ==============
+# ============== Webhook تلغرام (تطبيع نص + تنفيذ تزامني) ==============
 OPEN_ALIASES   = {"/افتح السجل","افتح السجل","/openlog","openlog"}
 CLOSE_ALIASES  = {"/اغلق السجل","اغلق السجل","/closelog","closelog"}
 STATUS_ALIASES = {"/status","شو عم تعمل","/شو_عم_تعمل","شو عم_تعمل","/ping","بينغ","بنج"}
 
-def handle_cmd(chat_id, low):
+HIDDEN = set(["\u200e","\u200f","\u202a","\u202b","\u202c","\u202d","\u202e",
+              "\u200d","\u061C","ـ","َ","ً","ُ","ٌ","ِ","ٍ","ْ","ّ"])
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    for h in HIDDEN:
+        s = s.replace(h, "")
+    s = " ".join(s.split())
+    return s.lower()
+
+def handle_cmd_sync(chat_id, low):
+    print(f"[CMD] chat={chat_id} low={repr(low)}")
     try:
         if low in OPEN_ALIASES:
             set_log_stream(True); send_message("📒 تم فتح السجل. (سيتم بث أي تنبيه جديد هنا)")
-            send_long_message(dump_last_alerts_text(50))
-        elif low in CLOSE_ALIASES:
-            set_log_stream(False); send_message("✅ تم إغلاق السجل.")
-        elif low in STATUS_ALIASES:
+            send_long_message(dump_last_alerts_text(50)); return
+        if low in CLOSE_ALIASES:
+            set_log_stream(False); send_message("✅ تم إغلاق السجل."); return
+        if low in STATUS_ALIASES:
             now = time.time()
             beats = {k: (round(now - v,1) if v else None) for k,v in last_beats.items()}
             with lock: wl = list(watchlist)
@@ -492,11 +504,11 @@ def handle_cmd(chat_id, low):
                 f"- 5m: gainers={snap['gainers']} | losers={snap['losers']} | top={top_txt} | bottom={bot_txt}\n"
                 f"- log_stream={'on' if is_log_stream_on() else 'off'}"
             )
-        else:
-            if low.startswith("/"):
-                send_message("❔ أمر غير معروف. جرّب: /افتح السجل أو /اغلق السجل أو /status")
+            return
+        if low.startswith("/"):
+            send_message("❔ أمر غير معروف. جرّب: /افتح السجل أو /اغلق السجل أو /status")
     except Exception as e:
-        print("handle_cmd error:", e)
+        print("handle_cmd_sync error:", e)
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -504,20 +516,19 @@ def telegram_webhook():
         data = request.get_json(force=True, silent=True) or {}
         msg = data.get("message") or data.get("edited_message") or {}
         chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id", ""))
+        chat_id = str(chat.get("id", "")).strip()
         text = (msg.get("text") or "")
+        print(f"[TG] from={chat_id} raw={repr(text)}")
 
-        print(f"[TG] from={chat_id} text={repr(text)}")
+        if CHAT_ID:
+            want = str(CHAT_ID).strip()
+            if chat_id and chat_id != want:
+                return {"ok": True}, 200
 
-        if CHAT_ID and chat_id and chat_id != str(CHAT_ID):
-            return {"ok": True}, 200
-
-        HIDDEN = ["\u200e","\u200f","\u202a","\u202b","\u202c","\u202d","\u202e","\u200d","\u061C","ـ"]
-        low = text
-        for h in HIDDEN: low = low.replace(h, "")
-        low = " ".join(low.split()).lower()
-
-        Thread(target=handle_cmd, args=(chat_id, low), daemon=True).start()
+        low = normalize_text(text)
+        print(f"[TG] normalized={repr(low)}")
+        # تنفيذ تزامني — ما بنستخدم Thread هون
+        handle_cmd_sync(chat_id, low)
     except Exception as e:
         print("telegram_webhook error:", e)
     return {"ok": True}, 200
