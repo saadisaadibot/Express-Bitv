@@ -542,7 +542,15 @@ def send_status(chat_override=None):
 
     lines = []
     lines.append(f"📊 الحالة — غرفة: {len(items)}/{ROOM_CAP}  |  Backoff: {'ON' if backoff_mode else 'OFF'}")
-
+    # سطر/سطرين يوضحوا شروط الإشعار بشكل مختصر
+    spread_pct = SPREAD_MAX_BP / 100.0  # تحويل bp إلى %
+    lines.append(
+        f"🔍 شروط التحمية: r60≥{PRE_R60:.2f}% & r20≥{PRE_R20:.2f}% & لا هبوط≤{PRE_NODIP:.2f}% & VolBoost≥{PRE_VOLBOOST:.2f}×"
+    )
+    lines.append(
+        f"🔔 شروط الإشعار: Fast(r40≥{TRIG_R40:.2f}%, r20≥0.15%) أو Accum(r120≥{TRIG_R120:.2f}%, r20≥{TRIG_R20HELP:.2f}%)، "
+        f"VolZ≥{TRIG_VOLZ:.2f}، Spread≤{spread_pct:.2f}%، Cooldown={ALERT_COOLDOWN_SEC}s، Silent={COIN_SILENT_SEC}s"
+    )
     if ready:
         lines.append("\n🚀 جاهزة:")
         for t in sorted(ready, key=lambda x: (x[2], x[3]), reverse=True)[:10]:
