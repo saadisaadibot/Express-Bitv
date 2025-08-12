@@ -252,6 +252,40 @@ def adaptive_multipliers():
     h = max(0.0, min(1.0, heat_ewma))
     return 0.75 if h < 0.15 else 0.9 if h < 0.35 else 1.0 if h < 0.6 else 1.25
 
+def market_snapshot_5m():
+    """
+    لقطة سريعة لعوائد ~5 دقائق من الذاكرة المحلية.
+    يرجّع dict فيه الرابحين/الخاسرين وأقوى/أضعف.
+    """
+    now = time.time()
+    snaps = []  # [(coin, ret_pct)]
+    with lock:
+        wl = list(watchlist)
+    for c in wl:
+        dq = prices[c]
+        if not dq:
+            continue
+        cur = dq[-1][1]
+        old = None
+        for ts, pr in reversed(dq):
+            if now - ts >= 270:  # ~4.5m وما أقدم من هيك بكثير
+                old = pr
+                break
+        if old and old > 0:
+            ret = (cur - old) / old * 100.0
+            snaps.append((c, ret))
+
+    if not snaps:
+        return {"gainers": 0, "losers": 0, "top": None, "bottom": None}
+
+    snaps.sort(key=lambda x: x[1], reverse=True)
+    gainers = sum(1 for _, r in snaps if r > 0)
+    losers  = sum(1 for _, r in snaps if r < 0)
+    top     = {"coin": snaps[0][0], "ret": round(snaps[0][1], 3)}
+    bottom  = {"coin": snaps[-1][0], "ret": round(snaps[-1][1], 3)}
+
+    return {"gainers": gainers, "losers": losers, "top": top, "bottom": bottom}
+
 # =========================
 # 🧩 أنماط
 # =========================
@@ -356,6 +390,7 @@ def status():
     m = adaptive_multipliers()
     with lock: wl = list(watchlist)
     now = time.time()
+    snap = market_snapshot_5m()
     return {
         "message": "OK",
         "heat": round(heat_ewma, 4),
@@ -369,7 +404,8 @@ def status():
             "room": round(now - last_beats["room"],1) if last_beats["room"] else None,
             "price": round(now - last_beats["price"],1) if last_beats["price"] else None,
             "analyzer": round(now - last_beats["analyzer"],1) if last_beats["analyzer"] else None,
-        }
+        },
+        "snapshot_5m": snap
     }, 200
 
 # ============== Webhook تلغرام (رد فوري + تنفيذ بالخلفية) ==============
@@ -389,12 +425,16 @@ def handle_cmd(chat_id, low):
             beats = {k: (round(now - v,1) if v else None) for k,v in last_beats.items()}
             with lock: wl = list(watchlist)
             m = adaptive_multipliers()
+            snap = market_snapshot_5m()
+            top_txt = f"{snap['top']['coin']} {snap['top']['ret']}%" if snap['top'] else "—"
+            bot_txt = f"{snap['bottom']['coin']} {snap['bottom']['ret']}%" if snap['bottom'] else "—"
             send_message(
                 f"ℹ️ الحالة:\n"
                 f"- heat={round(heat_ewma,4)} | m={m}\n"
                 f"- watchlist={len(wl)} | rank_filter={RANK_FILTER}\n"
                 f"- revive_only={bool(REVIVE_ONLY)} | lastday_skip={LASTDAY_SKIP_PCT}%\n"
                 f"- beats: room={beats['room']}s, price={beats['price']}s, analyzer={beats['analyzer']}s\n"
+                f"- 5m: gainers={snap['gainers']} | losers={snap['losers']} | top={top_txt} | bottom={bot_txt}\n"
                 f"- log_stream={'on' if is_log_stream_on() else 'off'}"
             )
         else:
