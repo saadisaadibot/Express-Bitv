@@ -57,10 +57,14 @@ last_beats = {"room":0, "price":0, "analyzer":0}
 # =========================
 BASE_URL = "https://api.bitvavo.com/v2"
 
+# 👇 جلسة HTTP ثابتة (Keep-Alive)
+session = requests.Session()
+session.headers.update({"Connection": "keep-alive"})
+
 def http_get(url, params=None, timeout=8):
     for _ in range(2):
         try:
-            return requests.get(url, params=params, timeout=timeout)
+            return session.get(url, params=params, timeout=timeout)
         except Exception:
             time.sleep(0.4)
     return None
@@ -116,29 +120,59 @@ def is_reviving(symbol):
     r.setex(key, REVIVE_CACHE_SEC, "1" if ok else "0")
     return ok
 
-def get_5m_top_symbols(limit=MAX_ROOM):
+# 👇 كاش لقائمة الأسواق EUR لمدة 10 دقائق
+def get_all_eur_bases():
+    ck = "eur_bases"
+    cached = r.get(ck)
+    if cached:
+        try:
+            return json.loads(cached)
+        except:
+            pass
     resp = http_get(f"{BASE_URL}/markets")
-    if not resp or resp.status_code != 200: return []
-    symbols = []
+    bases = []
+    if resp and resp.status_code == 200:
+        try:
+            for m in resp.json():
+                if m.get("quote") == "EUR" and m.get("status") == "trading":
+                    b = m.get("base")
+                    if b and b.isalpha() and len(b) <= 6:
+                        bases.append(b)
+        except Exception:
+            pass
+    # خزّن 10 دقائق
     try:
-        for m in resp.json():
-            if m.get("quote") == "EUR" and m.get("status") == "trading":
-                base = m.get("base")
-                if base and base.isalpha() and len(base) <= 6:
-                    symbols.append(base)
-    except: pass
-    now = time.time(); changes = []
+        r.setex(ck, 600, json.dumps(bases, ensure_ascii=False))
+    except Exception:
+        pass
+    return bases
+
+def get_5m_top_symbols(limit=MAX_ROOM):
+    # 🔁 بدلًا من طلب /markets كل مرة، نستخدم الكاش
+    symbols = get_all_eur_bases()
+    if not symbols:
+        return []
+
+    now = time.time()
+    changes = []
     for base in symbols:
-        dq = prices[base]; old = None
+        dq = prices[base]
+        # نبحث عن نقطة قبل ~270ث
+        old = None
         for ts, pr in reversed(dq):
-            if now - ts >= 270: old = pr; break
+            if now - ts >= 270:
+                old = pr
+                break
         cur = get_price(base)
-        if cur is None: continue
+        if cur is None:
+            continue
         ch = (cur - old) / old * 100.0 if old else 0.0
         changes.append((base, ch))
+        # حدّث السلسلة
         dq.append((now, cur))
         cutoff = now - 900
-        while dq and dq[0][0] < cutoff: dq.popleft()
+        while dq and dq[0][0] < cutoff:
+            dq.pop(0)
     changes.sort(key=lambda x: x[1], reverse=True)
     return [c[0] for c in changes[:limit]]
 
@@ -163,8 +197,8 @@ def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
         print(f"[TG_DISABLED] {text}"); return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=6)
+        session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                     json={"chat_id": CHAT_ID, "text": text}, timeout=6)
     except Exception as e:
         print("Telegram error:", e)
 
@@ -220,7 +254,7 @@ def notify_buy(coin, tag, change_text=None):
 
     if SAQAR_WEBHOOK:
         try:
-            requests.post(SAQAR_WEBHOOK, json={"message":{"text": f"اشتري {coin}"}}, timeout=5)
+            session.post(SAQAR_WEBHOOK, json={"message":{"text": f"اشتري {coin}"}}, timeout=5)
         except Exception: pass
 
     entry = {"ts": int(now), "coin": coin, "rank": rank, "tag": tag_txt, "heat": round(heat_ewma, 4)}
@@ -253,12 +287,8 @@ def adaptive_multipliers():
     return 0.75 if h < 0.15 else 0.9 if h < 0.35 else 1.0 if h < 0.6 else 1.25
 
 def market_snapshot_5m():
-    """
-    لقطة سريعة لعوائد ~5 دقائق من الذاكرة المحلية.
-    يرجّع dict فيه الرابحين/الخاسرين وأقوى/أضعف.
-    """
     now = time.time()
-    snaps = []  # [(coin, ret_pct)]
+    snaps = []
     with lock:
         wl = list(watchlist)
     for c in wl:
@@ -268,7 +298,7 @@ def market_snapshot_5m():
         cur = dq[-1][1]
         old = None
         for ts, pr in reversed(dq):
-            if now - ts >= 270:  # ~4.5m وما أقدم من هيك بكثير
+            if now - ts >= 270:
                 old = pr
                 break
         if old and old > 0:
@@ -283,7 +313,6 @@ def market_snapshot_5m():
     losers  = sum(1 for _, r in snaps if r < 0)
     top     = {"coin": snaps[0][0], "ret": round(snaps[0][1], 3)}
     bottom  = {"coin": snaps[-1][0], "ret": round(snaps[-1][1], 3)}
-
     return {"gainers": gainers, "losers": losers, "top": top, "bottom": bottom}
 
 # =========================
@@ -483,10 +512,9 @@ def start_workers_once():
         threads_started = True
         print("[BOOT] ✅ background workers started")
 
-# شغّلها عند الاستيراد + قبل أول طلب
+# شغّلها عند الاستيراد + للتشغيل المحلي
 start_workers_once()
 
-# للتشغيل المحلي فقط
 if __name__ == "__main__":
     start_workers_once()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
