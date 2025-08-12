@@ -275,14 +275,15 @@ def discovery_loop():
         last_discovery_at = t0
         try:
             # حمّل الأسواق المدعومة مرة أولى ثم كل 30 دقيقة
-            if not SUPPORTED_MARKETS or (int(t0) % (30*60) < 2):
+            if not SUPPORTED_MARKETS or (int(t0) % (30 * 60) < 2):
                 load_supported_markets()
 
             tick = read_ticker_24h()
             if not tick:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
 
-            # استثناء رابحين 24h + مدعومين + ليسوا في البلاك‑ليست
+            # استثناء رابحين 24h + مدعومين + ليسوا في البلاك-ليست
             tick = [
                 x for x in tick
                 if x["pct24"] < EXCLUDE_24H_PCT and is_supported_market(x["market"])
@@ -296,7 +297,7 @@ def discovery_loop():
             tick.sort(key=lambda x: x["eur_volume"], reverse=True)
             top = tick[:60]
 
-            # احسب 5m change لهؤلاء فقط
+            # احسب تغيّر 5m لهؤلاء فقط
             five_map = {}
             for batch in chunks(top, 12):
                 for x in batch:
@@ -304,7 +305,7 @@ def discovery_loop():
                     cnd = read_last_candles_1m(m, limit=10)
                     ch5 = compute_5m_change_from_candles(cnd)
                     five_map[m] = ch5
-                time.sleep(0.35)
+                time.sleep(0.35)  # تلطيف الحمل
 
             sorted_top = sorted(
                 (x for x in top if x["market"] in five_map),
@@ -316,12 +317,15 @@ def discovery_loop():
             # حدّث الغرفة + مرّر السبريد إلى الحالة
             with room_lock:
                 wanted = {p["market"] for p in pick}
-                # جدّد الموجود
+
+                # جدّد الموجود ضمن القائمة المختارة
                 for m, st in list(room.items()):
                     if m in wanted:
                         st.renew()
+
                 # خريطة السبريد للقائمة الحالية
                 spread_map = {x["market"]: x.get("spread_bp", 0.0) for x in pick}
+
                 # أدخل الجدد وحدّث السبريد
                 for p in pick:
                     m = p["market"]
@@ -333,18 +337,40 @@ def discovery_loop():
                     st = room.get(m)
                     if st:
                         st.spread_bp = float(spread_map.get(m, 0.0))
-                # قص الزائد
-                if len(room) > ROOM_CAP:
+
+                # قصّ الزائد بطريقة ذكية: نعطي أولوية للقوي ونقصّ الضعيف
+                overflow = len(room) - ROOM_CAP
+                if overflow > 0:
                     scored = []
+                    nowt = now_ts()
                     for m, st in room.items():
-                        r60 = st.r_change(60) if st.buffer else -999
-                        scored.append((r60, m))
+                        # مؤشرات قوة لحظية
+                        r60  = st.r_change(60) if st.buffer else -999.0
+                        r120 = st.r_change(120) if st.buffer else 0.0
+                        vz   = st.volz()
+                        age_min = (nowt - st.entered_at) / 60.0
+
+                        # وزن أعلى للسرعة + دعم الحجم
+                        score = 0.7 * r60 + 0.3 * r120 + 0.5 * vz
+
+                        # تحمية قوية تأخذ بونص بسيط؛ الضعيفة (r60<=0) بلا حماية
+                        if st.preheat and r60 > 0:
+                            score += 0.3
+
+                        # عامل وقت بسيط حتى لا تبقى عملة قديمة ماسكة مكان
+                        score -= 0.02 * age_min
+
+                        scored.append((score, m))
+
+                    # الأقل نقاطًا يُقص أولًا
                     scored.sort()
-                    for _, m in scored[:len(room)-ROOM_CAP]:
+                    for _, m in scored[:overflow]:
                         room.pop(m, None)
                         watchlist.discard(m)
+
         except Exception as e:
             print("[DISCOVERY] error:", e)
+
         slept = now_ts() - t0
         time.sleep(max(2.0, DISCOVERY_SEC - slept))
 
