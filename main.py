@@ -28,7 +28,7 @@ HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))    # كم % خلا�
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))     # EWMA لنعومة الحرارة
 
 # منع السبام
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))  # كولداون لكل عملة
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 10800))  # كولداون لكل عملة
 GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))  # مهلة إحماء بعد التشغيل
 
 # توصيلات
