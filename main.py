@@ -97,11 +97,33 @@ def notify_buy(market, reason):
     msg = f"🚀 BUY {market}  | {reason}"
     print("[ALERT]", msg)
     tg_send(msg)
-    if SAQAR_WEBHOOK:
-        try:
-            session.post(SAQAR_WEBHOOK, json={"text": f"اشتري {market}", "reason": reason}, timeout=6)
-        except Exception as e:
-            print("[SAQAR] post failed:", e)
+
+    url = (SAQAR_WEBHOOK or "").strip()
+    if not url:
+        return  # ما في Webhook محدد
+
+    payload = {"text": f"اشتري {market}", "reason": reason}
+
+    try:
+        # المحاولة 1: JSON (application/json)
+        r = session.post(url, json=payload, timeout=8)
+        if r.status_code >= 200 and r.status_code < 300:
+            print(f"[SAQAR] OK {r.status_code}")
+            return
+        else:
+            print(f"[SAQAR] JSON failed {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print("[SAQAR] JSON error:", e)
+
+    try:
+        # المحاولة 2: form-encoded (بعض السيرفرات تتوقعها)
+        r = session.post(url, data=payload, timeout=8)
+        if r.status_code >= 200 and r.status_code < 300:
+            print(f"[SAQAR] OK(form) {r.status_code}")
+        else:
+            print(f"[SAQAR] form failed {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print("[SAQAR] form error:", e)
 
 # =========================
 # 🧠 حالة الرمز
