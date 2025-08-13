@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Merged Old-Style Fetch + Decision)
-- جلب أسعار سوق-بسوق على مهل (Retries + Fallback 24h ثم 1m close)
-- خيط مستقل لجلب الأسعار يغذي البافر باستمرار
-- خيط قرار فقط: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- يزرع price_now من A ويجدد TTL
-- إشعار صقر: "اشتري {symbol}"، وتلغرام (اختياري)
-- /status واضح مع ⭐ للـ TopN
+Bot B — TopN Watcher (Stable Entry Baseline + Calm Fetch)
+- جلب أسعار سوق-بسوق بهدوء (Retries + Fallback 24h ثم 1m close)
+- entry_price ثابت لكل عملة (من أول سعر فعلي) — لا يُصفَّر مع CV لاحق
+- قرار منفصل عن الجلب (خيطين): Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+- يجدد TTL عند كل CV من A
+- إشعار صقر: "اشتري {symbol}"
+- /status يبيّن r20/r60/r120 + SinceIn% بوضوح
 """
 
 import os, time, threading, re
@@ -23,13 +23,13 @@ HTTP_TIMEOUT       = 8.0
 ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))
 ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))
 
-# قرار كل ثانية (حلقة القرار فقط)
+# قرار فقط
 TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))
 
 # جلب أسعار سوق-بسوق (مثل القديم)
-SCAN_INTERVAL_SEC   = float(os.getenv("SCAN_INTERVAL_SEC", 5.0))   # كل كم ثانية نلف دورة كاملة على الغرفة
-PER_REQUEST_GAP_SEC = float(os.getenv("PER_REQUEST_GAP_SEC", 0.12))# نوم قصير بين كل سوق وسوق
-PRICE_RETRIES       = int(os.getenv("PRICE_RETRIES", 2))           # محاولات إعادة الطلب لكل سعر
+SCAN_INTERVAL_SEC   = float(os.getenv("SCAN_INTERVAL_SEC", 5.0))    # دورة كاملة على الغرفة
+PER_REQUEST_GAP_SEC = float(os.getenv("PER_REQUEST_GAP_SEC", 0.12)) # نوم بين كل سوق
+PRICE_RETRIES       = int(os.getenv("PRICE_RETRIES", 2))            # محاولات إعادة
 
 TTL_MIN            = int(os.getenv("TTL_MIN", 30))       # يُجدَّد عند كل CV
 SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
@@ -39,7 +39,7 @@ ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 WARMUP_SEC         = int(os.getenv("WARMUP_SEC", 25))
 NUDGE_R20          = float(os.getenv("NUDGE_R20", 0.12))
 NUDGE_R40          = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP        = float(os.getenv("BREAKOUT_BP", 6.0))   # اختراق قمة 60s
+BREAKOUT_BP        = float(os.getenv("BREAKOUT_BP", 6.0))   # اختراق قمة 60s (6bp)
 DD60_MAX           = float(os.getenv("DD60_MAX", 0.25))
 GLOBAL_ALERT_GAP   = int(os.getenv("GLOBAL_ALERT_GAP", 10))
 CHASE_R5M_MAX      = float(os.getenv("CHASE_R5M_MAX", 2.20))
@@ -54,7 +54,7 @@ SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
 # HTTP + كاش 24h
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/Merged-Fetch"})
+session.headers.update({"User-Agent":"TopN-Watcher/Entry-Baseline"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -98,11 +98,18 @@ def saqar_buy(symbol: str):
         print("[SAQAR] error:", e)
 
 # =========================
+# أدوات
+# =========================
+def pct(a, b):
+    if b is None or b == 0: return 0.0
+    return (a - b) / b * 100.0
+
+# =========================
 # Coin
 # =========================
 class Coin:
     __slots__ = ("market","symbol","entered_at","expires_at","last_alert_at",
-                 "cv","buf","last_price","armed_at","silent_until","price_fail")
+                 "cv","buf","last_price","entry_price","silent_until","price_fail")
     def __init__(self, market, symbol, ttl_sec):
         t = time.time()
         self.market = market
@@ -111,9 +118,9 @@ class Coin:
         self.expires_at = t + ttl_sec
         self.last_alert_at = 0.0
         self.cv = {}
-        self.buf = deque(maxlen=1200)  # ~20 دقيقة لو قرأنا عيّنة/ثانية
+        self.buf = deque(maxlen=1200)  # ~20 دقيقة على وتيرة 1 عينة/ثانية
         self.last_price = None
-        self.armed_at = t
+        self.entry_price = None  # ← baseline الثابت
         self.silent_until = t + WARMUP_SEC
         self.price_fail = 0
 
@@ -126,7 +133,12 @@ class Coin:
             if tt <= t_target:
                 base = pp; break
         if base is None: base = self.buf[0][1]
-        return (p_now - base) / base * 100.0
+        return pct(p_now, base)
+
+    def since_entry(self) -> float:
+        if self.entry_price is None or self.last_price is None:
+            return 0.0
+        return pct(self.last_price, self.entry_price)
 
 # =========================
 # الغرفة
@@ -138,7 +150,12 @@ VALID_MKT = re.compile(r"^[A-Z0-9]{1,10}-EUR$")
 def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
 
 def ensure_coin(cv):
-    """تحديث/إضافة عملة: يزرع السعر فورًا ويجدد TTL ويطبّق WARMUP."""
+    """
+    تحديث/إضافة عملة:
+    - لا نلمس entry_price إذا كانت موجودة (baseline ثابت).
+    - نجدد TTL إلى 30 دقيقة من الآن.
+    - نزرع price_now في البافر كعينة فورية (ولا نغيّر entry_price إلا إذا كانت None).
+    """
     m   = cv["market"].upper()
     if not is_valid_market(m): return
     sym = cv.get("symbol", m.split("-")[0])
@@ -154,11 +171,13 @@ def ensure_coin(cv):
             if p0 > 0:
                 c.last_price = p0
                 c.buf.append((nowt, p0))
+                if c.entry_price is None:
+                    c.entry_price = p0  # ← أول سعر فعلي فقط
             c.expires_at   = nowt + TTL_MIN*60
-            c.armed_at     = nowt
             c.silent_until = nowt + WARMUP_SEC
             return
 
+        # الغرفة ممتلئة؟ نطرد الأضعف (حسب r5m التاريخي)
         if len(room) >= ROOM_CAP:
             weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
             if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
@@ -169,20 +188,20 @@ def ensure_coin(cv):
         c.cv.update(feat)
         p0 = float(feat.get("price_now") or 0.0)
         if p0 > 0:
-            c.last_price = p0
+            c.last_price  = p0
+            c.entry_price = p0   # ← baseline عند الدخول لأول مرة
             c.buf.append((nowt, p0))
         room[m] = c
 
 # =========================
-# جلب الأسعار (مثل القديم) + Fallback
+# جلب الأسعار (هادئ) + Fallback
 # =========================
-_price_fail = {}          # market -> consecutive fails
-_last_candle_fetch = {}   # market -> ts آخر جلب شموع
+_last_candle_fetch = {}
 
 def get_price_one(market):
     """
-    يقرأ /v2/ticker/price لسوق واحد. يتعامل مع dict أو list.
-    Retries خفيفة + fallback 24h ثم close من شموع 1m.
+    /v2/ticker/price لسوق واحد.
+    يتعامل مع dict أو list. Retries + fallback 24h ثم close من 1m.
     """
     p = None
     for _ in range(PRICE_RETRIES):
@@ -200,9 +219,8 @@ def get_price_one(market):
             p = None
         if p is not None and p > 0:
             return p
-        time.sleep(0.1)  # backoff صغير بين المحاولات
+        time.sleep(0.1)
 
-    # Fallback 1: 24h last من الكاش
     data24 = get_24h_cached(max_age_sec=1.0)
     if data24:
         try:
@@ -213,7 +231,6 @@ def get_price_one(market):
         except Exception:
             pass
 
-    # Fallback 2: close من شموع 1m (مرّة كل 10s لنفس السوق)
     now = time.time()
     if now - _last_candle_fetch.get(market, 0) >= 10:
         cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
@@ -230,17 +247,15 @@ def get_price_one(market):
 
 def price_poller_loop():
     """
-    يلف على غرفة الأسواق كل SCAN_INTERVAL_SEC.
-    بين كل سوق وسوق PER_REQUEST_GAP_SEC لتجنب 429/400.
-    يغذي البافر فقط. لا قرارات هنا.
+    يلف على الغرفة كل SCAN_INTERVAL_SEC ويغذي البافر.
+    لا قرارات هنا.
     """
     while True:
         start = time.time()
         with room_lock:
             markets = [m for m in room.keys() if is_valid_market(m)]
         if not markets:
-            time.sleep(0.5)
-            continue
+            time.sleep(0.5); continue
 
         for m in markets:
             p = get_price_one(m)
@@ -248,26 +263,27 @@ def price_poller_loop():
                 with room_lock:
                     c = room.get(m)
                     if c:
-                        c.price_fail = getattr(c, "price_fail", 0) + 1
+                        c.price_fail += 1
                         if c.price_fail % 5 == 0:
                             print(f"[PRICE] {m} failed {c.price_fail}x")
-                time.sleep(PER_REQUEST_GAP_SEC)
-                continue
+                time.sleep(PER_REQUEST_GAP_SEC); continue
 
             ts = time.time()
             with room_lock:
                 c = room.get(m)
-                if not c:
-                    continue
-                c.price_fail = 0
-                c.last_price = p
-                c.buf.append((ts, p))
-                if TTL_MIN > 0 and ts >= c.expires_at:
-                    c.expires_at = ts + 120
+                if not c: 
+                    pass
+                else:
+                    c.price_fail = 0
+                    c.last_price = p
+                    c.buf.append((ts, p))
+                    if c.entry_price is None:
+                        c.entry_price = p  # أمان: لو دخل بدون price_now
+                    if TTL_MIN > 0 and ts >= c.expires_at:
+                        c.expires_at = ts + 120
 
             time.sleep(PER_REQUEST_GAP_SEC)
 
-        # حافظ على الفترة الكلية للدورة
         elapsed = time.time() - start
         time.sleep(max(0.05, SCAN_INTERVAL_SEC - elapsed))
 
@@ -312,7 +328,7 @@ def decide_and_alert():
         top_n = sorted_room[:max(0, ALERT_TOP_N)]
 
         for m, c in top_n:
-            if nowt < c.silent_until:
+            if nowt < c.silent_until: 
                 continue
             if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
                 continue
@@ -321,7 +337,6 @@ def decide_and_alert():
 
             r5m = float(c.cv.get("r5m", 0.0))
             r20 = c.r_change(20)
-            # مانع مطاردة: تمدد قوي بدون زخم حيّ
             if r5m >= CHASE_R5M_MAX and r20 < CHASE_R20_MIN:
                 continue
 
@@ -336,7 +351,6 @@ def decide_and_alert():
             nudge_ok    = (r20 >= NUDGE_R20 and r40 >= NUDGE_R40)
             dd_ok       = (dd60 <= DD60_MAX)
 
-            # تسهيل طفيف إذا A أرسل preburst
             preburst = bool((c.cv or {}).get("preburst", False))
             if preburst:
                 nudge_ok = (r20 >= max(0.08, NUDGE_R20-0.04) and r40 >= max(0.14, NUDGE_R40-0.06))
@@ -355,10 +369,6 @@ def decide_and_alert():
 # حلقة القرار فقط
 # =========================
 def monitor_loop():
-    """
-    حلقة القرار فقط: ما بتجيب أسعار.
-    تعتمد على البافر الذي يملأه price_poller_loop.
-    """
     while True:
         try:
             decide_and_alert()
@@ -371,7 +381,7 @@ def monitor_loop():
         time.sleep(TICK_SEC)
 
 # =========================
-# حالة وواجهات
+# الحالة وواجهات
 # =========================
 def build_status_text():
     with room_lock:
@@ -381,11 +391,13 @@ def build_status_text():
             star = "⭐" if rank <= ALERT_TOP_N else " "
             r5m  = c.cv.get("r5m", 0.0); r10m = c.cv.get("r10m", 0.0); vz = c.cv.get("volZ", 0.0)
             r20  = c.r_change(20); r60 = c.r_change(60); r120 = c.r_change(120)
+            since = c.since_entry()
             ttl  = int(c.expires_at - time.time())
             ttl_text = "∞" if TTL_MIN == 0 else f"{ttl}s"
             lines.append(
                 f"{rank:02d}.{star} {m:<10} | r5m {r5m:+.2f}%  r10m {r10m:+.2f}%  "
-                f"r20 {r20:+.2f}%  r60 {r60:+.2f}%  r120 {r120:+.2f}%  volZ {vz:+.2f}  TTL {ttl_text}"
+                f"r20 {r20:+.2f}%  r60 {r60:+.2f}%  r120 {r120:+.2f}%  "
+                f"SinceIn {since:+.2f}%  volZ {vz:+.2f}  TTL {ttl_text}"
             )
     header = f"📊 Room {len(room)}/{ROOM_CAP} | TopN={ALERT_TOP_N} | Gap={GLOBAL_ALERT_GAP}s"
     return header + ("\n" + "\n".join(lines) if lines else "\n(لا يوجد عملات بعد)")
