@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Final RR 1s + Fallback)
+Bot B — TopN Watcher (Merged Old-Style Fetch + Decision)
+- جلب أسعار سوق-بسوق على مهل (Retries + Fallback 24h ثم 1m close)
+- خيط مستقل لجلب الأسعار يغذي البافر باستمرار
+- خيط قرار فقط: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+- يزرع price_now من A ويجدد TTL
+- إشعار صقر: "اشتري {symbol}"، وتلغرام (اختياري)
+- /status واضح مع ⭐ للـ TopN
 """
 
 import os, time, threading, re
@@ -9,7 +15,7 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات
+# إعدادات قابلة للتعديل
 # =========================
 BITVAVO_URL        = "https://api.bitvavo.com"
 HTTP_TIMEOUT       = 8.0
@@ -17,8 +23,13 @@ HTTP_TIMEOUT       = 8.0
 ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))
 ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))
 
-TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))   # ثانية
-CHUNK_PER_TICK     = int(os.getenv("CHUNK_PER_TICK", 8)) # كم عملة نقرأ بكل نبضة
+# قرار كل ثانية (حلقة القرار فقط)
+TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))
+
+# جلب أسعار سوق-بسوق (مثل القديم)
+SCAN_INTERVAL_SEC   = float(os.getenv("SCAN_INTERVAL_SEC", 5.0))   # كل كم ثانية نلف دورة كاملة على الغرفة
+PER_REQUEST_GAP_SEC = float(os.getenv("PER_REQUEST_GAP_SEC", 0.12))# نوم قصير بين كل سوق وسوق
+PRICE_RETRIES       = int(os.getenv("PRICE_RETRIES", 2))           # محاولات إعادة الطلب لكل سعر
 
 TTL_MIN            = int(os.getenv("TTL_MIN", 30))       # يُجدَّد عند كل CV
 SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
@@ -43,7 +54,7 @@ SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
 # HTTP + كاش 24h
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/Final-RR1s"})
+session.headers.update({"User-Agent":"TopN-Watcher/Merged-Fetch"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -100,7 +111,7 @@ class Coin:
         self.expires_at = t + ttl_sec
         self.last_alert_at = 0.0
         self.cv = {}
-        self.buf = deque(maxlen=int(max(600, 900/max(0.5, TICK_SEC))))  # ~10–15 دقيقة
+        self.buf = deque(maxlen=1200)  # ~20 دقيقة لو قرأنا عيّنة/ثانية
         self.last_price = None
         self.armed_at = t
         self.silent_until = t + WARMUP_SEC
@@ -163,35 +174,33 @@ def ensure_coin(cv):
         room[m] = c
 
 # =========================
-# أسعار + فالـباك
+# جلب الأسعار (مثل القديم) + Fallback
 # =========================
 _price_fail = {}          # market -> consecutive fails
 _last_candle_fetch = {}   # market -> ts آخر جلب شموع
 
-def fetch_price(market):
-    """قراءة سعر سوق واحد + فالـباك 24h ثم close 1m بعد فشلين."""
-    data = http_get("/v2/ticker/price", params={"market": market})
+def get_price_one(market):
+    """
+    يقرأ /v2/ticker/price لسوق واحد. يتعامل مع dict أو list.
+    Retries خفيفة + fallback 24h ثم close من شموع 1m.
+    """
     p = None
-    try:
-        if isinstance(data, dict):
-            p = float(data.get("price"))
-        elif isinstance(data, list) and data:
-            if len(data) == 1:
-                p = float((data[0] or {}).get("price"))
-            else:
-                row = next((x for x in data if x.get("market") == market), None)
-                if row: p = float(row.get("price"))
-    except Exception:
-        p = None
-
-    if p is not None and p > 0:
-        _price_fail[market] = 0
-        return p
-
-    # فشل — زد العداد
-    _price_fail[market] = _price_fail.get(market, 0) + 1
-    if _price_fail[market] < 2:
-        return None
+    for _ in range(PRICE_RETRIES):
+        data = http_get("/v2/ticker/price", params={"market": market})
+        try:
+            if isinstance(data, dict):
+                p = float(data.get("price"))
+            elif isinstance(data, list) and data:
+                if len(data) == 1:
+                    p = float((data[0] or {}).get("price"))
+                else:
+                    row = next((x for x in data if x.get("market") == market), None)
+                    if row: p = float(row.get("price"))
+        except Exception:
+            p = None
+        if p is not None and p > 0:
+            return p
+        time.sleep(0.1)  # backoff صغير بين المحاولات
 
     # Fallback 1: 24h last من الكاش
     data24 = get_24h_cached(max_age_sec=1.0)
@@ -199,7 +208,7 @@ def fetch_price(market):
         try:
             it = next((x for x in data24 if x.get("market")==market), None)
             p = float((it or {}).get("last", 0) or 0)
-            if p > 0: 
+            if p > 0:
                 return p
         except Exception:
             pass
@@ -211,14 +220,60 @@ def fetch_price(market):
         _last_candle_fetch[market] = now
         try:
             if isinstance(cnd, list) and cnd:
-                p = float(cnd[-1][4])
-                if p > 0: 
+                p = float(cnd[-1][4])  # close
+                if p > 0:
                     return p
         except Exception:
             pass
 
     return None
 
+def price_poller_loop():
+    """
+    يلف على غرفة الأسواق كل SCAN_INTERVAL_SEC.
+    بين كل سوق وسوق PER_REQUEST_GAP_SEC لتجنب 429/400.
+    يغذي البافر فقط. لا قرارات هنا.
+    """
+    while True:
+        start = time.time()
+        with room_lock:
+            markets = [m for m in room.keys() if is_valid_market(m)]
+        if not markets:
+            time.sleep(0.5)
+            continue
+
+        for m in markets:
+            p = get_price_one(m)
+            if p is None or p <= 0:
+                with room_lock:
+                    c = room.get(m)
+                    if c:
+                        c.price_fail = getattr(c, "price_fail", 0) + 1
+                        if c.price_fail % 5 == 0:
+                            print(f"[PRICE] {m} failed {c.price_fail}x")
+                time.sleep(PER_REQUEST_GAP_SEC)
+                continue
+
+            ts = time.time()
+            with room_lock:
+                c = room.get(m)
+                if not c:
+                    continue
+                c.price_fail = 0
+                c.last_price = p
+                c.buf.append((ts, p))
+                if TTL_MIN > 0 and ts >= c.expires_at:
+                    c.expires_at = ts + 120
+
+            time.sleep(PER_REQUEST_GAP_SEC)
+
+        # حافظ على الفترة الكلية للدورة
+        elapsed = time.time() - start
+        time.sleep(max(0.05, SCAN_INTERVAL_SEC - elapsed))
+
+# =========================
+# القرار + الإشعار
+# =========================
 def spread_ok(market):
     data = get_24h_cached()
     if not data: return True
@@ -246,11 +301,7 @@ def recent_dd_pct(c: Coin, seconds: int):
     hi = max(p for _,p in sub); last = sub[-1][1]
     return (hi - last) / hi * 100.0
 
-# =========================
-# قرار وإشعار
-# =========================
 last_global_alert = 0.0
-
 def decide_and_alert():
     """يطلق فقط لأول N عملة بعد تحقق النخزة وكسر القمة وفلتر anti-chase."""
     global last_global_alert
@@ -301,55 +352,20 @@ def decide_and_alert():
             saqar_buy(c.symbol)
 
 # =========================
-# مراقبة Round-Robin كل 1s
+# حلقة القرار فقط
 # =========================
 def monitor_loop():
-    rr = 0  # مؤشر الدوران على الغرفة
+    """
+    حلقة القرار فقط: ما بتجيب أسعار.
+    تعتمد على البافر الذي يملأه price_poller_loop.
+    """
     while True:
         try:
-            with room_lock:
-                markets_all = [m for m in room.keys() if is_valid_market(m)]
-            if not markets_all:
-                time.sleep(TICK_SEC)
-                continue
-
-            # دفعة صغيرة بهالنبضة
-            start = rr
-            end   = min(start + CHUNK_PER_TICK, len(markets_all))
-            batch = markets_all[start:end]
-            if not batch:
-                rr = 0
-                batch = markets_all[:min(CHUNK_PER_TICK, len(markets_all))]
-            rr = (end if end < len(markets_all) else 0)
-
-            ts = time.time()
-            for m in batch:
-                p = fetch_price(m)
-                if p is None or p <= 0:
-                    with room_lock:
-                        c = room.get(m)
-                        if c:
-                            c.price_fail += 1
-                            if c.price_fail % 5 == 0:
-                                print(f"[PRICE] {m} failed {c.price_fail}x")
-                    continue
-
-                with room_lock:
-                    c = room.get(m)
-                    if not c: 
-                        continue
-                    c.price_fail = 0
-                    c.last_price = p
-                    c.buf.append((ts, p))
-                    if TTL_MIN > 0 and ts >= c.expires_at:
-                        c.expires_at = ts + 120
-
             decide_and_alert()
-
             if int(time.time()) % 30 == 0:
                 with room_lock:
                     filled = sum(1 for c in room.values() if len(c.buf) >= 2)
-                print(f"[MONITOR] rr={rr} — updated {len(batch)} / {len(markets_all)} | good {filled}/{len(room)}")
+                print(f"[MONITOR] decision-only — buffers ok {filled}/{len(room)}")
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
@@ -413,7 +429,8 @@ def telegram_webhook():
 # التشغيل
 # =========================
 def start_threads():
-    threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=price_poller_loop, daemon=True).start()  # الجالب
+    threading.Thread(target=monitor_loop, daemon=True).start()       # المقرِّر
 
 start_threads()
 
