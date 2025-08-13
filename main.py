@@ -46,7 +46,7 @@ NUDGE_R40           = float(os.getenv("NUDGE_R40", 0.20))     # %
 # Telegram / Webhook (اختياري)
 BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
 CHAT_ID             = os.getenv("CHAT_ID", "")
-SAQR_WEBHOOK        = os.getenv("SAQR_WEBHOOK", "")           # مثلاً أمر شراء
+SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK", "")           # مثلاً أمر شراء
 
 # تكيّف خفيف لكل عملة (bandit-like)
 TUNE_WIN_SEC        = int(os.getenv("TUNE_WIN_SEC", 120))     # نقيم الإشارة بعد 120s
