@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Final 1s Bulk + Smart Fallback)
-- يستقبل CV من A، يزرع price_now في البافر ويجدّد TTL لـ 30 دقيقة كل مرة
-- حلقة مراقبة كل 1s: جلب جماعي لأسعار كل الغرفة (بدُفعات) بدون ترميز للفواصل
-- فالـباك ذكي: 24h ثم close من شموع 1m بعد فشلين متتاليين
-- إطلاق إشعارات حقيقية فقط: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+Bot B — TopN Watcher (Final 1s per-market + Smart Fallback)
+- يستقبل CV من A، يزرع price_now في البافر ويجدّد TTL لـ 30 دقيقة
+- مراقبة كل 1s: قراءة سعر **لكل سوق على حدة** (بدون markets=)
+- فالـباك ذكي: 24h ثم close 1m بعد فشلين متتاليين
+- إشعارات حقيقية: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
 - إرسال لصقر: "اشتري {symbol}"، وتلغرام اختياري
 - /status مختصر وواضح (⭐ للـ TopN)
 """
@@ -46,7 +46,7 @@ SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
 # HTTP + كاش 24h
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/Final-1s"})
+session.headers.update({"User-Agent":"TopN-Watcher/Final-1s-single"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -57,16 +57,6 @@ def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
         return r.json()
     except Exception as e:
         print(f"[HTTP] GET {path} failed:", e)
-        return None
-
-def http_get_full(url, timeout=HTTP_TIMEOUT):
-    """GET باستخدام URL كامل دون params حتى لا تُشفّر الفواصل ',' إلى %2C."""
-    try:
-        r = session.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("[HTTP FULL] GET failed:", e)
         return None
 
 _tick24_cache = {"ts": 0.0, "data": None}
@@ -172,7 +162,7 @@ def ensure_coin(cv):
         room[m] = c
 
 # =========================
-# أسعار جماعية + فالـباك
+# أسعار + فالـباك
 # =========================
 _price_fail = {}          # market -> consecutive fails
 _last_candle_fetch = {}   # market -> ts آخر جلب شموع
@@ -208,7 +198,7 @@ def fetch_price(market):
         try:
             it = next((x for x in data24 if x.get("market")==market), None)
             p = float((it or {}).get("last", 0) or 0)
-            if p > 0: 
+            if p > 0:
                 return p
         except Exception:
             pass
@@ -221,44 +211,12 @@ def fetch_price(market):
         try:
             if isinstance(cnd, list) and cnd:
                 p = float(cnd[-1][4])
-                if p > 0: 
+                if p > 0:
                     return p
         except Exception:
             pass
 
     return None
-
-def fetch_prices_batched(markets, batch_size=8):
-    """جلب أسعار بدُفعات عبر markets=A,B,... دون ترميز للفواصل، مع فالـباك لمن ينقص."""
-    markets = [m.upper() for m in markets]
-    out = {}
-
-    for i in range(0, len(markets), batch_size):
-        chunk = markets[i:i+batch_size]
-        url = f"{BITVAVO_URL}/v2/ticker/price?markets=" + ",".join(chunk)
-        data = http_get_full(url)
-
-        try:
-            if isinstance(data, list):
-                for row in data:
-                    m = row.get("market"); pr = row.get("price")
-                    if m and pr is not None:
-                        out[m] = float(pr)
-            elif isinstance(data, dict):  # عنصر واحد
-                m = data.get("market"); pr = data.get("price")
-                if m and pr is not None:
-                    out[m] = float(pr)
-        except Exception:
-            pass
-
-    # أكمل المفقودين بفالـباك
-    missing = [m for m in markets if m not in out]
-    for m in missing:
-        p = fetch_price(m)
-        if p is not None and p > 0:
-            out[m] = p
-
-    return out
 
 def spread_ok(market):
     data = get_24h_cached()
@@ -342,7 +300,7 @@ def decide_and_alert():
             saqar_buy(c.symbol)
 
 # =========================
-# مراقبة 1s (سحب بدُفعات)
+# مراقبة 1s (لكل سوق على حدة)
 # =========================
 def monitor_loop():
     while True:
@@ -352,18 +310,21 @@ def monitor_loop():
             if not markets:
                 time.sleep(TICK_SEC); continue
 
-            prices_map = fetch_prices_batched(markets, batch_size=8)
             ts = time.time()
+            for m in markets:
+                p = fetch_price(m)
+                if p is None or p <= 0:
+                    with room_lock:
+                        c = room.get(m)
+                        if c:
+                            c.price_fail += 1
+                            if c.price_fail % 5 == 0:
+                                print(f"[PRICE] {m} failed {c.price_fail}x")
+                    continue
 
-            with room_lock:
-                for m in markets:
+                with room_lock:
                     c = room.get(m)
-                    if not c: continue
-                    p = prices_map.get(m)
-                    if p is None or p <= 0:
-                        c.price_fail = getattr(c, "price_fail", 0) + 1
-                        if c.price_fail % 5 == 0:
-                            print(f"[PRICE] {m} failed {c.price_fail}x")
+                    if not c: 
                         continue
                     c.price_fail = 0
                     c.last_price = p
@@ -373,7 +334,6 @@ def monitor_loop():
 
             decide_and_alert()
 
-            # لوج طمأنة
             if int(time.time()) % 30 == 0:
                 with room_lock:
                     filled = sum(1 for c in room.values() if len(c.buf) >= 2)
