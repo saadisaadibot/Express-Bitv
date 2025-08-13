@@ -1,44 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (نسخة تلغرام + صقر)
-- يستقبل CV من A ويحدّثه دون تصفير البافر أو العدادات
-- يرتّب الغرفة حسب r5m ويُرسل إشعارات شراء فقط لأول ALERT_TOP_N
-- لا يقصي عملة إلا إذا الغرفة ممتلئة وجاء CV أقوى
-- /status يرجع تقرير مفصّل (HTTP و Telegram)
+Bot B — TopN Watcher (Telegram + Saqar)
+- ينسخ CV من A ويكمل المراقبة بدون تصفير البافر
+- يجدد TTL للرمز إلى 30 دقيقة عند وصول CV جديد لنفس الرمز
+- لا يقصي عملة إلا إذا الغرفة ممتلئة وجاءت أقوى منها
+- يرسل لصقر "اشتري {symbol}" فقط لأول ALERT_TOP_N عملات
+- /status عبر HTTP وتلغرام
 """
 
-import os, time, math, random, threading
+import os, time, threading, random
 from collections import deque
 import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# ⚙️ إعدادات قابلة للتعديل
+# إعدادات قابلة للتعديل
 # =========================
 BITVAVO_URL        = "https://api.bitvavo.com"
 HTTP_TIMEOUT       = 8.0
 
-ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))      # حجم الغرفة
-ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))     # إشعارات فقط لأول N
-TICK_SEC           = float(os.getenv("TICK_SEC", 2.5))    # دورة المراقبة
-BATCH_SIZE         = int(os.getenv("BATCH_SIZE", 12))     # دفعة أسعار
-
-# TTL معطّل افتراضيًا (0 = معطّل). فعّله إذا بدك خروج تلقائي بعد مدة.
-TTL_MIN            = int(os.getenv("TTL_MIN", 0))         # دقائق
-SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60))  # 0.60% حد أقصى للسبريد
+ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))
+ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))        # إشعار فقط لتوب N
+TICK_SEC           = float(os.getenv("TICK_SEC", 2.5))
+BATCH_SIZE         = int(os.getenv("BATCH_SIZE", 12))
+TTL_MIN            = int(os.getenv("TTL_MIN", 30))           # مدة المراقبة (دقائق)
+SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60))     # 0.60%
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 
 # Telegram (اختياري)
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
-CHAT_ID            = os.getenv("CHAT_ID", "")             # اختياري: لإرسال الردود لقناة ثابتة
+CHAT_ID            = os.getenv("CHAT_ID", "")                 # افتراضي لإرسال /status
+
 # Webhook صقر (إلزامي لإرسال "اشتري")
 SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
 
 # =========================
-# 🌐 HTTP Session
+# HTTP
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/2.0"})
+session.headers.update({"User-Agent":"TopN-Watcher/2.1"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -51,15 +51,10 @@ def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
         print(f"[HTTP] GET {path} failed:", e)
         return None
 
-# =========================
-# 🔔 إرسال إشعارات
-# =========================
 def tg_send(text, chat_id=None):
-    if not BOT_TOKEN: 
-        return
+    if not BOT_TOKEN: return
     cid = chat_id or CHAT_ID
-    if not cid:
-        return
+    if not cid: return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         session.post(url, json={"chat_id": cid, "text": text, "disable_web_page_preview": True}, timeout=8)
@@ -67,20 +62,19 @@ def tg_send(text, chat_id=None):
         print("[TG] send failed:", e)
 
 def saqar_buy(symbol):
-    if not SAQAR_WEBHOOK:
-        return
-    payload = {"text": f"اشتري {symbol.lower()}"}   # كما طلبت: نص بسيط فقط
+    if not SAQAR_WEBHOOK: return
+    payload = {"text": f"اشتري {symbol.lower()}"}  # رسمي وبسيط
     try:
         r = session.post(SAQAR_WEBHOOK, json=payload, timeout=8)
         if 200 <= r.status_code < 300:
             print(f"[SAQAR] ✅ اشتري {symbol.lower()}")
         else:
-            print(f"[SAQAR] ❌ {r.status_code} {r.text[:200]}")
+            print(f"[SAQAR] ❌ {r.status_code} {r.text[:160]}")
     except Exception as e:
         print("[SAQAR] error:", e)
 
 # =========================
-# 🧠 Coin
+# Coin
 # =========================
 class Coin:
     __slots__ = ("market","symbol","entered_at","expires_at","last_alert_at","cv","buf","last_price")
@@ -89,14 +83,14 @@ class Coin:
         self.market = market
         self.symbol = symbol
         self.entered_at = t
-        # TTL اختياري — معطّل إذا TTL_MIN=0
-        self.expires_at = (t + ttl_sec) if ttl_sec > 0 else 9e18
+        self.expires_at = t + ttl_sec
         self.last_alert_at = 0
-        self.cv = {}  # r5m, r10m, volZ, spread/liq_rank…
-        self.buf = deque(maxlen=int(max(600, 900/max(0.5, TICK_SEC)))))  # ~10-15 دقيقة
+        self.cv = {}  # r5m, r10m, volZ, liq_rank ..
+        # ~10-15 دقيقة بافر
+        self.buf = deque(maxlen=int(max(600, 900/max(0.5, TICK_SEC))))
         self.last_price = None
 
-    def r_change(self, seconds):
+    def r_change(self, seconds: int) -> float:
         if len(self.buf) < 2: return 0.0
         t_now, p_now = self.buf[-1]
         t_target = t_now - seconds
@@ -108,24 +102,33 @@ class Coin:
         return (p_now - base) / base * 100.0
 
 # =========================
-# 🗃️ الغرفة
+# الغرفة
 # =========================
 room_lock = threading.Lock()
 room = {}  # market -> Coin
 
 def ensure_coin(cv):
-    """ينسخ CV بدون تصفير، ويقصي فقط عند الامتلاء إذا الجديدة أقوى."""
+    """
+    - إذا الرمز موجود: حدّث CV وجدد TTL إلى 30 دقيقة من الآن (أو حسب TTL_MIN).
+    - إذا غير موجود:
+        * إن كانت الغرفة ممتلئة: اقصِ الأضعف فقط إن كانت الجديدة أقوى.
+        * ثم أضف الرمز.
+    """
     m   = cv["market"]
     sym = cv.get("symbol", m.split("-")[0])
     feat= cv.get("feat", {})
-    ttl_sec = int(cv.get("ttl_sec", TTL_MIN*60))
+    ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN*60)))  # ضمان ≥ 60s
 
+    nowt = time.time()
     with room_lock:
-        if m in room:
-            room[m].cv.update(feat)
+        c = room.get(m)
+        if c:
+            c.cv.update(feat)
+            # ✅ تجديد الوقت المتبقي إلى 30 دقيقة من الآن
+            c.expires_at = nowt + TTL_MIN*60
             return
 
-        # امتلاء؟ قص الأضعف فقط إن كانت الجديدة أقوى
+        # الغرفة ممتلئة؟
         if len(room) >= ROOM_CAP:
             weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
             if feat.get("r5m", 0.0) <= weakest_coin.cv.get("r5m", 0.0):
@@ -137,7 +140,7 @@ def ensure_coin(cv):
         room[m] = c
 
 # =========================
-# 📈 الأسعار
+# الأسعار + سبريد
 # =========================
 def fetch_price(market):
     data = http_get("/v2/ticker/price", params={"market": market})
@@ -146,14 +149,13 @@ def fetch_price(market):
     except:
         return None
 
-def spread_ok(market):
-    # محاولة تقدير السبريد (اختياري)
+def spread_ok(market) -> bool:
     data = http_get("/v2/ticker/24h")
     if not data: return True
+    it = next((x for x in data if x.get("market")==market), None)
+    if not it: return True
     try:
-        item = next((x for x in data if x.get("market")==market), None)
-        if not item: return True
-        bid = float(item.get("bid", 0) or 0); ask = float(item.get("ask", 0) or 0)
+        bid = float(it.get("bid", 0) or 0); ask = float(it.get("ask", 0) or 0)
         if bid<=0 or ask<=0: return True
         bp = (ask - bid) / ((ask+bid)/2) * 10000
         return bp <= SPREAD_MAX_BP
@@ -161,26 +163,23 @@ def spread_ok(market):
         return True
 
 # =========================
-# 🔔 القرار (Top-N فقط)
+# القرار (Top-N فقط)
 # =========================
 def decide_and_alert():
     nowt = time.time()
     with room_lock:
-        # ترتيب حسب r5m من CV
         sorted_room = sorted(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0), reverse=True)
-
         top_n = sorted_room[:max(0, ALERT_TOP_N)]
         for m, c in top_n:
             if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
                 continue
-            # سبريد حماية خفيفة
             if not spread_ok(m):
                 continue
             c.last_alert_at = nowt
             saqar_buy(c.symbol)
 
 # =========================
-# 🩺 المراقبة
+# المراقبة
 # =========================
 def monitor_loop():
     rr = 0
@@ -204,18 +203,17 @@ def monitor_loop():
                     if not c: continue
                     c.last_price = p
                     c.buf.append((ts, p))
-                    # TTL مفعّل؟ (إلا إذا TTL_MIN=0 لن يخرج)
-                    if ts >= c.expires_at:
-                        # ما نقصي إلا عند الامتلاء — لذا فقط مدّد قليلاً
-                        c.expires_at = ts + 120  # تمديد بسيط كي يبقى حتى تأتي أقوى منه
+                    # خروج تلقائي فقط إذا فعّال TTL_MIN>0
+                    if TTL_MIN > 0 and ts >= c.expires_at:
+                        # لا نقصي فورًا: نمدد قليلًا ريثما تأتي أقوى منه (منطقك)
+                        c.expires_at = ts + 120
             decide_and_alert()
-
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
 
 # =========================
-# 📊 الحالة
+# الحالة
 # =========================
 def build_status_text():
     with room_lock:
@@ -228,16 +226,17 @@ def build_status_text():
             r5m  = c.cv.get("r5m", 0.0)
             r10m = c.cv.get("r10m", 0.0)
             volZ = c.cv.get("volZ", 0.0)
-            ttl  = int(c.expires_at - time.time()) if c.expires_at < 9e18 else -1
+            ttl  = int(c.expires_at - time.time())
+            ttl_text = "∞" if TTL_MIN == 0 else (str(ttl)+"s")
             rows.append(f"{rank:02d}. {m:<10} "
                         f"r5m={r5m:+.2f}% r10m={r10m:+.2f}% "
                         f"r20={r20:+.2f}% r60={r60:+.2f}% r120={r120:+.2f}% "
-                        f"volZ={volZ:+.2f} TTL={'∞' if ttl<0 else str(ttl)+'s'}")
+                        f"volZ={volZ:+.2f} TTL={ttl_text}")
     hdr = f"📊 Room: {len(room)}/{ROOM_CAP} | AlertTopN={ALERT_TOP_N}"
     return hdr + ("\n" + "\n".join(rows) if rows else "\n(لا يوجد عملات بعد)")
 
 # =========================
-# 🌐 Flask API
+# Flask API
 # =========================
 app = Flask(__name__)
 
@@ -260,7 +259,7 @@ def status_http():
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
-    """استقبال أوامر تلغرام — استخدم /status لعرض الحالة."""
+    """استخدم /status في تلغرام لعرض الحالة."""
     try:
         data = request.get_json(force=True, silent=True) or {}
         msg  = data.get("message") or data.get("edited_message") or {}
@@ -268,17 +267,15 @@ def telegram_webhook():
         chat = msg.get("chat", {}).get("id")
         if not txt: 
             return jsonify(ok=True)
-
         if txt in ("/status", "status", "الحالة", "/الحالة"):
-            text = build_status_text()
-            tg_send(text, chat_id=chat or CHAT_ID)
+            tg_send(build_status_text(), chat_id=chat or CHAT_ID)
         return jsonify(ok=True)
     except Exception as e:
         print("[WEBHOOK] err:", e)
         return jsonify(ok=True)
 
 # =========================
-# ▶️ التشغيل
+# التشغيل
 # =========================
 def start_threads():
     threading.Thread(target=monitor_loop, daemon=True).start()
