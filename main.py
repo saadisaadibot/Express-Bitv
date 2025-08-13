@@ -28,8 +28,8 @@ PRE_NODIP           = float(os.getenv("PRE_NODIP", 0.25))    # %
 PRE_VOLBOOST        = float(os.getenv("PRE_VOLBOOST", 1.4))  # ×
 
 # عتبات التريغر (الانفجار)
-TRIG_R40            = float(os.getenv("TRIG_R40", 0.60))     # %
-TRIG_R120           = float(os.getenv("TRIG_R120", 1.20))    # %
+TRIG_R40            = float(os.getenv("TRIG_R40", 0.40))     # %
+TRIG_R120           = float(os.getenv("TRIG_R120", 0.80))    # %
 TRIG_R20HELP        = float(os.getenv("TRIG_R20HELP", 0.25)) # %
 TRIG_VOLZ           = float(os.getenv("TRIG_VOLZ", 1.0))     # Z-score
 
