@@ -177,21 +177,33 @@ room_lock = threading.Lock()
 room = {}   # market -> Coin
 
 def ensure_coin(cv):
-    m = cv["market"]; sym = cv.get("symbol", m.split("-")[0])
+    m   = cv["market"]
+    sym = cv.get("symbol", m.split("-")[0])
+    nowt = now()
+    ttl_sec = int(cv.get("ttl_sec", TTL_MIN*60))
+
     with room_lock:
         c = room.get(m)
         if not c:
+            # إدخال أول مرة: اضبط المؤقّتات فقط هنا
             c = Coin(m, sym)
+            c.expires_at   = nowt + ttl_sec
+            c.silent_until = nowt + COIN_SILENT_SEC
             room[m] = c
-        c.cv = cv["feat"]
-        c.tags = cv.get("tags", [])
-        c.last_cv_at = now()
-        c.silent_until = now() + COIN_SILENT_SEC
-        c.renew(cv.get("ttl_sec", TTL_MIN*60))
-        # قص زائد لو لزم
+
+        # تحديث معلومات فقط (بدون لمس المؤقّتات)
+        c.cv    = cv["feat"]
+        c.tags  = cv.get("tags", [])
+        c.last_cv_at = nowt
+
+        # لا نجدد TTL ولا نعيد silent على CVات لاحقة
+        # (لو بدك تنعّش TTL عند الاقتراب من الانتهاء، فعّل السطرين التاليين بدلاً من ذلك)
+        # if c.expires_at - nowt < 0.4 * ttl_sec:
+        #     c.expires_at = nowt + ttl_sec
+
+        # قص زائد كما هو
         overflow = len(room) - ROOM_CAP
         if overflow > 0:
-            # قص ذكي: أبقِ الجديد والفعّال
             scored = []
             tnow = now()
             for mk, st in room.items():
