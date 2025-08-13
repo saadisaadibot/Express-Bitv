@@ -125,29 +125,75 @@ def ensure_coin(cv):
     with room_lock:
         c = room.get(m)
         if c:
+            # تحديث CV للعملة الموجودة
             c.cv.update(feat)
-            c.expires_at = nowt + TTL_MIN*60   # تجديد 30 دقيقة
-            c.armed_at = nowt
+
+            # ✅ زرع السعر من A في البافر فورًا
+            p0 = float(feat.get("price_now") or 0.0)
+            if p0 > 0:
+                c.last_price = p0
+                c.buf.append((nowt, p0))
+
+            # تجديد الوقت 30 دقيقة من الآن + تسليح/صمت
+            c.expires_at   = nowt + TTL_MIN*60
+            c.armed_at     = nowt
             c.silent_until = nowt + WARMUP_SEC
             return
 
+        # الغرفة ممتلئة؟ أزل الأضعف فقط إذا الجديدة أقوى
         if len(room) >= ROOM_CAP:
-            weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
-            if feat.get("r5m", 0.0) <= weakest_coin.cv.get("r5m", 0.0):
+            weakest_mk, weakest_coin = min(
+                room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0)
+            )
+            if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
                 return
             room.pop(weakest_mk, None)
 
+        # إضافة عملة جديدة
         c = Coin(m, sym, ttl_sec)
         c.cv.update(feat)
-        room[m] = c
 
+        # ✅ زرع السعر الابتدائي في البافر
+        p0 = float(feat.get("price_now") or 0.0)
+        if p0 > 0:
+            c.last_price = p0
+            c.buf.append((nowt, p0))
+
+        room[m] = c
 # =========================
 # أسعار + سبريد + أدوات قرار
 # =========================
+price_errs = {}  # market -> عدد فشل متتالي
+
 def fetch_price(market):
     data = http_get("/v2/ticker/price", params={"market": market})
-    try: return float(data.get("price"))
-    except: return None
+    p = None
+    try:
+        if isinstance(data, dict):
+            p = float(data.get("price"))
+    except Exception:
+        p = None
+
+    if p is None:
+        # بديل خفيف: آخر سعر من 24h لنفس السوق
+        data24 = http_get("/v2/ticker/24h")
+        if data24:
+            it = next((x for x in data24 if x.get("market")==market), None)
+            try:
+                p = float((it or {}).get("last", 0) or 0)
+            except Exception:
+                p = None
+
+        # عداد أخطاء
+        cnt = price_errs.get(market, 0) + 1
+        price_errs[market] = cnt
+        if cnt % 5 == 0:
+            print(f"[PRICE] {market} failed {cnt}x")
+
+    else:
+        price_errs[market] = 0
+
+    return p
 
 def spread_ok(market):
     data = http_get("/v2/ticker/24h")
