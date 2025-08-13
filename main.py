@@ -270,6 +270,10 @@ def compute_5m_change_from_candles(candles):
 
 def discovery_loop():
     global last_discovery_at
+    # إعدادات مرنة للاكتشاف
+    TOP_CANDIDATES   = 120     # بدل 60
+    ALLOW_STRONG_5M  = 0.8     # ٪ خلال 5 دقائق لتجاوز فلتر 24h إذا الزخم قوي
+
     while True:
         t0 = now_ts()
         last_discovery_at = t0
@@ -280,38 +284,38 @@ def discovery_loop():
 
             tick = read_ticker_24h()
             if not tick:
-                time.sleep(5)
-                continue
+                time.sleep(5); continue
 
-            # استثناء رابحين 24h + مدعومين + ليسوا في البلاك-ليست
-            tick = [
-                x for x in tick
-                if x["pct24"] < EXCLUDE_24H_PCT and is_supported_market(x["market"])
-            ]
+            # لا نفلتر %24h هنا؛ فقط اضمن السوق مدعوم وغير محظور
+            tick = [x for x in tick if is_supported_market(x["market"])]
 
             # تقدير سيولة باليورو ~ volume_base * last
             for x in tick:
                 x["eur_volume"] = x["volume"] * (x["last"] or 0.0)
 
-            # أعلى 60 سيولة
+            # خذ أعلى السيولة كبداية واسعة
             tick.sort(key=lambda x: x["eur_volume"], reverse=True)
-            top = tick[:60]
+            candidates = tick[:TOP_CANDIDATES]
 
-            # احسب تغيّر 5m لهؤلاء فقط
+            # احسب r5m لهؤلاء فقط (من شموع 1m)
             five_map = {}
-            for batch in chunks(top, 12):
+            for batch in chunks(candidates, 12):
                 for x in batch:
                     m = x["market"]
                     cnd = read_last_candles_1m(m, limit=10)
-                    ch5 = compute_5m_change_from_candles(cnd)
-                    five_map[m] = ch5
+                    five_map[m] = compute_5m_change_from_candles(cnd)
                 time.sleep(0.35)  # تلطيف الحمل
 
-            sorted_top = sorted(
-                (x for x in top if x["market"] in five_map),
-                key=lambda x: five_map.get(x["market"], 0.0),
-                reverse=True
-            )
+            # فلتر 24h "مرن": اسمح بمرور أي عملة لو r5m قوي حتى لو pct24 مرتفع
+            filtered = []
+            for x in candidates:
+                m  = x["market"]
+                r5 = five_map.get(m, 0.0)
+                if (x["pct24"] < EXCLUDE_24H_PCT) or (r5 >= ALLOW_STRONG_5M):
+                    filtered.append(x)
+
+            # رتّب حسب r5m وخذ الأفضل لغرفتك
+            sorted_top = sorted(filtered, key=lambda x: five_map.get(x["market"], 0.0), reverse=True)
             pick = sorted_top[:max(ROOM_CAP, 20)]
 
             # حدّث الغرفة + مرّر السبريد إلى الحالة
@@ -328,8 +332,7 @@ def discovery_loop():
 
                 # أدخل الجدد وحدّث السبريد
                 for p in pick:
-                    m = p["market"]
-                    sym = p["symbol"]
+                    m = p["market"]; sym = p["symbol"]
                     if m not in room and is_supported_market(m):
                         st = CoinState(sym, m)
                         room[m] = st
@@ -344,7 +347,6 @@ def discovery_loop():
                     scored = []
                     nowt = now_ts()
                     for m, st in room.items():
-                        # مؤشرات قوة لحظية
                         r60  = st.r_change(60) if st.buffer else -999.0
                         r120 = st.r_change(120) if st.buffer else 0.0
                         vz   = st.volz()
@@ -352,17 +354,12 @@ def discovery_loop():
 
                         # وزن أعلى للسرعة + دعم الحجم
                         score = 0.7 * r60 + 0.3 * r120 + 0.5 * vz
-
-                        # تحمية قوية تأخذ بونص بسيط؛ الضعيفة (r60<=0) بلا حماية
                         if st.preheat and r60 > 0:
-                            score += 0.3
-
-                        # عامل وقت بسيط حتى لا تبقى عملة قديمة ماسكة مكان
-                        score -= 0.02 * age_min
+                            score += 0.3          # بونص لتحمية قوية
+                        score -= 0.02 * age_min  # خصم بسيط لعمر طويل بلا تقدم
 
                         scored.append((score, m))
 
-                    # الأقل نقاطًا يُقص أولًا
                     scored.sort()
                     for _, m in scored[:overflow]:
                         room.pop(m, None)
@@ -373,7 +370,6 @@ def discovery_loop():
 
         slept = now_ts() - t0
         time.sleep(max(2.0, DISCOVERY_SEC - slept))
-
 # =========================
 # 📈 تحديث حجم 1m الدوري للغرفة (للـ VolZ)
 # =========================
