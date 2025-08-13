@@ -16,7 +16,7 @@ from flask import Flask, request, jsonify
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
 DISCOVERY_SEC       = int(os.getenv("DISCOVERY_SEC", 120))   # تحديث المرشحين
-ROOM_CAP            = int(os.getenv("ROOM_CAP", 24))         # سعة غرفة العمليات
+ROOM_CAP            = int(os.getenv("ROOM_CAP", 28))         # سعة غرفة العمليات
 TTL_MIN             = int(os.getenv("TTL_MIN", 30))          # مدة بقاء الرمز (دقائق)
 TICK_SEC            = float(os.getenv("TICK_SEC", 3.0))      # دورة المراقبة (ثوانٍ)
 EXCLUDE_24H_PCT     = float(os.getenv("EXCLUDE_24H_PCT", 12.0))  # استثناء رابحين 24h الكبار
