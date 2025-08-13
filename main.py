@@ -1,37 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Final 1s per-market + Smart Fallback)
-- يستقبل CV من A، يزرع price_now في البافر ويجدّد TTL لـ 30 دقيقة
-- مراقبة كل 1s: قراءة سعر **لكل سوق على حدة** (بدون markets=)
-- فالـباك ذكي: 24h ثم close 1m بعد فشلين متتاليين
-- إشعارات حقيقية: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- إرسال لصقر: "اشتري {symbol}"، وتلغرام اختياري
-- /status مختصر وواضح (⭐ للـ TopN)
+Bot B — TopN Watcher (Final RR 1s + Fallback)
 """
 
-import os, time, threading
+import os, time, threading, re
 from collections import deque
 import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات قابلة للتعديل
+# إعدادات
 # =========================
 BITVAVO_URL        = "https://api.bitvavo.com"
 HTTP_TIMEOUT       = 8.0
 
 ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))
 ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))
-TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))       # ثانية
-TTL_MIN            = int(os.getenv("TTL_MIN", 30))           # يُجدَّد عند كل CV
-SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60))     # 0.60%
+
+TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))   # ثانية
+CHUNK_PER_TICK     = int(os.getenv("CHUNK_PER_TICK", 8)) # كم عملة نقرأ بكل نبضة
+
+TTL_MIN            = int(os.getenv("TTL_MIN", 30))       # يُجدَّد عند كل CV
+SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 
 # تأكيد حي + منع مطاردة
 WARMUP_SEC         = int(os.getenv("WARMUP_SEC", 25))
 NUDGE_R20          = float(os.getenv("NUDGE_R20", 0.12))
 NUDGE_R40          = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP        = float(os.getenv("BREAKOUT_BP", 6.0))    # اختراق قمة 60s
+BREAKOUT_BP        = float(os.getenv("BREAKOUT_BP", 6.0))   # اختراق قمة 60s
 DD60_MAX           = float(os.getenv("DD60_MAX", 0.25))
 GLOBAL_ALERT_GAP   = int(os.getenv("GLOBAL_ALERT_GAP", 10))
 CHASE_R5M_MAX      = float(os.getenv("CHASE_R5M_MAX", 2.20))
@@ -46,7 +43,7 @@ SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
 # HTTP + كاش 24h
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/Final-1s-single"})
+session.headers.update({"User-Agent":"TopN-Watcher/Final-RR1s"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
@@ -125,10 +122,14 @@ class Coin:
 # =========================
 room_lock = threading.Lock()
 room = {}  # market -> Coin
+VALID_MKT = re.compile(r"^[A-Z0-9]{1,10}-EUR$")
+
+def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
 
 def ensure_coin(cv):
     """تحديث/إضافة عملة: يزرع السعر فورًا ويجدد TTL ويطبّق WARMUP."""
     m   = cv["market"].upper()
+    if not is_valid_market(m): return
     sym = cv.get("symbol", m.split("-")[0])
     feat= cv.get("feat", {})
     ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN*60)))
@@ -168,7 +169,7 @@ _price_fail = {}          # market -> consecutive fails
 _last_candle_fetch = {}   # market -> ts آخر جلب شموع
 
 def fetch_price(market):
-    """قراءة سعر سوق واحد (dict أو list) + فالـباك 24h ثم شموع 1m بعد فشلين."""
+    """قراءة سعر سوق واحد + فالـباك 24h ثم close 1m بعد فشلين."""
     data = http_get("/v2/ticker/price", params={"market": market})
     p = None
     try:
@@ -198,7 +199,7 @@ def fetch_price(market):
         try:
             it = next((x for x in data24 if x.get("market")==market), None)
             p = float((it or {}).get("last", 0) or 0)
-            if p > 0:
+            if p > 0: 
                 return p
         except Exception:
             pass
@@ -211,7 +212,7 @@ def fetch_price(market):
         try:
             if isinstance(cnd, list) and cnd:
                 p = float(cnd[-1][4])
-                if p > 0:
+                if p > 0: 
                     return p
         except Exception:
             pass
@@ -300,18 +301,29 @@ def decide_and_alert():
             saqar_buy(c.symbol)
 
 # =========================
-# مراقبة 1s (لكل سوق على حدة)
+# مراقبة Round-Robin كل 1s
 # =========================
 def monitor_loop():
+    rr = 0  # مؤشر الدوران على الغرفة
     while True:
         try:
             with room_lock:
-                markets = list(room.keys())
-            if not markets:
-                time.sleep(TICK_SEC); continue
+                markets_all = [m for m in room.keys() if is_valid_market(m)]
+            if not markets_all:
+                time.sleep(TICK_SEC)
+                continue
+
+            # دفعة صغيرة بهالنبضة
+            start = rr
+            end   = min(start + CHUNK_PER_TICK, len(markets_all))
+            batch = markets_all[start:end]
+            if not batch:
+                rr = 0
+                batch = markets_all[:min(CHUNK_PER_TICK, len(markets_all))]
+            rr = (end if end < len(markets_all) else 0)
 
             ts = time.time()
-            for m in markets:
+            for m in batch:
                 p = fetch_price(m)
                 if p is None or p <= 0:
                     with room_lock:
@@ -337,7 +349,7 @@ def monitor_loop():
             if int(time.time()) % 30 == 0:
                 with room_lock:
                     filled = sum(1 for c in room.values() if len(c.buf) >= 2)
-                print(f"[MONITOR] 1s loop — prices ok for {filled}/{len(room)}")
+                print(f"[MONITOR] rr={rr} — updated {len(batch)} / {len(markets_all)} | good {filled}/{len(room)}")
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
