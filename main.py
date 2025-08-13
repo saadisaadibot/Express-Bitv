@@ -1,164 +1,87 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — الحاضنة اليقِظة (Sniper / Decision Engine)
-- يستقبل CV من Bot A عبر /ingest
-- يراقب السعر فقط (ticker/price) على دفعات خفيفة
-- يطبق قواعد (Gradual+Nudge / Fast Burst / Accum) ويرسل إشعار شراء (Webhook/Telegram)
-- بدون Redis. كل شيء بالذاكرة.
-- قصّ ذكي عند امتلاء الغرفة. TTL + Sticky للفُرص الجديدة.
+Bot B — الحاضنة الوحشية (Top N Watcher)
+- يستقبل CV من A (Top 5m)
+- يراقب ويحسب مؤشرات لحظية
+- يرسل إشارات شراء فقط لأول ALERT_TOP_N عملة
+- لا يقصي العملة إلا إذا الغرفة ممتلئة وجاءت عملة أفضل
+- /status يعرض العملات مرتبة مع كامل العدادات
 """
 
 import os, time, math, json, random, threading
-from collections import deque, defaultdict
+from collections import deque
 import requests
 from flask import Flask, request, jsonify
 
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-# Bitvavo
-BITVAVO_URL         = os.getenv("BITVAVO_URL", "https://api.bitvavo.com")
-HTTP_TIMEOUT        = float(os.getenv("HTTP_TIMEOUT", 8.0))
+BITVAVO_URL    = "https://api.bitvavo.com"
+HTTP_TIMEOUT   = 8.0
 
-# غرفة ومراقبة
-ROOM_CAP            = int(os.getenv("ROOM_CAP", 24))          # أقصى عدد رموز تحت المراقبة
-TTL_MIN             = int(os.getenv("TTL_MIN", 30))           # مدة بقاء الرمز (دقائق)
-STICKY_MIN          = int(os.getenv("STICKY_MIN", 5))         # فترة سماح بعد الدخول (دقائق)
-TICK_SEC            = float(os.getenv("TICK_SEC", 2.5))       # دورة المراقبة (ثوانٍ)
-BATCH_SIZE          = int(os.getenv("BATCH_SIZE", 12))        # عدد الأسواق بكل دفعة
+ROOM_CAP       = 24          # أقصى عدد عملات تحت المراقبة
+TTL_MIN        = 30          # مدة بقاء الرمز (دقائق)
+STICKY_MIN     = 5           # فترة سماح بعد الدخول (دقائق)
+TICK_SEC       = 2.5         # دورة المراقبة (ثواني)
+BATCH_SIZE     = 12          # عدد الأسواق بكل دفعة
 
-# تبريد وإشعارات
-ALERT_COOLDOWN_SEC  = int(os.getenv("ALERT_COOLDOWN_SEC", 120))
-SPREAD_MAX_BP       = int(os.getenv("SPREAD_MAX_BP", 30))     # 0.30% كحد أقصى
-COIN_SILENT_SEC     = int(os.getenv("COIN_SILENT_SEC", 5))    # صمت بعد دخول CV
+ALERT_TOP_N    = 3           # يرسل إشعارات فقط لأول N عملة بالأداء
 
-# عتبات القرار (قريبة من إعداداتك المتوازنة)
-TRIG_R40            = float(os.getenv("TRIG_R40", 0.40))      # %
-TRIG_R120           = float(os.getenv("TRIG_R120", 0.80))     # %
-TRIG_VOLZ           = float(os.getenv("TRIG_VOLZ", 1.00))     # من CV (A)
+SPREAD_MAX_BP  = 30          # سبريد أقصى (0.30%)
+ALERT_COOLDOWN_SEC = 120     # كولداون بين الإشعارات لنفس العملة
 
-# قواعد الترند التدريجي (من A) + تكة (من السعر الحيّ)
-GRAD_R600           = float(os.getenv("GRAD_R600", 3.00))     # %
-GRAD_DD300_MAX      = float(os.getenv("GRAD_DD300_MAX", 1.00))# %
-NUDGE_R60           = float(os.getenv("NUDGE_R60", 0.15))     # %
-NUDGE_R40           = float(os.getenv("NUDGE_R40", 0.20))     # %
-
-# Telegram / Webhook (اختياري)
-BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
-CHAT_ID             = os.getenv("CHAT_ID", "")
-SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK", "")           # مثلاً أمر شراء
-
-# تكيّف خفيف لكل عملة (bandit-like)
-TUNE_WIN_SEC        = int(os.getenv("TUNE_WIN_SEC", 120))     # نقيم الإشارة بعد 120s
-TUNE_STEP           = float(os.getenv("TUNE_STEP", 0.05))     # تعديل محلي للحدود ±
-TUNE_MAX_ABS        = float(os.getenv("TUNE_MAX_ABS", 0.20))  # حد أقصى للتعديل التراكمي
+SAQAR_WEBHOOK  = os.getenv("SAQAR_WEBHOOK", "")  # رابط صقر
 
 # =========================
-# 🌐 HTTP Session
+# 🌐 HTTP
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"Warden-Sniper/1.0"})
+session.headers.update({"User-Agent":"TopN-Watcher/1.0"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
 def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
-    url = f"{base}{path}"
     try:
-        r = session.get(url, params=params, timeout=timeout)
-        if r.status_code == 429:
-            time.sleep(0.6 + random.random()*0.6)
+        r = session.get(f"{base}{path}", params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"[HTTP] GET {path} failed: {e}")
+        print(f"[HTTP] GET {path} failed:", e)
         return None
 
-# =========================
-# 🧰 أدوات
-# =========================
-def pct(a, b):
-    if b is None or b == 0: return 0.0
-    return (a - b) / b * 100.0
-
-def now(): return time.time()
-
-# =========================
-# 🔔 إشعارات
-# =========================
-def tg_send(text):
-    if not BOT_TOKEN or not CHAT_ID: return
+def saqar_buy(symbol):
+    if not SAQAR_WEBHOOK: 
+        return
+    payload = {"text": f"اشتري {symbol.upper()}"}
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        session.post(url, json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=8)
-    except Exception as e:
-        print("[TG] send failed:", e)
-
-def notify_buy(market, reason):
-    msg = f"🚀 BUY {market}  | {reason}"
-    print("[ALERT]", msg)
-    tg_send(msg)
-
-    url = (SAQAR_WEBHOOK or "").strip()
-    if not url:
-        return  # ما في Webhook محدد
-
-    payload = {"text": f"اشتري {market}", "reason": reason}
-
-    try:
-        # المحاولة 1: JSON (application/json)
-        r = session.post(url, json=payload, timeout=8)
-        if r.status_code >= 200 and r.status_code < 300:
-            print(f"[SAQAR] OK {r.status_code}")
-            return
+        r = session.post(SAQAR_WEBHOOK, json=payload, timeout=8)
+        if 200 <= r.status_code < 300:
+            print(f"[SAQAR] ✅ Sent buy {symbol.upper()}")
         else:
-            print(f"[SAQAR] JSON failed {r.status_code}: {r.text[:200]}")
+            print(f"[SAQAR] ❌ Failed {r.status_code}")
     except Exception as e:
-        print("[SAQAR] JSON error:", e)
-
-    try:
-        # المحاولة 2: form-encoded (بعض السيرفرات تتوقعها)
-        r = session.post(url, data=payload, timeout=8)
-        if r.status_code >= 200 and r.status_code < 300:
-            print(f"[SAQAR] OK(form) {r.status_code}")
-        else:
-            print(f"[SAQAR] form failed {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print("[SAQAR] form error:", e)
+        print("[SAQAR] error:", e)
 
 # =========================
-# 🧠 حالة الرمز
+# 🧠 كائن العملة
 # =========================
 class Coin:
     __slots__ = (
-        "market","symbol",
-        "entered_at","expires_at","sticky_until",
-        "last_alert_at","last_cv_at","silent_until",
-        "cv","tags",
-        "buf","last_price",
-        "tune_bias","outcomes","pending_eval"
+        "market","symbol","entered_at","expires_at","sticky_until",
+        "last_alert_at","cv","buf","last_price"
     )
-    def __init__(self, market, symbol):
+    def __init__(self, market, symbol, ttl_sec):
+        nowt = time.time()
         self.market = market
         self.symbol = symbol
-        t = now()
-        self.entered_at = t
-        self.expires_at = t + TTL_MIN*60
-        self.sticky_until = t + STICKY_MIN*60
+        self.entered_at = nowt
+        self.expires_at = nowt + ttl_sec
+        self.sticky_until = nowt + STICKY_MIN*60
         self.last_alert_at = 0
-        self.last_cv_at = 0
-        self.silent_until = t + COIN_SILENT_SEC
-        self.cv = {}         # آخر CV من A
-        self.tags = []
-        self.buf = deque(maxlen=int(max(600, 900/TICK_SEC)))  # ~10-15 دقيقة
+        self.cv = {}
+        self.buf = deque(maxlen=int(max(600, 900/TICK_SEC)))
         self.last_price = None
-        self.tune_bias = 0.0  # ± تعديل محلي على حدود r40/r120
-        self.outcomes = deque(maxlen=8)  # سجل نجاح/فشل
-        self.pending_eval = [] # [(t_alert, price_at_alert)]
 
-    def renew(self, ttl_sec):
-        self.expires_at = max(self.expires_at, now() + ttl_sec)
-
-    # تغيّر خلال آخر N ثوانٍ من buffer
     def r_change(self, seconds):
         if len(self.buf) < 2: return 0.0
         t_now, p_now = self.buf[-1]
@@ -168,224 +91,108 @@ class Coin:
             if t <= t_target:
                 base = p; break
         if base is None: base = self.buf[0][1]
-        return pct(p_now, base)
+        return (p_now - base) / base * 100.0
 
 # =========================
-# 🗃️ غرفة وإدارة
+# 🗃️ الغرفة
 # =========================
 room_lock = threading.Lock()
-room = {}   # market -> Coin
+room = {}  # market -> Coin
 
 def ensure_coin(cv):
-    m   = cv["market"]
+    m = cv["market"]
     sym = cv.get("symbol", m.split("-")[0])
-    nowt = now()
     ttl_sec = int(cv.get("ttl_sec", TTL_MIN*60))
-
     with room_lock:
-        c = room.get(m)
-        if not c:
-            # إدخال أول مرة: اضبط المؤقّتات فقط هنا
-            c = Coin(m, sym)
-            c.expires_at   = nowt + ttl_sec
-            c.silent_until = nowt + COIN_SILENT_SEC
-            room[m] = c
-
-        # تحديث معلومات فقط (بدون لمس المؤقّتات)
-        c.cv    = cv["feat"]
-        c.tags  = cv.get("tags", [])
-        c.last_cv_at = nowt
-
-        # لا نجدد TTL ولا نعيد silent على CVات لاحقة
-        # (لو بدك تنعّش TTL عند الاقتراب من الانتهاء، فعّل السطرين التاليين بدلاً من ذلك)
-        # if c.expires_at - nowt < 0.4 * ttl_sec:
-        #     c.expires_at = nowt + ttl_sec
-
-        # قص زائد كما هو
-        overflow = len(room) - ROOM_CAP
-        if overflow > 0:
-            scored = []
-            tnow = now()
-            for mk, st in room.items():
-                r60  = st.r_change(60)
-                r120 = st.r_change(120)
-                vz   = float(st.cv.get("volZ", 0.0)) if st.cv else 0.0
-                age_min = (tnow - st.entered_at)/60.0
-                score = 0.7*r60 + 0.3*r120 + 0.5*vz
-                if tnow < st.sticky_until: score += 5.0
-                score -= 0.02*age_min
-                scored.append((score, mk))
-            scored.sort()
-            for _, mk in scored[:overflow]:
-                room.pop(mk, None)
+        if m in room:
+            # تحديث بيانات CV بدون تصفير البافر
+            room[m].cv.update(cv.get("feat", {}))
+            return
+        # إذا الغرفة ممتلئة → أقصِ أضعف إذا CV الجديد أقوى
+        if len(room) >= ROOM_CAP:
+            weakest = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
+            if cv["feat"].get("r5m", 0.0) > weakest[1].cv.get("r5m", 0.0):
+                room.pop(weakest[0], None)
+            else:
+                return
+        # إضافة عملة جديدة
+        c = Coin(m, sym, ttl_sec)
+        c.cv.update(cv.get("feat", {}))
+        room[m] = c
 
 # =========================
-# 📈 جلب السعر الحيّ
+# 📈 الأسعار
 # =========================
 def fetch_price(market):
     data = http_get("/v2/ticker/price", params={"market": market})
-    if not data: return None
     try:
-        return float(data.get("price") or 0.0)
-    except: return None
-
-# =========================
-# 🧠 قواعد القرار
-# =========================
-def decide(market, c: Coin, ts, price):
-    # حماية عامة
-    if ts < c.silent_until: return None
-    if (ts - c.last_alert_at) < ALERT_COOLDOWN_SEC: return None
-
-    # مؤشرات لحظية من الـbuffer
-    r20  = c.r_change(20)
-    r40  = c.r_change(40)
-    r60  = c.r_change(60)
-    r120 = c.r_change(120)
-
-    # ميزات من CV (A)
-    cv = c.cv or {}
-    r300  = float(cv.get("r300", 0.0))
-    r600  = float(cv.get("r600", 0.0))
-    dd300 = float(cv.get("dd300", 9e9))
-    volZ  = float(cv.get("volZ", 0.0))
-    spread_bp = float(cv.get("spread_bp", 999))
-    pct24 = float(cv.get("pct24", 0.0))
-    liq_rank = int(cv.get("eur_liq_rank", 9999))
-
-    # سبريد حماية
-    if spread_bp > SPREAD_MAX_BP:
+        return float(data.get("price"))
+    except:
         return None
 
-    # تكيّف محلي بسيط
-    bias = max(-TUNE_MAX_ABS, min(TUNE_MAX_ABS, c.tune_bias))
-    R40 = TRIG_R40 + bias
-    R120= TRIG_R120 + bias
-
-    reasons = []
-
-    # 1) Gradual + Nudge
-    if (r600 >= GRAD_R600 and dd300 <= GRAD_DD300_MAX):
-        if (r60 >= NUDGE_R60) or (r40 >= NUDGE_R40):
-            if (volZ >= 0.9) or (liq_rank <= 60):
-                reasons.append(f"Gradual+Nudge r600={r600:.2f}% dd300={dd300:.2f}% r60={r60:.2f}% volZ={volZ:.2f}")
-
-    # 2) Fast Burst
-    if (r40 >= R40 and r120 >= R120) and ((volZ >= TRIG_VOLZ) or (r40 >= R40 + 0.10)):
-        reasons.append(f"FastBurst r40={r40:.2f}% r120={r120:.2f}% volZ={volZ:.2f}")
-
-    # 3) Accumulation
-    if (r120 >= R120 and r20 >= 0.20 and volZ >= 1.0):
-        reasons.append(f"Accum r120={r120:.2f}% r20={r20:.2f}% volZ={volZ:.2f}")
-
-    if not reasons:
-        return None
-
-    reason = reasons[0]  # أول مايُحقق شرط
-    # سجّل تنبيه + جدولة تقييم النتيجة بعد TUNE_WIN_SEC
-    c.last_alert_at = ts
-    c.pending_eval.append((ts, price))
-    return reason
+# =========================
+# 🔔 القرار
+# =========================
+def decide_and_alert():
+    nowt = time.time()
+    with room_lock:
+        # ترتيب العملات حسب r5m (من CV)
+        sorted_room = sorted(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0), reverse=True)
+        for rank, (m, c) in enumerate(sorted_room, start=1):
+            if rank > ALERT_TOP_N:
+                continue
+            if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
+                continue
+            c.last_alert_at = nowt
+            saqar_buy(c.symbol)
 
 # =========================
-# 🧪 تقييم الإشارات (تكيّف محلي)
+# 🩺 المراقبة
 # =========================
-def eval_loop():
-    while True:
-        try:
-            nowt = now()
-            with room_lock:
-                items = list(room.items())
-            for m, c in items:
-                # قيّم كل إشعار مرّ عليه TUNE_WIN_SEC
-                keep = []
-                for (t_alert, p0) in c.pending_eval:
-                    if nowt - t_alert < TUNE_WIN_SEC:
-                        keep.append((t_alert, p0)); continue
-                    # احصل على آخر سعر
-                    p_now = c.last_price if c.last_price else p0
-                    ret = pct(p_now, p0)
-                    ok = (ret >= 0.40)  # نجح إذا +0.4% خلال 120s
-                    c.outcomes.append(1 if ok else 0)
-                    # عدّل bias
-                    if ok and c.tune_bias > -TUNE_MAX_ABS:
-                        c.tune_bias = max(-TUNE_MAX_ABS, c.tune_bias - TUNE_STEP)
-                    elif (not ok) and c.tune_bias < TUNE_MAX_ABS:
-                        c.tune_bias = min(TUNE_MAX_ABS, c.tune_bias + TUNE_STEP)
-                c.pending_eval = keep
-        except Exception as e:
-            print("[EVAL] error:", e)
-        time.sleep(5)
-
-# =========================
-# 🩺 حلقة المراقبة
-# =========================
-backoff = False
 def monitor_loop():
-    global backoff
     rr = 0
     while True:
-        t0 = now()
         try:
             with room_lock:
                 markets = list(room.keys())
             if not markets:
                 time.sleep(TICK_SEC); continue
-
-            batch = markets[rr:rr+BATCH_SIZE]
-            if not batch:
-                rr = 0
-                batch = markets[:BATCH_SIZE]
-            rr += BATCH_SIZE
-
-            errors = 0
+            batch = markets[rr:rr+BATCH_SIZE] or markets[:BATCH_SIZE]
+            rr = (rr + BATCH_SIZE) % len(markets)
             for m in batch:
                 p = fetch_price(m)
-                if p is None:
-                    errors += 1; continue
-                ts = now()
+                if p is None: continue
+                ts = time.time()
                 with room_lock:
                     c = room.get(m)
                     if not c: continue
                     c.last_price = p
                     c.buf.append((ts, p))
-                    # انتهاء TTL
-                    if ts >= c.expires_at:
-                        room.pop(m, None)
-                        continue
-                    # قرار
-                    reason = decide(m, c, ts, p)
-                    if reason:
-                        notify_buy(m, reason)
-
-            backoff = (errors >= max(3, len(batch)//3))
+            decide_and_alert()
         except Exception as e:
             print("[MONITOR] error:", e)
-            backoff = True
+        time.sleep(TICK_SEC)
 
-        base = TICK_SEC if not backoff else max(TICK_SEC, 5.0)
-        time.sleep(max(0.2, base + random.uniform(0.05, 0.25) - (now() - t0)))
-
+# =========================
+# 📊 الحالة
+# =========================
 def build_status_text():
     with room_lock:
-        n = len(room)
+        sorted_room = sorted(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0), reverse=True)
         rows = []
-        nowt = now()
-        for m, c in room.items():
-            r20  = c.r_change(20)
-            r60  = c.r_change(60)
+        for rank, (m, c) in enumerate(sorted_room, start=1):
+            r20 = c.r_change(20)
+            r60 = c.r_change(60)
             r120 = c.r_change(120)
-            vz   = float((c.cv or {}).get("volZ", 0.0))
-            ttl  = max(0, int(c.expires_at - nowt))
-            rows.append(f"• {m:<12} r20={r20:+.2f}% r60={r60:+.2f}% r120={r120:+.2f}% "
-                        f"VolZ={vz:+.2f} TTL={ttl}s bias={c.tune_bias:+.2f}")
-    hdr  = f"📊 Status — Room: {n}/{ROOM_CAP} | Backoff: {'ON' if backoff else 'OFF'}"
-    rules= (f"\n🔍 Gradual+Nudge: r600≥{GRAD_R600:.2f}%, dd300≤{GRAD_DD300_MAX:.2f}% + "
-            f"(r60≥{NUDGE_R60:.2f}% or r40≥{NUDGE_R40:.2f}%) & VolZ≥0.9 or Rank≤60"
-            f"\n⚡ FastBurst: r40≥{TRIG_R40:.2f}% & r120≥{TRIG_R120:.2f}% & (VolZ≥{TRIG_VOLZ:.2f} or r40≥{TRIG_R40+0.10:.2f}%)"
-            f"\n📈 Accum: r120≥{TRIG_R120:.2f}% & r20≥0.20% & VolZ≥1.0"
-            f"\n🛡️ Spread≤{SPREAD_MAX_BP/100:.2f}%, Cooldown={ALERT_COOLDOWN_SEC}s, Sticky={STICKY_MIN}m")
-    return hdr + "\n" + rules + "\n\n" + "\n".join(rows)
+            r5m = c.cv.get("r5m", 0.0)
+            r10m = c.cv.get("r10m", 0.0)
+            volZ = c.cv.get("volZ", 0.0)
+            ttl  = int(c.expires_at - time.time())
+            rows.append(f"{rank:02d}. {m:<10} r5m={r5m:+.2f}% r10m={r10m:+.2f}% "
+                        f"r20={r20:+.2f}% r60={r60:+.2f}% r120={r120:+.2f}% "
+                        f"volZ={volZ:+.2f} TTL={ttl}s")
+    hdr = f"📊 Room: {len(room)}/{ROOM_CAP} | AlertTopN={ALERT_TOP_N}"
+    return hdr + "\n" + "\n".join(rows)
 
 # =========================
 # 🌐 Flask API
@@ -394,65 +201,25 @@ app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "Warden Sniper B is alive ✅"
+    return "TopN Watcher B is alive ✅"
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
-    """
-    يستقبل CV من Bot A:
-    {
-      "market":"XYZ-EUR",
-      "symbol":"XYZ",
-      "ts": 1723...,
-      "feat": { r300,r600,r1800,dd300,volZ,spread_bp,pct24,eur_liq_rank },
-      "tags":[...],
-      "ttl_sec": 1800
-    }
-    """
-    try:
-        cv = request.get_json(force=True, silent=True) or {}
-        market = cv.get("market","")
-        feat = cv.get("feat",{})
-        if not market or not feat:
-            return jsonify(ok=False, err="bad payload"), 400
-        ensure_coin(cv)
-        return jsonify(ok=True)
-    except Exception as e:
-        print("[INGEST] err:", e)
-        return jsonify(ok=False), 200
+    cv = request.get_json(force=True, silent=True) or {}
+    if not cv.get("market") or not cv.get("feat"):
+        return jsonify(ok=False, err="bad payload"), 400
+    ensure_coin(cv)
+    return jsonify(ok=True)
 
 @app.route("/status")
 def status():
-    text = build_status_text()
-    return text, 200, {"Content-Type":"text/plain; charset=utf-8"}
-
-@app.route("/webhook", methods=["POST"])
-def tg_webhook():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        msg  = data.get("message", {}) or data.get("edited_message", {})
-        txt  = (msg.get("text") or "").strip().lower()
-        chat = msg.get("chat", {}).get("id")
-        if not txt or not chat:
-            return jsonify(ok=True)
-        if txt in ("status", "/status", "الحالة", "/الحالة"):
-            text = build_status_text()
-            # أرسل للـ chat اللي طلب
-            if BOT_TOKEN:
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-                session.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=8)
-            return jsonify(ok=True)
-        return jsonify(ok=True)
-    except Exception as e:
-        print("[WEBHOOK] err:", e)
-        return jsonify(ok=True)
+    return build_status_text(), 200, {"Content-Type":"text/plain; charset=utf-8"}
 
 # =========================
 # ▶️ التشغيل
 # =========================
 def start_threads():
     threading.Thread(target=monitor_loop, daemon=True).start()
-    threading.Thread(target=eval_loop, daemon=True).start()
 
 start_threads()
 
