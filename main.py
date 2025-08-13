@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (1s Bulk, Final)
-- ينسخ CV من A ويجدّد TTL لـ30 دقيقة عند كل CV
-- يزرع price_now في البافر فور الاستلام
-- حلقة مراقبة كل 1s: جلب جماعي لأسعار كل الغرفة
-- Fallback ذكي: 24h ثم شموع 1m بعد فشلين متتاليين
-- إشعارات حقيقية فقط: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- /status واضح مع ⭐ للـ TopN
-- إرسال لصقر: "اشتري {symbol}"
+Bot B — TopN Watcher (Final 1s Bulk + Smart Fallback)
+- يستقبل CV من A، يزرع price_now في البافر ويجدّد TTL لـ 30 دقيقة كل مرة
+- حلقة مراقبة كل 1s: جلب جماعي لأسعار كل الغرفة (بدُفعات) بدون ترميز للفواصل
+- فالـباك ذكي: 24h ثم close من شموع 1m بعد فشلين متتاليين
+- إطلاق إشعارات حقيقية فقط: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+- إرسال لصقر: "اشتري {symbol}"، وتلغرام اختياري
+- /status مختصر وواضح (⭐ للـ TopN)
 """
 
 import os, time, threading
@@ -16,7 +15,7 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات
+# إعدادات قابلة للتعديل
 # =========================
 BITVAVO_URL        = "https://api.bitvavo.com"
 HTTP_TIMEOUT       = 8.0
@@ -38,7 +37,7 @@ GLOBAL_ALERT_GAP   = int(os.getenv("GLOBAL_ALERT_GAP", 10))
 CHASE_R5M_MAX      = float(os.getenv("CHASE_R5M_MAX", 2.20))
 CHASE_R20_MIN      = float(os.getenv("CHASE_R20_MIN", 0.05))
 
-# Telegram + Saqar
+# Telegram + Saqar (اختياري)
 BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
 CHAT_ID            = os.getenv("CHAT_ID", "")
 SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
@@ -58,6 +57,16 @@ def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
         return r.json()
     except Exception as e:
         print(f"[HTTP] GET {path} failed:", e)
+        return None
+
+def http_get_full(url, timeout=HTTP_TIMEOUT):
+    """GET باستخدام URL كامل دون params حتى لا تُشفّر الفواصل ',' إلى %2C."""
+    try:
+        r = session.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("[HTTP FULL] GET failed:", e)
         return None
 
 _tick24_cache = {"ts": 0.0, "data": None}
@@ -163,65 +172,91 @@ def ensure_coin(cv):
         room[m] = c
 
 # =========================
-# أسعار جماعية + Fallback
+# أسعار جماعية + فالـباك
 # =========================
 _price_fail = {}          # market -> consecutive fails
 _last_candle_fetch = {}   # market -> ts آخر جلب شموع
 
-def fetch_prices_bulk_all(markets):
-    """يسحب أسعار كل الأسواق دفعة واحدة، ويكمل الناقص بـ 24h ثم close 1m بعد فشلين متتابعين."""
-    if not markets: return {}
-    joined = ",".join(markets)
-    data = http_get("/v2/ticker/price", params={"markets": joined})
-
-    out = {}
+def fetch_price(market):
+    """قراءة سعر سوق واحد (dict أو list) + فالـباك 24h ثم شموع 1m بعد فشلين."""
+    data = http_get("/v2/ticker/price", params={"market": market})
+    p = None
     try:
-        if isinstance(data, list):
-            for row in data:
-                m = row.get("market"); pr = row.get("price")
-                if m and pr is not None:
-                    out[m] = float(pr)
-        elif isinstance(data, dict):  # أحيانًا عنصر واحد
-            m = data.get("market"); pr = data.get("price")
-            if m and pr is not None:
-                out[m] = float(pr)
+        if isinstance(data, dict):
+            p = float(data.get("price"))
+        elif isinstance(data, list) and data:
+            if len(data) == 1:
+                p = float((data[0] or {}).get("price"))
+            else:
+                row = next((x for x in data if x.get("market") == market), None)
+                if row: p = float(row.get("price"))
     except Exception:
-        pass
+        p = None
 
-    # أسواق ناقصة من الرد اللحظي
-    missing = [m for m in markets if m not in out]
+    if p is not None and p > 0:
+        _price_fail[market] = 0
+        return p
 
-    # 24h من الكاش (سريع)
-    if missing:
-        data24 = get_24h_cached(max_age_sec=1.0)
-        for m in list(missing):
-            try:
-                it = next((x for x in data24 or [] if x.get("market")==m), None)
-                if it and it.get("last"):
-                    out[m] = float(it["last"])
-                    missing.remove(m)
-            except Exception:
-                pass
+    # فشل — زد العداد
+    _price_fail[market] = _price_fail.get(market, 0) + 1
+    if _price_fail[market] < 2:
+        return None
 
-    # آخر خيار: شموع 1m (بعد فشلين متتالين ولكل عملة كل 10s)
-    now = time.time()
-    for m in missing:
-        _price_fail[m] = _price_fail.get(m, 0) + 1
-        if _price_fail[m] < 2:
-            continue
-        if now - _last_candle_fetch.get(m, 0) < 10:
-            continue
-        cnd = http_get(f"/v2/{m}/candles", params={"interval": "1m", "limit": 1})
-        _last_candle_fetch[m] = now
+    # Fallback 1: 24h last من الكاش
+    data24 = get_24h_cached(max_age_sec=1.0)
+    if data24:
         try:
-            if isinstance(cnd, list) and cnd:
-                out[m] = float(cnd[-1][4])  # close
+            it = next((x for x in data24 if x.get("market")==market), None)
+            p = float((it or {}).get("last", 0) or 0)
+            if p > 0: 
+                return p
         except Exception:
             pass
 
-    # صفّر عدادات الفشل لمن نجح
-    for m in out.keys():
-        _price_fail[m] = 0
+    # Fallback 2: close من شموع 1m (مرّة كل 10s لنفس السوق)
+    now = time.time()
+    if now - _last_candle_fetch.get(market, 0) >= 10:
+        cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
+        _last_candle_fetch[market] = now
+        try:
+            if isinstance(cnd, list) and cnd:
+                p = float(cnd[-1][4])
+                if p > 0: 
+                    return p
+        except Exception:
+            pass
+
+    return None
+
+def fetch_prices_batched(markets, batch_size=8):
+    """جلب أسعار بدُفعات عبر markets=A,B,... دون ترميز للفواصل، مع فالـباك لمن ينقص."""
+    markets = [m.upper() for m in markets]
+    out = {}
+
+    for i in range(0, len(markets), batch_size):
+        chunk = markets[i:i+batch_size]
+        url = f"{BITVAVO_URL}/v2/ticker/price?markets=" + ",".join(chunk)
+        data = http_get_full(url)
+
+        try:
+            if isinstance(data, list):
+                for row in data:
+                    m = row.get("market"); pr = row.get("price")
+                    if m and pr is not None:
+                        out[m] = float(pr)
+            elif isinstance(data, dict):  # عنصر واحد
+                m = data.get("market"); pr = data.get("price")
+                if m and pr is not None:
+                    out[m] = float(pr)
+        except Exception:
+            pass
+
+    # أكمل المفقودين بفالـباك
+    missing = [m for m in markets if m not in out]
+    for m in missing:
+        p = fetch_price(m)
+        if p is not None and p > 0:
+            out[m] = p
 
     return out
 
@@ -307,7 +342,7 @@ def decide_and_alert():
             saqar_buy(c.symbol)
 
 # =========================
-# مراقبة 1s (سحب جماعي)
+# مراقبة 1s (سحب بدُفعات)
 # =========================
 def monitor_loop():
     while True:
@@ -317,7 +352,7 @@ def monitor_loop():
             if not markets:
                 time.sleep(TICK_SEC); continue
 
-            prices_map = fetch_prices_bulk_all(markets)
+            prices_map = fetch_prices_batched(markets, batch_size=8)
             ts = time.time()
 
             with room_lock:
@@ -326,7 +361,7 @@ def monitor_loop():
                     if not c: continue
                     p = prices_map.get(m)
                     if p is None or p <= 0:
-                        c.price_fail += 1
+                        c.price_fail = getattr(c, "price_fail", 0) + 1
                         if c.price_fail % 5 == 0:
                             print(f"[PRICE] {m} failed {c.price_fail}x")
                         continue
@@ -338,6 +373,7 @@ def monitor_loop():
 
             decide_and_alert()
 
+            # لوج طمأنة
             if int(time.time()) % 30 == 0:
                 with room_lock:
                     filled = sum(1 for c in room.values() if len(c.buf) >= 2)
