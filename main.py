@@ -332,6 +332,27 @@ def monitor_loop():
         base = TICK_SEC if not backoff else max(TICK_SEC, 5.0)
         time.sleep(max(0.2, base + random.uniform(0.05, 0.25) - (now() - t0)))
 
+def build_status_text():
+    with room_lock:
+        n = len(room)
+        rows = []
+        nowt = now()
+        for m, c in room.items():
+            r20  = c.r_change(20)
+            r60  = c.r_change(60)
+            r120 = c.r_change(120)
+            vz   = float((c.cv or {}).get("volZ", 0.0))
+            ttl  = max(0, int(c.expires_at - nowt))
+            rows.append(f"• {m:<12} r20={r20:+.2f}% r60={r60:+.2f}% r120={r120:+.2f}% "
+                        f"VolZ={vz:+.2f} TTL={ttl}s bias={c.tune_bias:+.2f}")
+    hdr  = f"📊 Status — Room: {n}/{ROOM_CAP} | Backoff: {'ON' if backoff else 'OFF'}"
+    rules= (f"\n🔍 Gradual+Nudge: r600≥{GRAD_R600:.2f}%, dd300≤{GRAD_DD300_MAX:.2f}% + "
+            f"(r60≥{NUDGE_R60:.2f}% or r40≥{NUDGE_R40:.2f}%) & VolZ≥0.9 or Rank≤60"
+            f"\n⚡ FastBurst: r40≥{TRIG_R40:.2f}% & r120≥{TRIG_R120:.2f}% & (VolZ≥{TRIG_VOLZ:.2f} or r40≥{TRIG_R40+0.10:.2f}%)"
+            f"\n📈 Accum: r120≥{TRIG_R120:.2f}% & r20≥0.20% & VolZ≥1.0"
+            f"\n🛡️ Spread≤{SPREAD_MAX_BP/100:.2f}%, Cooldown={ALERT_COOLDOWN_SEC}s, Sticky={STICKY_MIN}m")
+    return hdr + "\n" + rules + "\n\n" + "\n".join(rows)
+
 # =========================
 # 🌐 Flask API
 # =========================
@@ -368,23 +389,29 @@ def ingest():
 
 @app.route("/status")
 def status():
-    with room_lock:
-        n = len(room)
-        rows = []
-        for m, c in room.items():
-            r60 = c.r_change(60)
-            r120= c.r_change(120)
-            vz  = float((c.cv or {}).get("volZ", 0.0))
-            ttl = max(0, int(c.expires_at - now()))
-            rows.append(f"• {m:<12} r60={r60:+.2f}% r120={r120:+.2f}% VolZ={vz:+.2f} TTL={ttl}s bias={c.tune_bias:+.2f}")
-    hdr  = f"📊 Status — Room: {n}/{ROOM_CAP} | Backoff: {'ON' if backoff else 'OFF'}"
-    rules= (f"\n🔍 Gradual+Nudge: r600≥{GRAD_R600:.2f}%, dd300≤{GRAD_DD300_MAX:.2f}% + "
-            f"(r60≥{NUDGE_R60:.2f}% or r40≥{NUDGE_R40:.2f}%) & VolZ≥0.9 or Rank≤60"
-            f"\n⚡ FastBurst: r40≥{TRIG_R40:.2f}% & r120≥{TRIG_R120:.2f}% & (VolZ≥{TRIG_VOLZ:.2f} or r40≥{TRIG_R40+0.10:.2f}%)"
-            f"\n📈 Accum: r120≥{TRIG_R120:.2f}% & r20≥0.20% & VolZ≥1.0"
-            f"\n🛡️ Spread≤{SPREAD_MAX_BP/100:.2f}%, Cooldown={ALERT_COOLDOWN_SEC}s, Sticky={STICKY_MIN}m"
-            f"\n🎯 Tune: step={TUNE_STEP:+.2f}, window={TUNE_WIN_SEC}s, max|bias|={TUNE_MAX_ABS:.2f}")
-    return (hdr + "\n" + rules + "\n\n" + "\n".join(rows)), 200, {"Content-Type":"text/plain; charset=utf-8"}
+    text = build_status_text()
+    return text, 200, {"Content-Type":"text/plain; charset=utf-8"}
+
+@app.route("/webhook", methods=["POST"])
+def tg_webhook():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        msg  = data.get("message", {}) or data.get("edited_message", {})
+        txt  = (msg.get("text") or "").strip().lower()
+        chat = msg.get("chat", {}).get("id")
+        if not txt or not chat:
+            return jsonify(ok=True)
+        if txt in ("status", "/status", "الحالة", "/الحالة"):
+            text = build_status_text()
+            # أرسل للـ chat اللي طلب
+            if BOT_TOKEN:
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                session.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=8)
+            return jsonify(ok=True)
+        return jsonify(ok=True)
+    except Exception as e:
+        print("[WEBHOOK] err:", e)
+        return jsonify(ok=True)
 
 # =========================
 # ▶️ التشغيل
