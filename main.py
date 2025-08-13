@@ -97,11 +97,11 @@ def notify_buy(market, reason):
     msg = f"🚀 BUY {market}  | {reason}"
     print("[ALERT]", msg)
     tg_send(msg)
-    if SAQR_WEBHOOK:
+    if SAQAR_WEBHOOK:
         try:
-            session.post(SAQR_WEBHOOK, json={"text": f"اشتري {market}", "reason": reason}, timeout=6)
+            session.post(SAQAR_WEBHOOK, json={"text": f"اشتري {market}", "reason": reason}, timeout=6)
         except Exception as e:
-            print("[SAQR] post failed:", e)
+            print("[SAQAR] post failed:", e)
 
 # =========================
 # 🧠 حالة الرمز
