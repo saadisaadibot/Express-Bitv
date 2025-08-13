@@ -167,24 +167,33 @@ def ensure_coin(cv):
 # =========================
 def fetch_price(market):
     data = http_get("/v2/ticker/price", params={"market": market})
+
     p = None
     try:
+        # dict {market, price}
         if isinstance(data, dict):
             p = float(data.get("price"))
+        # list [{market, price}, ...]
+        elif isinstance(data, list) and data:
+            if len(data) == 1:
+                p = float((data[0] or {}).get("price"))
+            else:
+                row = next((x for x in data if x.get("market") == market), None)
+                if row: p = float(row.get("price"))
     except Exception:
         p = None
 
-    if p is None:
-        # بديل: آخر سعر من 24h (من الكاش)
+    # fallback: last من 24h (من الكاش)
+    if p is None or p <= 0:
         data24 = get_24h_cached()
         if data24:
-            it = next((x for x in data24 if x.get("market")==market), None)
             try:
+                it = next((x for x in data24 if x.get("market")==market), None)
                 p = float((it or {}).get("last", 0) or 0)
             except Exception:
                 p = None
-    return p
 
+    return p
 def spread_ok(market):
     data = get_24h_cached()
     if not data: return True
