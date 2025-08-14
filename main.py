@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Bot B — TopN Watcher (Stable Entry Baseline + Calm Fetch)
-- جلب أسعار سوق-بسوق بهدوء (Retries + Fallback 24h ثم 1m close)
-- entry_price ثابت لكل عملة (من أول سعر فعلي) — لا يُصفَّر مع CV لاحق
-- قرار منفصل عن الجلب (خيطين): Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- يجدد TTL عند كل CV من A
+- entry_price ثابت لكل عملة (ينضبط عند أول سعر فعلي فقط)
+- جلب سعر سوق-بسوق باستمرار (Retries + Fallback 24h ثم 1m close)
+- قرار منفصل: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+- يجدد TTL عند كل CV من A (لا يصفّر baseline)
 - إشعار صقر: "اشتري {symbol}"
-- /status يبيّن r20/r60/r120 + SinceIn% بوضوح
+- /status يعرض r20/r60/r120 + SinceIn% + BufN
+- /diag للتشخيص السريع لحجم البافر وآخر عيّنة
 """
 
 import os, time, threading, re
@@ -15,40 +16,40 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات قابلة للتعديل
+# إعدادات قابلة للتعديل (يمكن من env)
 # =========================
-BITVAVO_URL        = "https://api.bitvavo.com"
-HTTP_TIMEOUT       = 8.0
+BITVAVO_URL         = "https://api.bitvavo.com"
+HTTP_TIMEOUT        = 8.0
 
-ROOM_CAP           = int(os.getenv("ROOM_CAP", 24))
-ALERT_TOP_N        = int(os.getenv("ALERT_TOP_N", 3))
+ROOM_CAP            = int(os.getenv("ROOM_CAP", 24))
+ALERT_TOP_N         = int(os.getenv("ALERT_TOP_N", 3))
 
-# قرار فقط
-TICK_SEC           = float(os.getenv("TICK_SEC", 1.0))
+# القرار فقط
+TICK_SEC            = float(os.getenv("TICK_SEC", 1.0))
 
-# جلب أسعار سوق-بسوق (مثل القديم)
-SCAN_INTERVAL_SEC   = float(os.getenv("SCAN_INTERVAL_SEC", 5.0))    # دورة كاملة على الغرفة
-PER_REQUEST_GAP_SEC = float(os.getenv("PER_REQUEST_GAP_SEC", 0.12)) # نوم بين كل سوق
-PRICE_RETRIES       = int(os.getenv("PRICE_RETRIES", 2))            # محاولات إعادة
+# الجالب (هادئ)
+SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 3.0))   # دورة كاملة على الغرفة
+PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.07))# نوم بين كل سوق
+PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 2))           # محاولات إعادة
 
-TTL_MIN            = int(os.getenv("TTL_MIN", 30))       # يُجدَّد عند كل CV
-SPREAD_MAX_BP      = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
+TTL_MIN             = int(os.getenv("TTL_MIN", 30))       # يُجدد عند كل CV
+SPREAD_MAX_BP       = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
+ALERT_COOLDOWN_SEC  = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 
 # تأكيد حي + منع مطاردة
-WARMUP_SEC         = int(os.getenv("WARMUP_SEC", 25))
-NUDGE_R20          = float(os.getenv("NUDGE_R20", 0.12))
-NUDGE_R40          = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP        = float(os.getenv("BREAKOUT_BP", 6.0))   # اختراق قمة 60s (6bp)
-DD60_MAX           = float(os.getenv("DD60_MAX", 0.25))
-GLOBAL_ALERT_GAP   = int(os.getenv("GLOBAL_ALERT_GAP", 10))
-CHASE_R5M_MAX      = float(os.getenv("CHASE_R5M_MAX", 2.20))
-CHASE_R20_MIN      = float(os.getenv("CHASE_R20_MIN", 0.05))
+WARMUP_SEC          = int(os.getenv("WARMUP_SEC", 25))
+NUDGE_R20           = float(os.getenv("NUDGE_R20", 0.12))
+NUDGE_R40           = float(os.getenv("NUDGE_R40", 0.20))
+BREAKOUT_BP         = float(os.getenv("BREAKOUT_BP", 6.0))  # 6 basis points فوق قمة 60s
+DD60_MAX            = float(os.getenv("DD60_MAX", 0.25))
+GLOBAL_ALERT_GAP    = int(os.getenv("GLOBAL_ALERT_GAP", 10))
+CHASE_R5M_MAX       = float(os.getenv("CHASE_R5M_MAX", 2.20))
+CHASE_R20_MIN       = float(os.getenv("CHASE_R20_MIN", 0.05))
 
-# Telegram + Saqar (اختياري)
-BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
-CHAT_ID            = os.getenv("CHAT_ID", "")
-SAQAR_WEBHOOK      = os.getenv("SAQAR_WEBHOOK", "")
+# Telegram + Saqar
+BOT_TOKEN           = os.getenv("BOT_TOKEN", "")
+CHAT_ID             = os.getenv("CHAT_ID", "")
+SAQAR_WEBHOOK       = os.getenv("SAQAR_WEBHOOK", "")
 
 # =========================
 # HTTP + كاش 24h
@@ -118,9 +119,9 @@ class Coin:
         self.expires_at = t + ttl_sec
         self.last_alert_at = 0.0
         self.cv = {}
-        self.buf = deque(maxlen=1200)  # ~20 دقيقة على وتيرة 1 عينة/ثانية
+        self.buf = deque(maxlen=1200)  # ~20 دقيقة على 1 عيّنة/ثانية
         self.last_price = None
-        self.entry_price = None  # ← baseline الثابت
+        self.entry_price = None  # baseline الثابت
         self.silent_until = t + WARMUP_SEC
         self.price_fail = 0
 
@@ -151,10 +152,9 @@ def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
 
 def ensure_coin(cv):
     """
-    تحديث/إضافة عملة:
     - لا نلمس entry_price إذا كانت موجودة (baseline ثابت).
     - نجدد TTL إلى 30 دقيقة من الآن.
-    - نزرع price_now في البافر كعينة فورية (ولا نغيّر entry_price إلا إذا كانت None).
+    - نزرع price_now في البافر كعينة فورية؛ baseline يضبط فقط لو كان None.
     """
     m   = cv["market"].upper()
     if not is_valid_market(m): return
@@ -172,12 +172,12 @@ def ensure_coin(cv):
                 c.last_price = p0
                 c.buf.append((nowt, p0))
                 if c.entry_price is None:
-                    c.entry_price = p0  # ← أول سعر فعلي فقط
+                    c.entry_price = p0
             c.expires_at   = nowt + TTL_MIN*60
             c.silent_until = nowt + WARMUP_SEC
             return
 
-        # الغرفة ممتلئة؟ نطرد الأضعف (حسب r5m التاريخي)
+        # قص زائد لو الغرفة مليانة — نحافظ على الأقوى (r5m)
         if len(room) >= ROOM_CAP:
             weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
             if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
@@ -189,7 +189,7 @@ def ensure_coin(cv):
         p0 = float(feat.get("price_now") or 0.0)
         if p0 > 0:
             c.last_price  = p0
-            c.entry_price = p0   # ← baseline عند الدخول لأول مرة
+            c.entry_price = p0
             c.buf.append((nowt, p0))
         room[m] = c
 
@@ -199,29 +199,26 @@ def ensure_coin(cv):
 _last_candle_fetch = {}
 
 def get_price_one(market):
-    """
-    /v2/ticker/price لسوق واحد.
-    يتعامل مع dict أو list. Retries + fallback 24h ثم close من 1m.
-    """
+    """/v2/ticker/price لسوق واحد + Fallback 24h ثم close من 1m."""
     p = None
     for _ in range(PRICE_RETRIES):
         data = http_get("/v2/ticker/price", params={"market": market})
         try:
             if isinstance(data, dict):
-                p = float(data.get("price"))
+                p = float(data.get("price") or 0)
             elif isinstance(data, list) and data:
                 if len(data) == 1:
-                    p = float((data[0] or {}).get("price"))
+                    p = float((data[0] or {}).get("price") or 0)
                 else:
-                    row = next((x for x in data if x.get("market") == market), None)
-                    if row: p = float(row.get("price"))
+                    row = next((x for x in data if x.get("market")==market), None)
+                    p = float((row or {}).get("price") or 0)
         except Exception:
             p = None
-        if p is not None and p > 0:
+        if p and p > 0:
             return p
         time.sleep(0.1)
 
-    data24 = get_24h_cached(max_age_sec=1.0)
+    data24 = get_24h_cached(1.0)
     if data24:
         try:
             it = next((x for x in data24 if x.get("market")==market), None)
@@ -233,11 +230,11 @@ def get_price_one(market):
 
     now = time.time()
     if now - _last_candle_fetch.get(market, 0) >= 10:
-        cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
+        cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit":1})
         _last_candle_fetch[market] = now
         try:
             if isinstance(cnd, list) and cnd:
-                p = float(cnd[-1][4])  # close
+                p = float(cnd[-1][4] or 0)  # close
                 if p > 0:
                     return p
         except Exception:
@@ -246,16 +243,14 @@ def get_price_one(market):
     return None
 
 def price_poller_loop():
-    """
-    يلف على الغرفة كل SCAN_INTERVAL_SEC ويغذي البافر.
-    لا قرارات هنا.
-    """
+    """يلف على الغرفة كل SCAN_INTERVAL_SEC ويغذي البافر — لا قرارات هنا."""
     while True:
-        start = time.time()
+        loop_start = time.time()
         with room_lock:
-            markets = [m for m in room.keys() if is_valid_market(m)]
+            markets = list(room.keys())
         if not markets:
-            time.sleep(0.5); continue
+            time.sleep(0.5)
+            continue
 
         for m in markets:
             p = get_price_one(m)
@@ -266,26 +261,26 @@ def price_poller_loop():
                         c.price_fail += 1
                         if c.price_fail % 5 == 0:
                             print(f"[PRICE] {m} failed {c.price_fail}x")
-                time.sleep(PER_REQUEST_GAP_SEC); continue
+                time.sleep(PER_REQUEST_GAP_SEC)
+                continue
 
             ts = time.time()
             with room_lock:
                 c = room.get(m)
-                if not c: 
-                    pass
-                else:
+                if c:
                     c.price_fail = 0
                     c.last_price = p
                     c.buf.append((ts, p))
                     if c.entry_price is None:
-                        c.entry_price = p  # أمان: لو دخل بدون price_now
+                        c.entry_price = p
                     if TTL_MIN > 0 and ts >= c.expires_at:
                         c.expires_at = ts + 120
 
             time.sleep(PER_REQUEST_GAP_SEC)
 
-        elapsed = time.time() - start
-        time.sleep(max(0.05, SCAN_INTERVAL_SEC - elapsed))
+        elapsed = time.time() - loop_start
+        if SCAN_INTERVAL_SEC - elapsed > 0:
+            time.sleep(SCAN_INTERVAL_SEC - elapsed)
 
 # =========================
 # القرار + الإشعار
@@ -319,7 +314,7 @@ def recent_dd_pct(c: Coin, seconds: int):
 
 last_global_alert = 0.0
 def decide_and_alert():
-    """يطلق فقط لأول N عملة بعد تحقق النخزة وكسر القمة وفلتر anti-chase."""
+    """يطلق فقط لأول N بعد تحقق النخزة + كسر قمة 60s + فلاتر الأمان."""
     global last_global_alert
     nowt = time.time()
 
@@ -365,17 +360,16 @@ def decide_and_alert():
             last_global_alert = nowt
             saqar_buy(c.symbol)
 
-# =========================
-# حلقة القرار فقط
-# =========================
 def monitor_loop():
+    """حلقة القرار فقط (لا تجلب أسعار)."""
     while True:
         try:
             decide_and_alert()
+            # لوج خفيف يطمن إن البافر معتبر
             if int(time.time()) % 30 == 0:
                 with room_lock:
                     filled = sum(1 for c in room.values() if len(c.buf) >= 2)
-                print(f"[MONITOR] decision-only — buffers ok {filled}/{len(room)}")
+                print(f"[MONITOR] buffers ok {filled}/{len(room)}")
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
@@ -387,29 +381,49 @@ def build_status_text():
     with room_lock:
         sorted_room = sorted(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0), reverse=True)
         lines = []
+        nowt = time.time()
         for rank, (m, c) in enumerate(sorted_room, start=1):
             star = "⭐" if rank <= ALERT_TOP_N else " "
             r5m  = c.cv.get("r5m", 0.0); r10m = c.cv.get("r10m", 0.0); vz = c.cv.get("volZ", 0.0)
             r20  = c.r_change(20); r60 = c.r_change(60); r120 = c.r_change(120)
-            since = c.since_entry()
-            ttl  = int(c.expires_at - time.time())
+            since= c.since_entry()
+            ttl  = int(c.expires_at - nowt)
             ttl_text = "∞" if TTL_MIN == 0 else f"{ttl}s"
             lines.append(
                 f"{rank:02d}.{star} {m:<10} | r5m {r5m:+.2f}%  r10m {r10m:+.2f}%  "
                 f"r20 {r20:+.2f}%  r60 {r60:+.2f}%  r120 {r120:+.2f}%  "
-                f"SinceIn {since:+.2f}%  volZ {vz:+.2f}  TTL {ttl_text}"
+                f"SinceIn {since:+.2f}%  volZ {vz:+.2f}  Buf{len(c.buf)}  TTL {ttl_text}"
             )
     header = f"📊 Room {len(room)}/{ROOM_CAP} | TopN={ALERT_TOP_N} | Gap={GLOBAL_ALERT_GAP}s"
     return header + ("\n" + "\n".join(lines) if lines else "\n(لا يوجد عملات بعد)")
 
-# =========================
-# Flask API
-# =========================
+# تشخيص سريع
 app = Flask(__name__)
 
 @app.route("/")
 def root():
     return "TopN Watcher B is alive ✅"
+
+@app.route("/status")
+def status_http():
+    return build_status_text(), 200, {"Content-Type":"text/plain; charset=utf-8"}
+
+@app.route("/diag")
+def diag():
+    out = []
+    now = time.time()
+    with room_lock:
+        for m,c in room.items():
+            buflen = len(c.buf)
+            last_age = (now - c.buf[-1][0]) if buflen else None
+            out.append({
+                "m": m, "buf_len": buflen,
+                "last_age_sec": round(last_age,2) if last_age is not None else None,
+                "entry": c.entry_price, "last": c.last_price,
+                "r20": round(c.r_change(20),3),
+                "r60": round(c.r_change(60),3)
+            })
+    return {"room": len(room), "items": out}, 200
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
@@ -418,10 +432,6 @@ def ingest():
         return jsonify(ok=False, err="bad payload"), 400
     ensure_coin(cv)
     return jsonify(ok=True)
-
-@app.route("/status")
-def status_http():
-    return build_status_text(), 200, {"Content-Type":"text/plain; charset=utf-8"}
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -438,11 +448,16 @@ def telegram_webhook():
         return jsonify(ok=True)
 
 # =========================
-# التشغيل
+# التشغيل (نضمن تشغيل الخيوط مرة واحدة)
 # =========================
+_threads_started = False
 def start_threads():
-    threading.Thread(target=price_poller_loop, daemon=True).start()  # الجالب
-    threading.Thread(target=monitor_loop, daemon=True).start()       # المقرِّر
+    global _threads_started
+    if _threads_started:
+        return
+    _threads_started = True
+    threading.Thread(target=price_poller_loop, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
 
 start_threads()
 
