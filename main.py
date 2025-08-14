@@ -18,7 +18,7 @@ BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
 
 ROOM_CAP             = int(os.getenv("ROOM_CAP", 24))
-ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 3))
+ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 15))
 
 # حلقات
 TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))     # قرار
