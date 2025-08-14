@@ -28,18 +28,18 @@ PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))
 
 # TTL وتجديد
 TTL_MIN              = int(os.getenv("TTL_MIN", 30))
-SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 60))
-ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
+SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 70))
+ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 150))
 
 # منطق تأكيد الحركة
-WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 3))
-NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.12))
-NUDGE_R40            = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 6.0))
+WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 1))
+NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.8))
+NUDGE_R40            = float(os.getenv("NUDGE_R40", 0.12))
+BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 2.0))
 DD60_MAX             = float(os.getenv("DD60_MAX", 0.25))
-GLOBAL_ALERT_GAP     = int(os.getenv("GLOBAL_ALERT_GAP", 10))
-CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", 2.20))
-CHASE_R20_MIN        = float(os.getenv("CHASE_R20_MIN", 0.05))
+GLOBAL_ALERT_GAP     = int(os.getenv("GLOBAL_ALERT_GAP", 7))
+CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", 5.0))
+CHASE_R20_MIN        = float(os.getenv("CHASE_R20_MIN", 0.02))
 
 # Telegram + Saqar
 BOT_TOKEN            = os.getenv("BOT_TOKEN", "")
