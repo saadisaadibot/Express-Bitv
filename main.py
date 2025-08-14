@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Bot B — TopN Watcher (Redis History + Robust Pricing + Live Re-Ranking)
-- ترتيب الغرفة لحظيًا: score = r5_live + 0.7*r10_live (Redis → buffer)
-- r20/r60/r120 محسوبة بالثواني (20s/60s/120s)
-- يثبت CV عند الإدخال ولا يعيد التهدئة عند كل CV
-- جلب سعر عنيد + backoff، Telegram/Saqar مع retries
+- ترتيب الغرفة لحظيًا: score = r5_live + 0.7*r10_live (من Redis أو البافر)
 - يمسح Redis (px:*) مرة واحدة عند الإقلاع
-- /status و /diag للتشخيص
+- باقي المنطق كما هو: جلب سعر عنيد، history في Redis، إشعارات لصقر، /status و /diag
 """
 
 import os, time, threading, re
@@ -21,12 +18,12 @@ BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
 
 ROOM_CAP             = int(os.getenv("ROOM_CAP", 24))
-ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 10))
+ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 3))
 
 # حلقات
-TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))      # قرار
+TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))     # قرار
 SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))  # سحب أسعار
-PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.08))
+PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.06))
 PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))
 
 # TTL وتجديد
@@ -35,11 +32,11 @@ SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 60))
 ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 
 # منطق تأكيد الحركة
-WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 5))
+WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 3))
 NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.12))
 NUDGE_R40            = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 12.0))   # شددناه قليلاً لتقليل الوهمي
-DD60_MAX             = float(os.getenv("DD60_MAX", 0.40))      # سمحنا بهزّة أكبر قليلاً
+BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 6.0))
+DD60_MAX             = float(os.getenv("DD60_MAX", 0.25))
 GLOBAL_ALERT_GAP     = int(os.getenv("GLOBAL_ALERT_GAP", 10))
 CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", 2.20))
 CHASE_R20_MIN        = float(os.getenv("CHASE_R20_MIN", 0.05))
@@ -57,7 +54,7 @@ REDIS_TRIM_EVERY     = int(os.getenv("REDIS_TRIM_EVERY", 200))
 rds = redis.from_url(REDIS_URL, decode_responses=True)
 
 # =========================
-# HTTP + كاش 24h + Backoff
+# HTTP + كاش 24h
 # =========================
 session = requests.Session()
 session.headers.update({"User-Agent":"TopN-Watcher/Redis"})
@@ -65,52 +62,19 @@ adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool
 session.mount("https://", adapter); session.mount("http://", adapter)
 
 def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
-    """
-    GET مع backoff تصاعدي (4 محاولات).
-    - عند 429: انتظر 1.0, 2.5, 4.0 s ...
-    - عند خطأ آخر: انتظر 0.5, 1.5, 2.5 s ...
-    """
     url = f"{base}{path}"
     for attempt in range(4):
         try:
             r = session.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
-                wait = 1.0 + attempt * 1.5
-                print(f"[HTTP] 429 {path} → retry in {wait:.1f}s")
-                time.sleep(wait); continue
+                time.sleep(0.25 + 0.25*attempt); continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             if attempt == 3:
-                print(f"[HTTP] GET {path} failed:", e)
-                return None
-            wait = 0.5 + attempt * 1.0
-            print(f"[HTTP] GET {path} error: {e} → retry in {wait:.1f}s")
-            time.sleep(wait)
+                print(f"[HTTP] GET {path} failed:", e); return None
+            time.sleep(0.15 + 0.15*attempt)
     return None
-
-def _post_with_retry(url, payload, timeout=8, tries=4, base_wait=0.7):
-    """
-    POST مع backoff بسيط. يرجع True لو نجح.
-    """
-    for attempt in range(tries):
-        try:
-            r = session.post(url, json=payload, timeout=timeout)
-            if r.status_code == 429:
-                wait = base_wait + attempt * 1.5
-                print(f"[POST] 429 {url} → retry in {wait:.1f}s")
-                time.sleep(wait); continue
-            if 200 <= r.status_code < 300:
-                return True
-            print(f"[POST] {url} status {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            if attempt == tries - 1:
-                print(f"[POST] {url} failed: {e}")
-                return False
-            wait = base_wait + attempt * 1.0
-            print(f"[POST] {url} error: {e} → retry in {wait:.1f}s")
-            time.sleep(wait)
-    return False
 
 _tick24_cache = {"ts": 0.0, "data": None}
 def get_24h_cached(max_age_sec: float = 2.0):
@@ -124,20 +88,23 @@ def tg_send(text, chat_id=None):
     if not BOT_TOKEN: return
     cid = chat_id or CHAT_ID
     if not cid: return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": cid, "text": text, "disable_web_page_preview": True}
-    ok = _post_with_retry(url, payload, timeout=10, tries=4, base_wait=0.7)
-    if not ok:
-        print("[TG] send failed (after retries)")
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        session.post(url, json={"chat_id": cid, "text": text, "disable_web_page_preview": True}, timeout=8)
+    except Exception as e:
+        print("[TG] send failed:", e)
 
 def saqar_buy(symbol: str):
     if not SAQAR_WEBHOOK: return
     payload = {"text": f"اشتري {symbol.lower()}"}
-    ok = _post_with_retry(SAQAR_WEBHOOK, payload, timeout=8, tries=4, base_wait=0.5)
-    if ok:
-        print(f"[SAQAR] ✅ اشتري {symbol.lower()}")
-    else:
-        print(f"[SAQAR] ❌ failed for {symbol.lower()}")
+    try:
+        r = session.post(SAQAR_WEBHOOK, json=payload, timeout=8)
+        if 200 <= r.status_code < 300:
+            print(f"[SAQAR] ✅ اشتري {symbol.lower()}")
+        else:
+            print(f"[SAQAR] ❌ {r.status_code} {r.text[:160]}")
+    except Exception as e:
+        print("[SAQAR] error:", e)
 
 # =========================
 # أدوات
@@ -167,7 +134,7 @@ class Coin:
         self.buf = deque(maxlen=2400)   # ~40 دقيقة على ~1s-2s
         self.last_price = None
         self.entry_price = None
-        self.silent_until = t + WARMUP_SEC   # تهدئة أول مرة فقط
+        self.silent_until = t + WARMUP_SEC
         self.price_fail = 0
         self.insert_count = 0
 
@@ -195,19 +162,16 @@ room = {}  # market -> Coin
 
 def ensure_coin(cv):
     m   = (cv.get("market") or "").upper()
-    if not is_valid_market(m): 
-        return
-    sym  = cv.get("symbol", m.split("-")[0])
-    feat = cv.get("feat", {})  # وارد من A
-    ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN * 60)))
+    if not is_valid_market(m): return
+    sym = cv.get("symbol", m.split("-")[0])
+    feat= cv.get("feat", {})
+    ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN*60)))
     nowt = time.time()
 
     with room_lock:
         c = room.get(m)
-
-        # ===== موجودة مسبقًا: لا نلمس c.cv إطلاقًا =====
         if c:
-            # نسجّل السعر (اختياري/مفيد للحسابات) لكن لا نحدّث CV
+            c.cv.update(feat)
             p0 = float(feat.get("price_now") or 0.0)
             if p0 > 0:
                 c.last_price = p0
@@ -215,32 +179,24 @@ def ensure_coin(cv):
                 if c.entry_price is None:
                     c.entry_price = p0
                 _redis_append_price(m, nowt, p0, c)
-
-            # فقط نجدد TTL — ولا نعيد التسليح
-            c.expires_at = nowt + TTL_MIN * 60
-            # لا تلمس: c.silent_until
+            c.expires_at   = nowt + TTL_MIN*60
+            c.silent_until = nowt + WARMUP_SEC
             return
 
-        # ===== غير موجودة: ندخلها ونثبت CV لأول مرة =====
         if len(room) >= ROOM_CAP:
-            weakest_mk, weakest_coin = min(
-                room.items(),
-                key=lambda kv: kv[1].cv.get("r5m", 0.0)
-            )
+            weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
             if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
                 return
             room.pop(weakest_mk, None)
 
         c = Coin(m, sym, ttl_sec)
-        c.cv.update(feat)  # نثبت CV عند الإدخال فقط
-
+        c.cv.update(feat)
         p0 = float(feat.get("price_now") or 0.0)
         if p0 > 0:
             c.last_price  = p0
             c.entry_price = p0
             c.buf.append((nowt, p0))
             _redis_append_price(m, nowt, p0, c)
-
         room[m] = c
 
 # =========================
@@ -305,7 +261,6 @@ def live_r_change(market, coin: Coin, seconds: int) -> float:
 _last_candle_fetch = {}
 
 def get_price_one(market):
-    # 1) PRICE
     for _ in range(max(2, PRICE_RETRIES)):
         data = http_get("/v2/ticker/price", params={"market": market})
         try:
@@ -325,7 +280,6 @@ def get_price_one(market):
             return p
         time.sleep(0.08)
 
-    # 2) BOOK → mid
     book = http_get(f"/v2/{market}/book", params={"depth": 1})
     try:
         if isinstance(book, dict):
@@ -340,7 +294,6 @@ def get_price_one(market):
     except Exception:
         pass
 
-    # 3) 1m candle (حديثة)
     now = time.time()
     if now - _last_candle_fetch.get(market, 0) >= 10:
         cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
@@ -354,7 +307,6 @@ def get_price_one(market):
         except Exception:
             pass
 
-    # 4) fallback 24h last
     data24 = get_24h_cached(1.0)
     if data24:
         try:
@@ -366,6 +318,48 @@ def get_price_one(market):
             pass
 
     return None
+
+def price_poller_loop():
+    while True:
+        start = time.time()
+        with room_lock:
+            markets = list(room.keys())
+        if not markets:
+            time.sleep(0.5); continue
+
+        for m in markets:
+            p = get_price_one(m)
+            if not (p and p > 0):
+                with room_lock:
+                    c = room.get(m)
+                    if c:
+                        c.price_fail += 1
+                        if c.price_fail % 5 == 0:
+                            print(f"[PRICE] {m} failing ({c.price_fail}x)")
+                time.sleep(PER_REQUEST_GAP_SEC); continue
+
+            ts = time.time()
+            with room_lock:
+                c = room.get(m)
+                if not c: 
+                    continue
+                if c.price_fail >= 5:
+                    print(f"[PRICE] {m} recovered after {c.price_fail} fails")
+                c.price_fail = 0
+                c.last_price = p
+                c.buf.append((ts, p))
+                if c.entry_price is None:
+                    c.entry_price = p
+                _redis_append_price(m, ts, p, c)
+
+                if TTL_MIN > 0 and ts >= c.expires_at:
+                    c.expires_at = ts + 120
+
+            time.sleep(PER_REQUEST_GAP_SEC)
+
+        elapsed = time.time() - start
+        if SCAN_INTERVAL_SEC > elapsed:
+            time.sleep(SCAN_INTERVAL_SEC - elapsed)
 
 # =========================
 # القرار + الإشعار
@@ -408,11 +402,12 @@ def decide_and_alert():
         for m, c in room.items():
             if c.last_price is None:
                 continue
-            r5  = live_r_change(m, c, 5*60)     # 5m
-            r10 = live_r_change(m, c,10*60)     # 10m
+            r5  = live_r_change(m, c, 5*60)
+            r10 = live_r_change(m, c, 10*60)
             score = r5 + 0.7*r10
             scored.append((score, r5, r10, m, c))
         scored.sort(reverse=True)  # الأعلى أولاً
+
         top_n = scored[:max(0, ALERT_TOP_N)]
 
     for score, r5_live, r10_live, m, c in top_n:
@@ -425,15 +420,15 @@ def decide_and_alert():
         if c.last_price is None:
             continue
 
-        # منع المطاردة: استخدم r5 الحي بدلاً من r5m من CV
-        r20_loc = c.r_change_local(20)  # 20s محلي
+        # منع مطاردة: استخدم r5 الحي بدلاً من r5m من CV
+        r20_loc = c.r_change_local(20)
         if r5_live >= CHASE_R5M_MAX and r20_loc < CHASE_R20_MIN:
             continue
 
-        # نسب قصيرة من Redis (ثواني)
-        r20  = r_change_redis(m, 20,  c.last_price)   # 20s
-        r60  = r_change_redis(m, 60,  c.last_price)   # 60s
-        r120 = r_change_redis(m,120,  c.last_price)   # 120s
+        # نسب أطول من Redis
+        r20  = r_change_redis(m, 20*60,  c.last_price)
+        r60  = r_change_redis(m, 60*60,  c.last_price)
+        r120 = r_change_redis(m,120*60,  c.last_price)
 
         r40_loc  = c.r_change_local(40)
         dd60_loc = recent_dd_pct_local(c, 60)
@@ -448,7 +443,7 @@ def decide_and_alert():
 
         preburst = bool((c.cv or {}).get("preburst", False))
         if preburst:
-            nudge_ok    = (r20 >= max(0.08, NUDGE_R20-0.04) and r40_loc >= max(0.14, NUDGE_R40-0.06))
+            nudge_ok = (r20 >= max(0.08, NUDGE_R20-0.04) and r40_loc >= max(0.14, NUDGE_R40-0.06))
             breakout_ok = (price_now > hi60_loc * 1.0003)
 
         if not (nudge_ok and breakout_ok and dd_ok):
@@ -528,17 +523,16 @@ def build_status_text():
         for m, c in room.items():
             if c.last_price is None:
                 continue
-            r5  = live_r_change(m, c, 5*60)    # 5m
-            r10 = live_r_change(m, c,10*60)    # 10m
+            r5  = live_r_change(m, c, 5*60)
+            r10 = live_r_change(m, c, 10*60)
             score = r5 + 0.7*r10
             scored.append((score, r5, r10, m, c))
 
         scored.sort(reverse=True)
         for rank, (score, r5, r10, m, c) in enumerate(scored, start=1):
-            # فترات قصيرة بالثواني
-            r20  = r_change_redis(m, 20,  c.last_price)   # 20s
-            r60  = r_change_redis(m, 60,  c.last_price)   # 60s
-            r120 = r_change_redis(m,120,  c.last_price)   # 120s
+            r20  = r_change_redis(m, 20*60,  c.last_price)
+            r60  = r_change_redis(m, 60*60,  c.last_price)
+            r120 = r_change_redis(m,120*60,  c.last_price)
             vz   = (c.cv or {}).get("volZ", 0.0)
             ttl  = int(c.expires_at - nowt)
             ttl_text = "∞" if TTL_MIN == 0 else f"{ttl}s"
@@ -575,11 +569,11 @@ def diag():
                 "m": m, "buf_len": buflen,
                 "redis_age_sec": round(last_age,2) if last_age is not None else None,
                 "entry": c.entry_price, "last": c.last_price,
-                "r5":   round(live_r_change(m, c, 5*60),3),
-                "r10":  round(live_r_change(m, c,10*60),3),
-                "r20":  round(r_change_redis(m, 20,  c.last_price),3),
-                "r60":  round(r_change_redis(m, 60,  c.last_price),3),
-                "r120": round(r_change_redis(m,120,  c.last_price),3),
+                "r5": round(live_r_change(m, c, 5*60),3),
+                "r10": round(live_r_change(m, c,10*60),3),
+                "r20": round(r_change_redis(m, 20*60,  c.last_price),3),
+                "r60": round(r_change_redis(m, 60*60,  c.last_price),3),
+                "r120":round(r_change_redis(m,120*60,  c.last_price),3),
             })
     return {"room": len(room), "items": out}, 200
 
