@@ -58,9 +58,9 @@ ADAPT_THRESHOLDS = {
         "CHASE_R5M_MAX": CHASE_R5M_MAX, "CHASE_R20_MIN": CHASE_R20_MIN,
     },
     "BEAR": {
-        "NUDGE_R20": 0.06, "NUDGE_R40": 0.10,
-        "BREAKOUT_BP": 1.0, "DD60_MAX": 0.40,
-        "CHASE_R5M_MAX": 6.0, "CHASE_R20_MIN": 0.015,
+        "NUDGE_R20": 0.03, "NUDGE_R40": 0.07,
+        "BREAKOUT_BP": 0.6, "DD60_MAX": 0.60,
+        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.015,
     },
 }
 
