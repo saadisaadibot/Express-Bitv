@@ -33,7 +33,7 @@ ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 150))
 
 # منطق تأكيد الحركة
 WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 1))
-NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.8))
+NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.08))
 NUDGE_R40            = float(os.getenv("NUDGE_R40", 0.12))
 BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 2.0))
 DD60_MAX             = float(os.getenv("DD60_MAX", 0.25))
