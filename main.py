@@ -1,21 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Robust Pricing + Baseline + Anti-Chase)
-- يستقبل CV من A ويحدّث الغرفة بدون تصفير baseline
-- جلب السعر عنيد: /ticker/price → /{market}/book(mid) → /{market}/candles(1m) → /ticker/24h
-- حلقتان: (1) price_poller_loop لتعبئة البافر، (2) monitor_loop للقرار فقط
-- Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- إشعار صقر "اشتري {symbol}"
-- /status مختصر واضح، و/diag للتشخيص (buf_len, last_age_sec, r20/r60)
+Bot B — TopN Watcher (Redis History + Robust Pricing)
+- يستقبل CV من A ويحدّث الغرفة (baseline ثابت لكل عملة)
+- history في Redis: سلسلة زمنية لكل market (ts|price) مع تقليم ذكي
+- حساب r5m/r10m/r20/r60/r120 من Redis (دقيق حتى بعد إعادة التشغيل)
+- جلب السعر عنيد: price → book(mid) → candle(1m) → 24h(last)
+- إشعار "اشتري {symbol}" إلى صقر + /status و /diag للتشخيص
 """
 
 import os, time, threading, re
 from collections import deque
-import requests
+import requests, redis
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات عامة
+# إعدادات
 # =========================
 BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
@@ -23,23 +22,22 @@ HTTP_TIMEOUT         = 8.0
 ROOM_CAP             = int(os.getenv("ROOM_CAP", 24))
 ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 3))
 
-# حلقة القرار فقط
-TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))
+# حلقات
+TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))     # قرار
+SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))  # سحب أسعار
+PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.06))
+PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))
 
-# حلقة الأسعار (هادئة)
-SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))   # كل كم ثانية نلف على الغرفة
-PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.06))# نوم صغير بين كل ماركت
-PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))           # محاولات /ticker/price
-
-TTL_MIN              = int(os.getenv("TTL_MIN", 30))       # يُجدد عند كل CV
-SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
+# TTL وتجديد
+TTL_MIN              = int(os.getenv("TTL_MIN", 30))
+SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 60))
 ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", 180))
 
-# تأكيد حي + منع مطاردة
+# منطق تأكيد الحركة
 WARMUP_SEC           = int(os.getenv("WARMUP_SEC", 25))
 NUDGE_R20            = float(os.getenv("NUDGE_R20", 0.12))
 NUDGE_R40            = float(os.getenv("NUDGE_R40", 0.20))
-BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 6.0))  # 6 bp فوق قمة 60s
+BREAKOUT_BP          = float(os.getenv("BREAKOUT_BP", 6.0))
 DD60_MAX             = float(os.getenv("DD60_MAX", 0.25))
 GLOBAL_ALERT_GAP     = int(os.getenv("GLOBAL_ALERT_GAP", 10))
 CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", 2.20))
@@ -50,16 +48,24 @@ BOT_TOKEN            = os.getenv("BOT_TOKEN", "")
 CHAT_ID              = os.getenv("CHAT_ID", "")
 SAQAR_WEBHOOK        = os.getenv("SAQAR_WEBHOOK", "")
 
+# Redis
+REDIS_URL            = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# كم عيّنة نحتفظ بها لكل ماركت (≈ كل 2s لمدة 3 ساعات = ~5400)
+REDIS_MAX_SAMPLES    = int(os.getenv("REDIS_MAX_SAMPLES", 6000))
+# نحذف الزائد كل كم إدراج
+REDIS_TRIM_EVERY     = int(os.getenv("REDIS_TRIM_EVERY", 200))
+
+rds = redis.from_url(REDIS_URL, decode_responses=True)
+
 # =========================
 # HTTP + كاش 24h
 # =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"TopN-Watcher/Entry-Baseline"})
+session.headers.update({"User-Agent":"TopN-Watcher/Redis"})
 adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
 def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
-    """عنيد مع 429 وأخطاء مؤقتة."""
     url = f"{base}{path}"
     for attempt in range(4):
         try:
@@ -111,12 +117,16 @@ def pct(a, b):
     if b is None or b == 0: return 0.0
     return (a - b) / b * 100.0
 
+VALID_MKT = re.compile(r"^[A-Z0-9]{1,10}-EUR$")
+def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
+
 # =========================
-# Coin
+# Coin (in-memory state)
 # =========================
 class Coin:
     __slots__ = ("market","symbol","entered_at","expires_at","last_alert_at",
-                 "cv","buf","last_price","entry_price","silent_until","price_fail")
+                 "cv","buf","last_price","entry_price","silent_until","price_fail",
+                 "insert_count")
     def __init__(self, market, symbol, ttl_sec):
         t = time.time()
         self.market = market
@@ -125,13 +135,15 @@ class Coin:
         self.expires_at = t + ttl_sec
         self.last_alert_at = 0.0
         self.cv = {}
-        self.buf = deque(maxlen=1200)  # ~20 دقيقة على 1/ث
+        self.buf = deque(maxlen=2400)   # ~40 دقيقة على ~1s-2s
         self.last_price = None
-        self.entry_price = None       # baseline ثابت (أول سعر حقيقي)
+        self.entry_price = None
         self.silent_until = t + WARMUP_SEC
         self.price_fail = 0
+        self.insert_count = 0
 
-    def r_change(self, seconds: int) -> float:
+    # تغيّر من البافر القصير (للقرارات السريعة)
+    def r_change_local(self, seconds: int) -> float:
         if len(self.buf) < 2: return 0.0
         t_now, p_now = self.buf[-1]
         t_target = t_now - seconds
@@ -152,15 +164,8 @@ class Coin:
 # =========================
 room_lock = threading.Lock()
 room = {}  # market -> Coin
-VALID_MKT = re.compile(r"^[A-Z0-9]{1,10}-EUR$")
-def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
 
 def ensure_coin(cv):
-    """
-    - لا نلمس entry_price إذا كانت موجودة (baseline ثابت).
-    - نجدد TTL إلى 30 دقيقة من الآن.
-    - نزرع price_now في البافر كعينة فورية؛ baseline يضبط فقط لو كان None.
-    """
     m   = (cv.get("market") or "").upper()
     if not is_valid_market(m): return
     sym = cv.get("symbol", m.split("-")[0])
@@ -178,11 +183,12 @@ def ensure_coin(cv):
                 c.buf.append((nowt, p0))
                 if c.entry_price is None:
                     c.entry_price = p0
+                _redis_append_price(m, nowt, p0, c)
             c.expires_at   = nowt + TTL_MIN*60
             c.silent_until = nowt + WARMUP_SEC
             return
 
-        # قص زائد لو الغرفة مليانة — نحافظ على الأقوى (r5m)
+        # قص زائد — أبق الأقوى
         if len(room) >= ROOM_CAP:
             weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
             if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
@@ -196,7 +202,64 @@ def ensure_coin(cv):
             c.last_price  = p0
             c.entry_price = p0
             c.buf.append((nowt, p0))
+            _redis_append_price(m, nowt, p0, c)
         room[m] = c
+
+# =========================
+# Redis history helpers
+# =========================
+def _rkey(market): return f"px:{market}"
+
+def _redis_append_price(market, ts, price, c: Coin):
+    """نضيف ts|price إلى Redis مع تقليم دوري."""
+    try:
+        rds.rpush(_rkey(market), f"{int(ts)}|{price:.12f}")
+        c.insert_count += 1
+        if c.insert_count % REDIS_TRIM_EVERY == 0:
+            # احفظ آخر REDIS_MAX_SAMPLES عنصر
+            llen = rds.llen(_rkey(market))
+            if llen and llen > REDIS_MAX_SAMPLES:
+                rds.ltrim(_rkey(market), max(0, llen-REDIS_MAX_SAMPLES), -1)
+            rds.expire(_rkey(market), 6*3600)  # 6 ساعات حفاظًا على المساحة
+    except Exception as e:
+        print("[REDIS] append failed:", e)
+
+def _redis_last_price(market):
+    try:
+        v = rds.lindex(_rkey(market), -1)
+        if not v: return None, None
+        ts_s, pr_s = (v.split("|", 1) if "|" in v else (None, None))
+        return (int(ts_s) if ts_s else None), (float(pr_s) if pr_s else None)
+    except Exception:
+        return None, None
+
+def _redis_price_at(market, seconds_ago: int):
+    """
+    نقرأ من آخر ~6000 عنصر ونختار أول عنصر زمنه <= now-seconds_ago.
+    """
+    try:
+        now_s = int(time.time())
+        target = now_s - int(seconds_ago)
+        # نأخذ مقطعًا كافيًا من الذيل
+        arr = rds.lrange(_rkey(market), -REDIS_MAX_SAMPLES, -1)
+        for v in reversed(arr):
+            if "|" not in v: continue
+            ts_s, pr_s = v.split("|", 1)
+            ts = int(ts_s); pr = float(pr_s)
+            if ts <= target:
+                return pr
+        # إن لم نجد، خذ أقدم عيّنة متوفرة
+        if arr:
+            ts_s, pr_s = arr[0].split("|", 1)
+            return float(pr_s)
+    except Exception as e:
+        print("[REDIS] price_at error:", e)
+    return None
+
+def r_change_redis(market, seconds_ago: int, last_price_now: float):
+    base = _redis_price_at(market, seconds_ago)
+    if base is None or last_price_now is None: return 0.0
+    return pct(last_price_now, base)
 
 # =========================
 # جلب الأسعار (عنيد + بدائل)
@@ -204,12 +267,6 @@ def ensure_coin(cv):
 _last_candle_fetch = {}
 
 def get_price_one(market):
-    """
-    1) /v2/ticker/price
-    2) /v2/{market}/book?depth=1 → mid
-    3) /v2/{market}/candles 1m (close حديث ≤60s)
-    4) /v2/ticker/24h (last) كـ fallback أخير
-    """
     # 1) PRICE
     for _ in range(max(2, PRICE_RETRIES)):
         data = http_get("/v2/ticker/price", params={"market": market})
@@ -245,7 +302,7 @@ def get_price_one(market):
     except Exception:
         pass
 
-    # 3) 1m candle (كل 10s فقط لكل ماركت)
+    # 3) 1m candle (حديثة)
     now = time.time()
     if now - _last_candle_fetch.get(market, 0) >= 10:
         cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
@@ -259,7 +316,7 @@ def get_price_one(market):
         except Exception:
             pass
 
-    # 4) fallback: last من 24h (كاش سريع)
+    # 4) fallback 24h last
     data24 = get_24h_cached(1.0)
     if data24:
         try:
@@ -273,7 +330,7 @@ def get_price_one(market):
     return None
 
 def price_poller_loop():
-    """يلف على الغرفة بشكل دوري ويغذي البافر — لا قرارات هنا."""
+    """يغذي الريدس + البافر باستمرار."""
     while True:
         start = time.time()
         with room_lock:
@@ -304,8 +361,10 @@ def price_poller_loop():
                 c.buf.append((ts, p))
                 if c.entry_price is None:
                     c.entry_price = p
+                _redis_append_price(m, ts, p, c)
+
                 if TTL_MIN > 0 and ts >= c.expires_at:
-                    c.expires_at = ts + 120  # لا نقصيها تلقائيًا
+                    c.expires_at = ts + 120
 
             time.sleep(PER_REQUEST_GAP_SEC)
 
@@ -329,13 +388,13 @@ def spread_ok(market):
     except Exception:
         return True
 
-def recent_high(c: Coin, seconds: int):
+def recent_high_local(c: Coin, seconds: int):
     if not c.buf: return None
     t_now = c.buf[-1][0]
     vals = [p for (t,p) in c.buf if t >= t_now - seconds]
     return max(vals) if vals else None
 
-def recent_dd_pct(c: Coin, seconds: int):
+def recent_dd_pct_local(c: Coin, seconds: int):
     if len(c.buf) < 2: return 0.0
     t_now = c.buf[-1][0]
     sub = [(t,p) for (t,p) in c.buf if t >= t_now - seconds]
@@ -345,7 +404,6 @@ def recent_dd_pct(c: Coin, seconds: int):
 
 last_global_alert = 0.0
 def decide_and_alert():
-    """يطلق فقط لأول N بعد تحقق النخزة + كسر قمة 60s + فلاتر الأمان."""
     global last_global_alert
     nowt = time.time()
 
@@ -360,27 +418,35 @@ def decide_and_alert():
                 continue
             if nowt - last_global_alert < GLOBAL_ALERT_GAP:
                 continue
-
-            r5m = float(c.cv.get("r5m", 0.0))
-            r20 = c.r_change(20)
-            if r5m >= CHASE_R5M_MAX and r20 < CHASE_R20_MIN:
-                continue  # تمدد متعب — لا نطارد
-
-            r40  = c.r_change(40)
-            dd60 = recent_dd_pct(c, 60)
-            hi60 = recent_high(c, 60)
-            price_now = c.last_price
-            if price_now is None or hi60 is None:
+            if c.last_price is None:
                 continue
 
-            breakout_ok = (price_now > hi60 * (1.0 + BREAKOUT_BP/10000.0))
-            nudge_ok    = (r20 >= NUDGE_R20 and r40 >= NUDGE_R40)
-            dd_ok       = (dd60 <= DD60_MAX)
+            # منع المطاردة
+            r5m_cv = float(c.cv.get("r5m", 0.0))
+            r20_loc = c.r_change_local(20)
+            if r5m_cv >= CHASE_R5M_MAX and r20_loc < CHASE_R20_MIN:
+                continue
+
+            # نِسب من Redis (دقيقة حتى بعد restart)
+            r20  = r_change_redis(m, 20*60,  c.last_price)
+            r60  = r_change_redis(m, 60*60,  c.last_price)
+            r120 = r_change_redis(m,120*60,  c.last_price)
+
+            r40_loc  = c.r_change_local(40)
+            dd60_loc = recent_dd_pct_local(c, 60)
+            hi60_loc = recent_high_local(c, 60)
+            price_now = c.last_price
+            if price_now is None or hi60_loc is None:
+                continue
+
+            breakout_ok = (price_now > hi60_loc * (1.0 + BREAKOUT_BP/10000.0))
+            nudge_ok    = (r20 >= NUDGE_R20 and r40_loc >= NUDGE_R40)
+            dd_ok       = (dd60_loc <= DD60_MAX)
 
             preburst = bool((c.cv or {}).get("preburst", False))
             if preburst:
-                nudge_ok = (r20 >= max(0.08, NUDGE_R20-0.04) and r40 >= max(0.14, NUDGE_R40-0.06))
-                breakout_ok = (price_now > hi60 * 1.0003)
+                nudge_ok = (r20 >= max(0.08, NUDGE_R20-0.04) and r40_loc >= max(0.14, NUDGE_R40-0.06))
+                breakout_ok = (price_now > hi60_loc * 1.0003)
 
             if not (nudge_ok and breakout_ok and dd_ok):
                 continue
@@ -392,20 +458,19 @@ def decide_and_alert():
             saqar_buy(c.symbol)
 
 def monitor_loop():
-    """حلقة القرار فقط (لا تجلب أسعار)."""
     while True:
         try:
             decide_and_alert()
             if int(time.time()) % 30 == 0:
                 with room_lock:
-                    ok = sum(1 for c in room.values() if len(c.buf) >= 2)
+                    ok = sum(1 for c in room.values() if len(c.buf) >= 2 and c.last_price is not None)
                 print(f"[MONITOR] buffers ok {ok}/{len(room)}")
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
 
 # =========================
-# الحالة وواجهات
+# حالة وواجهات
 # =========================
 def build_status_text():
     with room_lock:
@@ -415,7 +480,10 @@ def build_status_text():
         for rank, (m, c) in enumerate(sorted_room, start=1):
             star = "⭐" if rank <= ALERT_TOP_N else " "
             r5m  = c.cv.get("r5m", 0.0); r10m = c.cv.get("r10m", 0.0); vz = c.cv.get("volZ", 0.0)
-            r20  = c.r_change(20); r60 = c.r_change(60); r120 = c.r_change(120)
+            # من Redis للفترات الطويلة
+            r20  = r_change_redis(m, 20*60,  c.last_price)
+            r60  = r_change_redis(m, 60*60,  c.last_price)
+            r120 = r_change_redis(m,120*60,  c.last_price)
             since= c.since_entry()
             ttl  = int(c.expires_at - nowt)
             ttl_text = "∞" if TTL_MIN == 0 else f"{ttl}s"
@@ -444,13 +512,15 @@ def diag():
     with room_lock:
         for m,c in room.items():
             buflen = len(c.buf)
-            last_age = (now - c.buf[-1][0]) if buflen else None
+            last_ts, last_px = _redis_last_price(m)
+            last_age = (now - last_ts) if last_ts else None
             out.append({
                 "m": m, "buf_len": buflen,
-                "last_age_sec": round(last_age,2) if last_age is not None else None,
+                "redis_age_sec": round(last_age,2) if last_age is not None else None,
                 "entry": c.entry_price, "last": c.last_price,
-                "r20": round(c.r_change(20),3),
-                "r60": round(c.r_change(60),3)
+                "r20": round(r_change_redis(m, 20*60,  c.last_price),3),
+                "r60": round(r_change_redis(m, 60*60,  c.last_price),3),
+                "r120":round(r_change_redis(m,120*60,  c.last_price),3),
             })
     return {"room": len(room), "items": out}, 200
 
@@ -459,8 +529,7 @@ def ingest():
     cv = request.get_json(force=True, silent=True) or {}
     if not cv.get("market") or not cv.get("feat"):
         return jsonify(ok=False, err="bad payload"), 400
-    ensure_coin(cv)
-    return jsonify(ok=True)
+    ensure_coin(cv); return jsonify(ok=True)
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -473,17 +542,15 @@ def telegram_webhook():
             tg_send(build_status_text(), chat_id=chat or CHAT_ID)
         return jsonify(ok=True)
     except Exception as e:
-        print("[WEBHOOK] err:", e)
-        return jsonify(ok=True)
+        print("[WEBHOOK] err:", e); return jsonify(ok=True)
 
 # =========================
-# التشغيل (مرة واحدة فقط)
+# التشغيل
 # =========================
 _threads_started = False
 def start_threads():
     global _threads_started
-    if _threads_started:
-        return
+    if _threads_started: return
     _threads_started = True
     threading.Thread(target=price_poller_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
