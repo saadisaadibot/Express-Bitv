@@ -162,16 +162,19 @@ room = {}  # market -> Coin
 
 def ensure_coin(cv):
     m   = (cv.get("market") or "").upper()
-    if not is_valid_market(m): return
-    sym = cv.get("symbol", m.split("-")[0])
-    feat= cv.get("feat", {})
-    ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN*60)))
+    if not is_valid_market(m): 
+        return
+    sym  = cv.get("symbol", m.split("-")[0])
+    feat = cv.get("feat", {})  # وارد من A
+    ttl_sec = max(60, int(cv.get("ttl_sec", TTL_MIN * 60)))
     nowt = time.time()
 
     with room_lock:
         c = room.get(m)
+
+        # ===== موجودة مسبقًا: لا نلمس c.cv إطلاقًا =====
         if c:
-            c.cv.update(feat)
+            # نسجّل السعر (اختياري/مفيد للحسابات) لكن لا نحدّث CV
             p0 = float(feat.get("price_now") or 0.0)
             if p0 > 0:
                 c.last_price = p0
@@ -179,26 +182,34 @@ def ensure_coin(cv):
                 if c.entry_price is None:
                     c.entry_price = p0
                 _redis_append_price(m, nowt, p0, c)
-            c.expires_at   = nowt + TTL_MIN*60
-            c.silent_until = nowt + WARMUP_SEC
+
+            # فقط نجدد TTL — ولا نعيد التسليح
+            c.expires_at = nowt + TTL_MIN * 60
+            # لا تلمس: c.silent_until
             return
 
+        # ===== غير موجودة: ندخلها ونثبت CV لأول مرة =====
+        # إذا الغرفة ممتلئة نحذف الأضعف فقط لو الجديدة أقوى
         if len(room) >= ROOM_CAP:
-            weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
+            weakest_mk, weakest_coin = min(
+                room.items(),
+                key=lambda kv: kv[1].cv.get("r5m", 0.0)
+            )
             if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
                 return
             room.pop(weakest_mk, None)
 
         c = Coin(m, sym, ttl_sec)
-        c.cv.update(feat)
+        c.cv.update(feat)  # نثبت CV عند الإدخال فقط
+
         p0 = float(feat.get("price_now") or 0.0)
         if p0 > 0:
             c.last_price  = p0
             c.entry_price = p0
             c.buf.append((nowt, p0))
             _redis_append_price(m, nowt, p0, c)
-        room[m] = c
 
+        room[m] = c
 # =========================
 # Redis helpers
 # =========================
