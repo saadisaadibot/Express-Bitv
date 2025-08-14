@@ -18,10 +18,10 @@ BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
 
 ROOM_CAP             = int(os.getenv("ROOM_CAP", 24))
-ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 15))
+ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 10))  # الافتراضي 10
 
 # حلقات
-TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))     # قرار
+TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))           # قرار
 SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))  # سحب أسعار
 PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.09))
 PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))
@@ -179,8 +179,8 @@ def ensure_coin(cv):
                 if c.entry_price is None:
                     c.entry_price = p0
                 _redis_append_price(m, nowt, p0, c)
-            c.expires_at   = nowt + TTL_MIN*60
-            c.silent_until = nowt + WARMUP_SEC
+            c.expires_at = nowt + TTL_MIN*60
+            # لا تعيد ضبط silent_until هنا حتى لا يظل صامتاً
             return
 
         if len(room) >= ROOM_CAP:
@@ -245,13 +245,14 @@ def _redis_price_at(market, seconds_ago: int):
 
 def r_change_redis(market, seconds_ago: int, last_price_now: float):
     base = _redis_price_at(market, seconds_ago)
-    if base is None or last_price_now is None: return 0.0
+    if base is None or last_price_now is None:
+        return None  # <— تمييز عدم وجود قاعدة مقارنة
     return pct(last_price_now, base)
 
 # لحظي: r5/r10 حي (Redis → local buffer كبديل)
 def live_r_change(market, coin: Coin, seconds: int) -> float:
     val = r_change_redis(market, seconds, coin.last_price)
-    if val == 0.0:  # لو لسه ما تراكم تاريخ كافي
+    if val is None:
         return coin.r_change_local(seconds)
     return val
 
@@ -341,7 +342,7 @@ def price_poller_loop():
             ts = time.time()
             with room_lock:
                 c = room.get(m)
-                if not c: 
+                if not c:
                     continue
                 if c.price_fail >= 5:
                     print(f"[PRICE] {m} recovered after {c.price_fail} fails")
@@ -407,11 +408,10 @@ def decide_and_alert():
             score = r5 + 0.7*r10
             scored.append((score, r5, r10, m, c))
         scored.sort(reverse=True)  # الأعلى أولاً
-
         top_n = scored[:max(0, ALERT_TOP_N)]
 
     for score, r5_live, r10_live, m, c in top_n:
-        if nowt < c.silent_until: 
+        if nowt < c.silent_until:
             continue
         if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
             continue
@@ -420,15 +420,15 @@ def decide_and_alert():
         if c.last_price is None:
             continue
 
-        # منع مطاردة: استخدم r5 الحي بدلاً من r5m من CV
+        # منع مطاردة: r5 حي مع شرط ربح قصير مقابل ركيزة 20s
         r20_loc = c.r_change_local(20)
         if r5_live >= CHASE_R5M_MAX and r20_loc < CHASE_R20_MIN:
             continue
 
-        # نسب أطول من Redis
-        r20  = r_change_redis(m, 20*60,  c.last_price)
-        r60  = r_change_redis(m, 60*60,  c.last_price)
-        r120 = r_change_redis(m,120*60,  c.last_price)
+        # نسب أطول من Redis (None -> 0.0)
+        r20  = r_change_redis(m, 20*60,  c.last_price) or 0.0
+        r60  = r_change_redis(m, 60*60,  c.last_price) or 0.0
+        r120 = r_change_redis(m,120*60,  c.last_price) or 0.0
 
         r40_loc  = c.r_change_local(40)
         dd60_loc = recent_dd_pct_local(c, 60)
@@ -470,48 +470,6 @@ def monitor_loop():
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
 
-def price_poller_loop():
-    while True:
-        start = time.time()
-        with room_lock:
-            markets = list(room.keys())
-        if not markets:
-            time.sleep(0.5); continue
-
-        for m in markets:
-            p = get_price_one(m)
-            if not (p and p > 0):
-                with room_lock:
-                    c = room.get(m)
-                    if c:
-                        c.price_fail += 1
-                        if c.price_fail % 5 == 0:
-                            print(f"[PRICE] {m} failing ({c.price_fail}x)")
-                time.sleep(PER_REQUEST_GAP_SEC); continue
-
-            ts = time.time()
-            with room_lock:
-                c = room.get(m)
-                if not c: 
-                    continue
-                if c.price_fail >= 5:
-                    print(f"[PRICE] {m} recovered after {c.price_fail} fails")
-                c.price_fail = 0
-                c.last_price = p
-                c.buf.append((ts, p))
-                if c.entry_price is None:
-                    c.entry_price = p
-                _redis_append_price(m, ts, p, c)
-
-                if TTL_MIN > 0 and ts >= c.expires_at:
-                    c.expires_at = ts + 120
-
-            time.sleep(PER_REQUEST_GAP_SEC)
-
-        elapsed = time.time() - start
-        if SCAN_INTERVAL_SEC > elapsed:
-            time.sleep(SCAN_INTERVAL_SEC - elapsed)
-
 # =========================
 # حالة وواجهات
 # =========================
@@ -530,9 +488,9 @@ def build_status_text():
 
         scored.sort(reverse=True)
         for rank, (score, r5, r10, m, c) in enumerate(scored, start=1):
-            r20  = r_change_redis(m, 20*60,  c.last_price)
-            r60  = r_change_redis(m, 60*60,  c.last_price)
-            r120 = r_change_redis(m,120*60,  c.last_price)
+            r20  = r_change_redis(m, 20*60,  c.last_price) or 0.0
+            r60  = r_change_redis(m, 60*60,  c.last_price) or 0.0
+            r120 = r_change_redis(m,120*60,  c.last_price) or 0.0
             vz   = (c.cv or {}).get("volZ", 0.0)
             ttl  = int(c.expires_at - nowt)
             ttl_text = "∞" if TTL_MIN == 0 else f"{ttl}s"
@@ -571,9 +529,9 @@ def diag():
                 "entry": c.entry_price, "last": c.last_price,
                 "r5": round(live_r_change(m, c, 5*60),3),
                 "r10": round(live_r_change(m, c,10*60),3),
-                "r20": round(r_change_redis(m, 20*60,  c.last_price),3),
-                "r60": round(r_change_redis(m, 60*60,  c.last_price),3),
-                "r120":round(r_change_redis(m,120*60,  c.last_price),3),
+                "r20": round((r_change_redis(m, 20*60,  c.last_price) or 0.0),3),
+                "r60": round((r_change_redis(m, 60*60,  c.last_price) or 0.0),3),
+                "r120":round((r_change_redis(m,120*60,  c.last_price) or 0.0),3),
             })
     return {"room": len(room), "items": out}, 200
 
