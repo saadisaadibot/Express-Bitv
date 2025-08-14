@@ -23,7 +23,7 @@ ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 15))
 # حلقات
 TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))     # قرار
 SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))  # سحب أسعار
-PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.06))
+PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.09))
 PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))
 
 # TTL وتجديد
