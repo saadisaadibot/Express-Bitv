@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Stable Entry Baseline + Robust Pricing)
-- baseline ثابت (entry_price) لا يُعاد ضبطه بعد أول عينة حقيقية
-- جلب السعر: /ticker/price → /{market}/book(mid) → /{market}/candles(1m close) → /ticker/24h
-- جلب هادئ مستمر مع retries و backoff خفيف
-- قرار: Warmup + Nudge + Breakout + Anti-Chase + Global Gap
-- يجدد TTL عند كل CV من A (لا يصفّر baseline)
-- إشعار صقر: "اشتري {symbol}"
-- /status يُظهر r20/r60/r120 + SinceIn% + BufN
-- /diag للتشخيص السريع
+Bot B — TopN Watcher (Robust Pricing + Baseline + Anti-Chase)
+- يستقبل CV من A ويحدّث الغرفة بدون تصفير baseline
+- جلب السعر عنيد: /ticker/price → /{market}/book(mid) → /{market}/candles(1m) → /ticker/24h
+- حلقتان: (1) price_poller_loop لتعبئة البافر، (2) monitor_loop للقرار فقط
+- Warmup + Nudge + Breakout + Anti-Chase + Global Gap
+- إشعار صقر "اشتري {symbol}"
+- /status مختصر واضح، و/diag للتشخيص (buf_len, last_age_sec, r20/r60)
 """
 
 import os, time, threading, re
@@ -17,7 +15,7 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================
-# إعدادات
+# إعدادات عامة
 # =========================
 BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
@@ -28,10 +26,10 @@ ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", 3))
 # حلقة القرار فقط
 TICK_SEC             = float(os.getenv("TICK_SEC", 1.0))
 
-# الجالب (هادئ)
-SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 3.0))   # دورة كاملة على الغرفة
-PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.07))# نوم بين كل سوق
-PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 2))           # محاولات /ticker/price
+# حلقة الأسعار (هادئة)
+SCAN_INTERVAL_SEC    = float(os.getenv("SCAN_INTERVAL_SEC", 2.0))   # كل كم ثانية نلف على الغرفة
+PER_REQUEST_GAP_SEC  = float(os.getenv("PER_REQUEST_GAP_SEC", 0.06))# نوم صغير بين كل ماركت
+PRICE_RETRIES        = int(os.getenv("PRICE_RETRIES", 3))           # محاولات /ticker/price
 
 TTL_MIN              = int(os.getenv("TTL_MIN", 30))       # يُجدد عند كل CV
 SPREAD_MAX_BP        = int(os.getenv("SPREAD_MAX_BP", 60)) # 0.60%
@@ -61,7 +59,7 @@ adapter = requests.adapters.HTTPAdapter(max_retries=2, pool_connections=50, pool
 session.mount("https://", adapter); session.mount("http://", adapter)
 
 def http_get(path, params=None, base=BITVAVO_URL, timeout=HTTP_TIMEOUT):
-    """عنيد مع 429/أخطاء مؤقتة."""
+    """عنيد مع 429 وأخطاء مؤقتة."""
     url = f"{base}{path}"
     for attempt in range(4):
         try:
@@ -127,9 +125,9 @@ class Coin:
         self.expires_at = t + ttl_sec
         self.last_alert_at = 0.0
         self.cv = {}
-        self.buf = deque(maxlen=1200)  # ~20 دقيقة على 1 عيّنة/ثانية
+        self.buf = deque(maxlen=1200)  # ~20 دقيقة على 1/ث
         self.last_price = None
-        self.entry_price = None  # baseline الثابت
+        self.entry_price = None       # baseline ثابت (أول سعر حقيقي)
         self.silent_until = t + WARMUP_SEC
         self.price_fail = 0
 
@@ -155,7 +153,6 @@ class Coin:
 room_lock = threading.Lock()
 room = {}  # market -> Coin
 VALID_MKT = re.compile(r"^[A-Z0-9]{1,10}-EUR$")
-
 def is_valid_market(m): return bool(VALID_MKT.match(m or ""))
 
 def ensure_coin(cv):
@@ -202,17 +199,16 @@ def ensure_coin(cv):
         room[m] = c
 
 # =========================
-# جلب الأسعار (Robust)
+# جلب الأسعار (عنيد + بدائل)
 # =========================
 _last_candle_fetch = {}
 
 def get_price_one(market):
     """
-    تسلسل المحاولات:
-    1) /v2/ticker/price (الأدق)
-    2) /v2/{market}/book?depth=1  -> mid = (bestAsk+bestBid)/2
-    3) /v2/{market}/candles 1m    -> close آخر شمعة (≤60s)
-    4) fallback أخير: last من /v2/ticker/24h (كاش)
+    1) /v2/ticker/price
+    2) /v2/{market}/book?depth=1 → mid
+    3) /v2/{market}/candles 1m (close حديث ≤60s)
+    4) /v2/ticker/24h (last) كـ fallback أخير
     """
     # 1) PRICE
     for _ in range(max(2, PRICE_RETRIES)):
@@ -243,27 +239,27 @@ def get_price_one(market):
             ask = float(asks[0][0]) if asks else 0.0
             bid = float(bids[0][0]) if bids else 0.0
             if ask > 0 and bid > 0:
-                mid = (ask + bid) / 2.0
+                mid = (ask + bid)/2.0
                 if mid > 0:
                     return mid
     except Exception:
         pass
 
-    # 3) 1m candle (كل 10s فقط للسوق نفسه)
+    # 3) 1m candle (كل 10s فقط لكل ماركت)
     now = time.time()
     if now - _last_candle_fetch.get(market, 0) >= 10:
         cnd = http_get(f"/v2/{market}/candles", params={"interval":"1m", "limit": 1})
         _last_candle_fetch[market] = now
         try:
             if isinstance(cnd, list) and cnd:
-                close = float(cnd[-1][4] or 0)  # close
+                close = float(cnd[-1][4] or 0)
                 t_ms  = float(cnd[-1][0] or 0)
                 if close > 0 and (now*1000 - t_ms) <= 60_000:
                     return close
         except Exception:
             pass
 
-    # 4) fallback أخير: last من 24h
+    # 4) fallback: last من 24h (كاش سريع)
     data24 = get_24h_cached(1.0)
     if data24:
         try:
@@ -277,45 +273,44 @@ def get_price_one(market):
     return None
 
 def price_poller_loop():
-    """يلف على الغرفة كل SCAN_INTERVAL_SEC ويغذي البافر — لا قرارات هنا."""
+    """يلف على الغرفة بشكل دوري ويغذي البافر — لا قرارات هنا."""
     while True:
-        loop_start = time.time()
+        start = time.time()
         with room_lock:
             markets = list(room.keys())
         if not markets:
-            time.sleep(0.5)
-            continue
+            time.sleep(0.5); continue
 
         for m in markets:
             p = get_price_one(m)
-            if p is None or p <= 0:
+            if not (p and p > 0):
                 with room_lock:
                     c = room.get(m)
                     if c:
                         c.price_fail += 1
                         if c.price_fail % 5 == 0:
-                            print(f"[PRICE] {m} still failing ({c.price_fail}x)")
-                time.sleep(PER_REQUEST_GAP_SEC)
-                continue
+                            print(f"[PRICE] {m} failing ({c.price_fail}x)")
+                time.sleep(PER_REQUEST_GAP_SEC); continue
 
             ts = time.time()
             with room_lock:
                 c = room.get(m)
-                if c:
-                    if c.price_fail >= 5:
-                        print(f"[PRICE] {m} recovered after {c.price_fail} fails")
-                    c.price_fail = 0
-                    c.last_price = p
-                    c.buf.append((ts, p))
-                    if c.entry_price is None:
-                        c.entry_price = p
-                    if TTL_MIN > 0 and ts >= c.expires_at:
-                        c.expires_at = ts + 120
+                if not c: 
+                    continue
+                if c.price_fail >= 5:
+                    print(f"[PRICE] {m} recovered after {c.price_fail} fails")
+                c.price_fail = 0
+                c.last_price = p
+                c.buf.append((ts, p))
+                if c.entry_price is None:
+                    c.entry_price = p
+                if TTL_MIN > 0 and ts >= c.expires_at:
+                    c.expires_at = ts + 120  # لا نقصيها تلقائيًا
 
             time.sleep(PER_REQUEST_GAP_SEC)
 
-        elapsed = time.time() - loop_start
-        if SCAN_INTERVAL_SEC - elapsed > 0:
+        elapsed = time.time() - start
+        if SCAN_INTERVAL_SEC > elapsed:
             time.sleep(SCAN_INTERVAL_SEC - elapsed)
 
 # =========================
@@ -369,7 +364,7 @@ def decide_and_alert():
             r5m = float(c.cv.get("r5m", 0.0))
             r20 = c.r_change(20)
             if r5m >= CHASE_R5M_MAX and r20 < CHASE_R20_MIN:
-                continue
+                continue  # تمدد متعب — لا نطارد
 
             r40  = c.r_change(40)
             dd60 = recent_dd_pct(c, 60)
@@ -403,8 +398,8 @@ def monitor_loop():
             decide_and_alert()
             if int(time.time()) % 30 == 0:
                 with room_lock:
-                    filled = sum(1 for c in room.values() if len(c.buf) >= 2)
-                print(f"[MONITOR] buffers ok {filled}/{len(room)}")
+                    ok = sum(1 for c in room.values() if len(c.buf) >= 2)
+                print(f"[MONITOR] buffers ok {ok}/{len(room)}")
         except Exception as e:
             print("[MONITOR] error:", e)
         time.sleep(TICK_SEC)
