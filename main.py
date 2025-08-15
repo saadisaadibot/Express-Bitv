@@ -15,47 +15,94 @@ import requests, redis
 from flask import Flask, request, jsonify
 
 # ============================================================
-# 🔧 إعدادات
+# 🔧 إعدادات عامة (قابلة للتعديل من هنا فقط)
 # ============================================================
 BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
 PER_REQUEST_GAP_SEC  = 0.09
 PRICE_RETRIES        = 3
 
-ROOM_CAP             = 24
-ALERT_TOP_N          = 10
-GLOBAL_ALERT_GAP     = 15   # خفّف رشّ الإطلاق بدون تضييع فرص
+ROOM_CAP             = int(os.getenv("ROOM_CAP", "24"))
+ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", "10"))
+GLOBAL_ALERT_GAP     = float(os.getenv("GLOBAL_ALERT_GAP", "15"))  # ثوانٍ
 
 TICK_SEC             = 1.0
 SCAN_INTERVAL_SEC    = 2.0
 
-TTL_MIN              = 30
-SPREAD_MAX_BP        = 100        # 1.0%
-ALERT_COOLDOWN_SEC   = 300
+TTL_MIN              = int(os.getenv("TTL_MIN", "30"))
+SPREAD_MAX_BP        = float(os.getenv("SPREAD_MAX_BP", "100"))   # 1.0%
+ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
 
 # مطاردة
-CHASE_R5M_MAX        = 5.0
-CHASE_R20_MIN        = 0.02       # 20s
+CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", "5.0"))
+CHASE_R20_MIN        = float(os.getenv("CHASE_R20_MIN", "0.02"))  # 20s
 
-# ===== حواجز أمان إضافية =====
-MIN_SCORE            = 1.0   # % حد أدنى لـ r5 + 0.7*r10
-MIN_R5               = 0.6   # % حد أدنى لخمسة دقائق
-MIN_R10              = 0.4   # % حد أدنى لعشر دقائق
-FIRE_ONCE_PER_COIN   = True  # إطلاق مرة/رمز حتى يبرد
-COOL_RESET_R20S      = 0.15  # لازم r20s ينزل تحتها لنعيد التسليح
-TELEGRAM_ON_FIRE     = True  # أرسل تفاصيل القرار على تيليغرام
+# ===== حواجز أمان أساسية (إذا عطّلت الديناميكي) =====
+MIN_SCORE_BASE       = float(os.getenv("MIN_SCORE_BASE", "1.0"))  # r5 + 0.7*r10
+MIN_R5_BASE          = float(os.getenv("MIN_R5_BASE", "0.6"))
+MIN_R10_BASE         = float(os.getenv("MIN_R10_BASE", "0.4"))
+MIN_VOLZ_BASE        = float(os.getenv("MIN_VOLZ_BASE", "0.0"))
 
-# عتبات أساسية (تُعدّل حسب الوضع)
-NUDGE_R20_BASE       = 0.20       # 20s
-NUDGE_R40_BASE       = 0.28       # 40s
-BREAKOUT_BP_BASE     = 15.0       # bp (~0.15%)
-DD60_MAX_BASE        = 0.35       # %
+# 🔁 ديناميكي حسب الوضع (فعّال افتراضياً)
+USE_DYNAMIC_GUARDS   = os.getenv("USE_DYNAMIC_GUARDS", "1") not in ("0","false","False")
+MIN_GUARDS = {
+    # يمكنك تغيير الأرقام هنا أو عبر ENV بالأسفل
+    "BULL":    {"score": float(os.getenv("BULL_SCORE", "0.8")),
+                "r5":    float(os.getenv("BULL_R5",    "0.5")),
+                "r10":   float(os.getenv("BULL_R10",   "0.3")),
+                "volZ":  float(os.getenv("BULL_VOLZ",  "0.0"))},
+    "NEUTRAL": {"score": float(os.getenv("NEUT_SCORE", "1.4")),
+                "r5":    float(os.getenv("NEUT_R5",    "0.9")),
+                "r10":   float(os.getenv("NEUT_R10",   "0.5")),
+                "volZ":  float(os.getenv("NEUT_VOLZ",  "0.0"))},
+    "BEAR":    {"score": float(os.getenv("BEAR_SCORE", "2.0")),
+                "r5":    float(os.getenv("BEAR_R5",    "1.0")),
+                "r10":   float(os.getenv("BEAR_R10",   "0.6")),
+                "volZ":  float(os.getenv("BEAR_VOLZ",  "0.3"))},
+}
+
+# شرط تسارع
+REQUIRE_ACCEL        = os.getenv("REQUIRE_ACCEL", "1") not in ("0","false","False")
+ACCEL_MIN_R40        = float(os.getenv("ACCEL_MIN_R40", "0.0"))   # r40s يجب ألا يكون سالباً
+
+# تشديد الـ preburst حسب الوضع
+PREBURST_TUNING = {
+    # زيادة على عتبات nudge و/أو اختراق بالـ bp
+    "BULL":    {"nudge20_add": float(os.getenv("PB_BULL_N20_ADD", "-0.02")),
+                "nudge40_add": float(os.getenv("PB_BULL_N40_ADD", "-0.03")),
+                "breakout_bp": float(os.getenv("PB_BULL_BRK_BP",  "18.0"))},  # ~0.18%
+    "NEUTRAL": {"nudge20_add": float(os.getenv("PB_NEUT_N20_ADD", "-0.02")),
+                "nudge40_add": float(os.getenv("PB_NEUT_N40_ADD", "-0.03")),
+                "breakout_bp": float(os.getenv("PB_NEUT_BRK_BP",  "20.0"))},
+    "BEAR":    {"nudge20_add": float(os.getenv("PB_BEAR_N20_ADD", "0.10")),   # تشدد
+                "nudge40_add": float(os.getenv("PB_BEAR_N40_ADD", "0.12")),
+                "breakout_bp": float(os.getenv("PB_BEAR_BRK_BP",  "35.0"))},  # ~0.35%
+}
+
+# Fire-once + إعادة التسليح
+FIRE_ONCE_PER_COIN   = os.getenv("FIRE_ONCE_PER_COIN", "1") not in ("0","false","False")
+COOL_RESET_R20S      = float(os.getenv("COOL_RESET_R20S", "0.15"))
+
+# تيليغرام عند الإطلاق
+TELEGRAM_ON_FIRE     = os.getenv("TELEGRAM_ON_FIRE", "1") not in ("0","false","False")
+
+# ميزانية تنبيهات بالدقيقة (للحد من الرش)
+MAX_FIRES_PER_MIN    = int(os.getenv("MAX_FIRES_PER_MIN", "3"))
+
+# عتبات أساسية (تُعدّل حسب الوضع) — الخاصة بإشارات nudge/breakout/dd
+NUDGE_R20_BASE       = float(os.getenv("NUDGE_R20_BASE", "0.20"))
+NUDGE_R40_BASE       = float(os.getenv("NUDGE_R40_BASE", "0.28"))
+BREAKOUT_BP_BASE     = float(os.getenv("BREAKOUT_BP_BASE", "15.0"))  # bp
+DD60_MAX_BASE        = float(os.getenv("DD60_MAX_BASE", "0.35"))
 
 ADAPT_THRESHOLDS = {
     "BULL": {
-        "NUDGE_R20": 0.22, "NUDGE_R40": 0.32,
-        "BREAKOUT_BP": 18.0, "DD60_MAX": 0.30,
-        "CHASE_R5M_MAX": 3.5, "CHASE_R20_MIN": 0.05,
+        "NUDGE_R20": float(os.getenv("BULL_N20", "0.22")),
+        "NUDGE_R40": float(os.getenv("BULL_N40", "0.32")),
+        "BREAKOUT_BP": float(os.getenv("BULL_BRK", "18.0")),
+        "DD60_MAX": float(os.getenv("BULL_DD60", "0.30")),
+        "CHASE_R5M_MAX": float(os.getenv("BULL_CHASE_R5", "3.5")),
+        "CHASE_R20_MIN": float(os.getenv("BULL_CHASE_R20", "0.05")),
     },
     "NEUTRAL": {
         "NUDGE_R20": NUDGE_R20_BASE, "NUDGE_R40": NUDGE_R40_BASE,
@@ -63,9 +110,12 @@ ADAPT_THRESHOLDS = {
         "CHASE_R5M_MAX": CHASE_R5M_MAX, "CHASE_R20_MIN": CHASE_R20_MIN,
     },
     "BEAR": {
-        "NUDGE_R20": 0.28, "NUDGE_R40": 0.40,
-        "BREAKOUT_BP": 25.0, "DD60_MAX": 0.25,
-        "CHASE_R5M_MAX": 2.5, "CHASE_R20_MIN": 0.06,
+        "NUDGE_R20": float(os.getenv("BEAR_N20", "0.28")),
+        "NUDGE_R40": float(os.getenv("BEAR_N40", "0.40")),
+        "BREAKOUT_BP": float(os.getenv("BEAR_BRK", "25.0")),
+        "DD60_MAX": float(os.getenv("BEAR_DD60", "0.25")),
+        "CHASE_R5M_MAX": float(os.getenv("BEAR_CHASE_R5", "2.5")),
+        "CHASE_R20_MIN": float(os.getenv("BEAR_CHASE_R20", "0.06")),
     },
 }
 
@@ -287,7 +337,7 @@ def live_r_change(market, coin: Coin, seconds: int) -> float:
     return val
 
 # -----------------------------
-# جلب الأسعار (عنيد + بدائل) — كما كانت (لا تغييرات هنا)
+# جلب الأسعار (لا تغييرات هنا)
 # -----------------------------
 _last_candle_fetch = {}
 
@@ -457,6 +507,7 @@ def market_mode_snapshot():
 # -----------------------------
 last_global_alert = 0.0
 fired_symbols = {}  # market -> {"armed": True/False, "last_fire": ts}
+_fire_ts = deque(maxlen=20)  # ميزانية إطلاق بالدقيقة
 
 def _format_fire_msg(sym, mode, rank, score, r5, r10, r20s, r40s, dd60, bp_spread, hi60ex_bp):
     parts = [
@@ -466,6 +517,13 @@ def _format_fire_msg(sym, mode, rank, score, r5, r10, r20s, r40s, dd60, bp_sprea
         f"DD60 {dd60:+.2f}%  Breakout>{hi60ex_bp:.1f}bp  Spread≈{bp_spread:.0f}bp"
     ]
     return " | ".join(parts)
+
+def _min_guards_for_mode(mode: str):
+    if USE_DYNAMIC_GUARDS:
+        g = MIN_GUARDS.get(mode, MIN_GUARDS["NEUTRAL"])
+        return g["score"], g["r5"], g["r10"], g["volZ"]
+    # static fallback
+    return MIN_SCORE_BASE, MIN_R5_BASE, MIN_R10_BASE, MIN_VOLZ_BASE
 
 def decide_and_alert():
     global last_global_alert
@@ -485,7 +543,7 @@ def decide_and_alert():
         top_n = scored[:max(0, ALERT_TOP_N)]
         ranks = {m: i+1 for i, (_,_,_,m,_) in enumerate(scored)}  # rank لكل سوق
 
-    # وضع السوق
+    # وضع السوق + عتباته
     mode, mm = market_mode_snapshot()
     th = ADAPT_THRESHOLDS.get(mode, ADAPT_THRESHOLDS["NEUTRAL"])
     dyn_NUDGE_R20     = th["NUDGE_R20"]
@@ -495,22 +553,32 @@ def decide_and_alert():
     dyn_CHASE_R5M_MAX = th["CHASE_R5M_MAX"]
     dyn_CHASE_R20_MIN = th["CHASE_R20_MIN"]
 
+    # حواجز دنيا (ديناميكي/ثابت)
+    min_score, min_r5, min_r10, min_volz = _min_guards_for_mode(mode)
+
     for score, r5_live, r10_live, m, c in top_n:
         if nowt < c.silent_until:
             continue
-
-        # حد أدنى للـ TopN
-        if (score < MIN_SCORE) or (r5_live < MIN_R5) or (r10_live < MIN_R10):
+        if c.last_price is None:
             continue
 
         # كولداون عالمي
         if nowt - last_global_alert < GLOBAL_ALERT_GAP:
             continue
-        if c.last_price is None:
+
+        # حواجز دنيا على الزخم اللحظي
+        if (score < min_score) or (r5_live < min_r5) or (r10_live < min_r10):
             continue
 
-        # منع المطاردة: r5 عالي بدون زخم 20s كافي
+        # فلتر فوليوم من CV المُرسل من A
+        vz = float((c.cv or {}).get("volZ", 0.0))
+        if vz < min_volz:
+            continue
+
+        # r20s للمطاردة + تسارع
         r20s = live_r_change(m, c, 20) or 0.0
+
+        # منع المطاردة: r5 عالي بدون زخم 20s
         if r5_live >= dyn_CHASE_R5M_MAX and r20s < dyn_CHASE_R20_MIN:
             continue
 
@@ -521,12 +589,13 @@ def decide_and_alert():
                 fired_symbols[m] = {"armed": True, "last_fire": 0.0}
             else:
                 if not st.get("armed", True):
+                    # لازم يبرد: r20s تحت العتبة
                     if r20s >= COOL_RESET_R20S:
                         continue
                     else:
                         st["armed"] = True  # أعِد التسليح بعد البرود
 
-        # إشارات قصيرة فقط للقرار
+        # إشارات قصيرة للقرار
         r40s   = c.r_change_local(40) or 0.0
         dd60   = recent_dd_pct_local(c, 60)
         hi60ex = recent_high_excl_last(c, 60, exclude_last_sec=2)
@@ -534,18 +603,34 @@ def decide_and_alert():
         if price_now is None or hi60ex is None:
             continue
 
+        # شرط تسارع اختياري
+        if REQUIRE_ACCEL:
+            if not (r20s >= r40s and r40s >= ACCEL_MIN_R40):
+                continue
+
+        # اختراق ونَجدة
         breakout_ok = (price_now > hi60ex * (1.0 + dyn_BREAKOUT_BP/10000.0))
         nudge_ok    = (r20s >= dyn_NUDGE_R20 and r40s >= dyn_NUDGE_R40)
         dd_ok       = (dd60 <= dyn_DD60_MAX)
 
+        # تشديد/تخفيف preburst حسب الوضع
         preburst = bool((c.cv or {}).get("preburst", False))
         if preburst:
-            nudge_ok    = (r20s >= max(0.0, dyn_NUDGE_R20-0.02) and r40s >= max(0.0, dyn_NUDGE_R40-0.03))
-            breakout_ok = (price_now > hi60ex * 1.0012)  # ~12 bp
+            tune = PREBURST_TUNING.get(mode, PREBURST_TUNING["NEUTRAL"])
+            nudge_ok    = (r20s >= (dyn_NUDGE_R20 + tune["nudge20_add"]) and
+                           r40s >= (dyn_NUDGE_R40 + tune["nudge40_add"]))
+            req_bp = max(dyn_BREAKOUT_BP, tune["breakout_bp"])
+            breakout_ok = (price_now > hi60ex * (1.0 + req_bp/10000.0))
 
         if not (nudge_ok and breakout_ok and dd_ok):
             continue
         if not spread_ok(m):
+            continue
+
+        # ميزانية: حد أقصى بالدقيقة
+        while _fire_ts and nowt - _fire_ts[0] > 60:
+            _fire_ts.popleft()
+        if len(_fire_ts) >= MAX_FIRES_PER_MIN:
             continue
 
         # تفاصيل للعرض
@@ -561,8 +646,9 @@ def decide_and_alert():
         c.last_alert_at = nowt
         last_global_alert = nowt
         saqar_buy(sym)
+        _fire_ts.append(nowt)
 
-        # أرسل تفاصيل القرار على تيليغرام
+        # رسالة تيليغرام مفصّلة
         if TELEGRAM_ON_FIRE:
             msg = _format_fire_msg(
                 sym=sym, mode=mode, rank=rank, score=score,
