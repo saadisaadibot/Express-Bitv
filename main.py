@@ -24,13 +24,13 @@ PRICE_RETRIES        = 3
 
 ROOM_CAP             = int(os.getenv("ROOM_CAP", "24"))
 ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", "10"))
-GLOBAL_ALERT_GAP     = float(os.getenv("GLOBAL_ALERT_GAP", "15"))  # ثوانٍ
+GLOBAL_ALERT_GAP     = float(os.getenv("GLOBAL_ALERT_GAP", "12"))  # ثوانٍ
 
 TICK_SEC             = 1.0
 SCAN_INTERVAL_SEC    = 2.0
 
 TTL_MIN              = int(os.getenv("TTL_MIN", "30"))
-SPREAD_MAX_BP        = float(os.getenv("SPREAD_MAX_BP", "100"))   # 1.0%
+SPREAD_MAX_BP        = float(os.getenv("SPREAD_MAX_BP", "70"))   # 1.0%
 ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
 
 # مطاردة
@@ -55,9 +55,9 @@ MIN_GUARDS = {
                 "r5":    float(os.getenv("NEUT_R5",    "0.9")),
                 "r10":   float(os.getenv("NEUT_R10",   "0.5")),
                 "volZ":  float(os.getenv("NEUT_VOLZ",  "0.0"))},
-    "BEAR":    {"score": float(os.getenv("BEAR_SCORE", "2.0")),
-                "r5":    float(os.getenv("BEAR_R5",    "1.0")),
-                "r10":   float(os.getenv("BEAR_R10",   "0.6")),
+    "BEAR":    {"score": float(os.getenv("BEAR_SCORE", "2.2")),
+                "r5":    float(os.getenv("BEAR_R5",    "1.2")),
+                "r10":   float(os.getenv("BEAR_R10",   "0.7")),
                 "volZ":  float(os.getenv("BEAR_VOLZ",  "0.3"))},
 }
 
