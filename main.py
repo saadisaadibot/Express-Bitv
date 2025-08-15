@@ -410,7 +410,7 @@ def analyzer():
 # =========================
 # 📥 Webhook تيليجرام (أوامر خفيفة)
 # =========================
-@app.route("/tg", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     data = request.json
     if not data or "message" not in data:
