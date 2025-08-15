@@ -151,26 +151,54 @@ def get_rank_from_bitvavo(coin):
     return rank_map.get(coin, 999)
 
 def build_status_text():
+    def pct_change_from_lookback(dq, lookback_sec, now_ts):
+        """
+        يحسب تغير النسبة من نقطة قبل lookback_sec تقريبًا (نأخذ أقدم سعر >= lookback_sec).
+        يرجّع 0.0 إذا ما توفرت نقطة مرجعية.
+        """
+        if not dq:
+            return 0.0
+        cur = dq[-1][1]
+        old = None
+        for ts, pr in reversed(dq):
+            if now_ts - ts >= lookback_sec:
+                old = pr
+                break
+        if old and old > 0:
+            return (cur - old) / old * 100.0
+        return 0.0
+
+    def drawdown_20m(dq, now_ts):
+        """
+        أسوأ ابتعاد عن القمة خلال آخر ~20 دقيقة الحالية.
+        نأخذ أعلى سعر في النافذة ثم نحسب ابتعاد السعر الحالي عنه (%-).
+        """
+        if not dq:
+            return 0.0
+        cur = dq[-1][1]
+        # النافذة 20 دقيقة حسب تخزينك (cutoff = now - 1200)
+        mx = max(pr for ts, pr in dq if now_ts - ts <= 1200) if dq else None
+        if mx and mx > 0:
+            return (cur - mx) / mx * 100.0  # ستكون عادة سالبة (ابتعاد عن القمة)
+        return 0.0
+
     now = time.time()
     rows = []
+
+    # نرتّب لاحقاً حسب r5m نزولاً
     for c in list(watchlist):
         dq = prices[c]
         if not dq:
             continue
-        cur = dq[-1][1]
-        old = None
-        for ts, pr in reversed(dq):
-            if now - ts >= 270:   # ~5m
-                old = pr
-                break
-        if old and old > 0:
-            ch5m = (cur - old) / old * 100.0
-        else:
-            ch5m = 0.0
-        rows.append((c, ch5m, cur))
+        r1m  = pct_change_from_lookback(dq, 60,  now)
+        r5m  = pct_change_from_lookback(dq, 300, now)
+        r15m = pct_change_from_lookback(dq, 900, now)
+        dd20 = drawdown_20m(dq, now)  # غالباً قيمة سالبة
+        rank = get_rank_from_bitvavo(c)
+        rows.append((c, r1m, r5m, r15m, dd20, rank))
 
-    # رتِّب تنازليًا حسب تغير 5m
-    rows.sort(key=lambda x: x[1], reverse=True)
+    # رتّب حسب r5m تنازلياً
+    rows.sort(key=lambda x: x[2], reverse=True)
 
     lines = []
     lines.append(f"📊 غرفة المراقبة: {len(watchlist)}/{MAX_ROOM} | Heat={heat_ewma:.2f}")
@@ -178,9 +206,12 @@ def build_status_text():
         lines.append("— لا توجد بيانات كافية بعد.")
         return "\n".join(lines)
 
-    for i, (c, ch5m, cur) in enumerate(rows, 1):
-        lines.append(f"{i:02d}. {c}: {ch5m:+.2f}% (5m) | 💰{cur}")
-        if i >= 30:  # منع طول زائد
+    for i, (c, r1m, r5m, r15m, dd20, rank) in enumerate(rows, 1):
+        # مثال شكل: 01. MDT #top3 | r1m +0.40% | r5m +2.60% | r15m +4.10% | DD20 -0.8%
+        lines.append(
+            f"{i:02d}. {c} #top{rank} | r1m {r1m:+.2f}% | r5m {r5m:+.2f}% | r15m {r15m:+.2f}% | DD20 {dd20:+.2f}%"
+        )
+        if i >= 30:  # لمنع طول الرسالة
             break
 
     return "\n".join(lines)
