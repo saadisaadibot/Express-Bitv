@@ -58,15 +58,26 @@ def series_trim(buf, horizon=300):
         buf.popleft()
 
 def r_change(buf, sec):
-    if len(buf) < 2: return 0.0
+    """نسبة التغير خلال نافذة sec: تستخدم أول نقطة >= target كمرجع.
+       ترجع 0.0 إذا ما في مرجع أقدم من النافذة (منطقي لبداية التشغيل)."""
+    if len(buf) < 2:
+        return 0.0
     latest_t, latest_p = buf[-1]
     target = latest_t - sec
-    ref = buf[0][1]
+
+    # لا توجد نقاط أقدم من النافذة → لا نختلق مرجع
+    if buf[0][0] > target:
+        return 0.0
+
+    ref_p = None
     for t, p in buf:
         if t >= target:
-            ref = p; break
-        ref = p
-    return pct(latest_p, ref)
+            ref_p = p
+            break
+    if ref_p is None:
+        ref_p = buf[0][1]
+
+    return pct(latest_p, ref_p)
 
 def dd_max(buf, sec=60):
     if len(buf) < 2: return 0.0
@@ -285,6 +296,12 @@ def decide_loop():
         buf = w["buf"]
         if len(buf) < 2:
             continue
+
+        # 🔒 حارس صغير: تأكد وجود نقطة أقدم من 60s قبل الحساب/الإطلاق
+        latest_t = buf[-1][0]
+        if buf[0][0] > (latest_t - 60):
+            continue
+
         r20 = r_change(buf, 20)
         r60 = r_change(buf, 60)
         dd  = dd_max(buf, 60)
