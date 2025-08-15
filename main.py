@@ -24,7 +24,7 @@ PRICE_RETRIES        = 3
 
 ROOM_CAP             = 24
 ALERT_TOP_N          = 10
-GLOBAL_ALERT_GAP     = 7
+GLOBAL_ALERT_GAP     = 15   # خفّف رشّ الإطلاق بدون تضييع فرص
 
 TICK_SEC             = 1.0
 SCAN_INTERVAL_SEC    = 2.0
@@ -37,10 +37,18 @@ ALERT_COOLDOWN_SEC   = 300
 CHASE_R5M_MAX        = 5.0
 CHASE_R20_MIN        = 0.02       # 20s
 
+# ===== حواجز أمان إضافية =====
+MIN_SCORE            = 1.0   # % حد أدنى لـ r5 + 0.7*r10
+MIN_R5               = 0.6   # % حد أدنى لخمسة دقائق
+MIN_R10              = 0.4   # % حد أدنى لعشر دقائق
+FIRE_ONCE_PER_COIN   = True  # إطلاق مرة/رمز حتى يبرد
+COOL_RESET_R20S      = 0.15  # لازم r20s ينزل تحتها لنعيد التسليح
+TELEGRAM_ON_FIRE     = True  # أرسل تفاصيل القرار على تيليغرام
+
 # عتبات أساسية (تُعدّل حسب الوضع)
 NUDGE_R20_BASE       = 0.20       # 20s
 NUDGE_R40_BASE       = 0.28       # 40s
-BREAKOUT_BP_BASE     = 15.0        # bp
+BREAKOUT_BP_BASE     = 15.0       # bp (~0.15%)
 DD60_MAX_BASE        = 0.35       # %
 
 ADAPT_THRESHOLDS = {
@@ -279,7 +287,7 @@ def live_r_change(market, coin: Coin, seconds: int) -> float:
     return val
 
 # -----------------------------
-# جلب الأسعار (عنيد + بدائل) — كما كانت
+# جلب الأسعار (عنيد + بدائل) — كما كانت (لا تغييرات هنا)
 # -----------------------------
 _last_candle_fetch = {}
 
@@ -448,12 +456,22 @@ def market_mode_snapshot():
 # القرار + الإشعار
 # -----------------------------
 last_global_alert = 0.0
+fired_symbols = {}  # market -> {"armed": True/False, "last_fire": ts}
+
+def _format_fire_msg(sym, mode, rank, score, r5, r10, r20s, r40s, dd60, bp_spread, hi60ex_bp):
+    parts = [
+        f"🟢 اشترِ {sym}",
+        f"Mode: {mode} | Rank: #{rank} | Score: {score:+.2f}%",
+        f"r5 {r5:+.2f}%  r10 {r10:+.2f}%  r20s {r20s:+.2f}%  r40s {r40s:+.2f}%",
+        f"DD60 {dd60:+.2f}%  Breakout>{hi60ex_bp:.1f}bp  Spread≈{bp_spread:.0f}bp"
+    ]
+    return " | ".join(parts)
 
 def decide_and_alert():
     global last_global_alert
     nowt = time.time()
 
-    # ترتيب لحظي
+    # ترتيب لحظي + خريطة rank للعرض
     with room_lock:
         scored = []
         for m, c in room.items():
@@ -465,39 +483,51 @@ def decide_and_alert():
             scored.append((score, r5, r10, m, c))
         scored.sort(reverse=True)
         top_n = scored[:max(0, ALERT_TOP_N)]
+        ranks = {m: i+1 for i, (_,_,_,m,_) in enumerate(scored)}  # rank لكل سوق
 
     # وضع السوق
     mode, mm = market_mode_snapshot()
     th = ADAPT_THRESHOLDS.get(mode, ADAPT_THRESHOLDS["NEUTRAL"])
-    dyn_NUDGE_R20     = th["NUDGE_R20"]     # على 20s
-    dyn_NUDGE_R40     = th["NUDGE_R40"]     # على 40s
+    dyn_NUDGE_R20     = th["NUDGE_R20"]
+    dyn_NUDGE_R40     = th["NUDGE_R40"]
     dyn_BREAKOUT_BP   = th["BREAKOUT_BP"]
     dyn_DD60_MAX      = th["DD60_MAX"]
     dyn_CHASE_R5M_MAX = th["CHASE_R5M_MAX"]
-    dyn_CHASE_R20_MIN = th["CHASE_R20_MIN"] # على 20s
+    dyn_CHASE_R20_MIN = th["CHASE_R20_MIN"]
 
     for score, r5_live, r10_live, m, c in top_n:
         if nowt < c.silent_until:
             continue
 
-        # كولداون مع استثناء اختراق جديد بعد 30s
-        if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
-            hi45 = recent_high_excl_last(c, 45, exclude_last_sec=2)
-            if not (hi45 and c.last_price > hi45 * 1.0005 and (nowt - c.last_alert_at > 30)):
-                continue
+        # حد أدنى للـ TopN
+        if (score < MIN_SCORE) or (r5_live < MIN_R5) or (r10_live < MIN_R10):
+            continue
 
+        # كولداون عالمي
         if nowt - last_global_alert < GLOBAL_ALERT_GAP:
             continue
         if c.last_price is None:
             continue
 
-        # كبح مطاردة (كلّها قصيرة)
-        r20s = live_r_change(m, c, 20)  # 20s
+        # منع المطاردة: r5 عالي بدون زخم 20s كافي
+        r20s = live_r_change(m, c, 20) or 0.0
         if r5_live >= dyn_CHASE_R5M_MAX and r20s < dyn_CHASE_R20_MIN:
             continue
 
+        # fire-once لكل رمز حتى يبرد
+        st = fired_symbols.get(m)
+        if FIRE_ONCE_PER_COIN:
+            if st is None:
+                fired_symbols[m] = {"armed": True, "last_fire": 0.0}
+            else:
+                if not st.get("armed", True):
+                    if r20s >= COOL_RESET_R20S:
+                        continue
+                    else:
+                        st["armed"] = True  # أعِد التسليح بعد البرود
+
         # إشارات قصيرة فقط للقرار
-        r40s   = c.r_change_local(40)
+        r40s   = c.r_change_local(40) or 0.0
         dd60   = recent_dd_pct_local(c, 60)
         hi60ex = recent_high_excl_last(c, 60, exclude_last_sec=2)
         price_now = c.last_price
@@ -510,17 +540,40 @@ def decide_and_alert():
 
         preburst = bool((c.cv or {}).get("preburst", False))
         if preburst:
-            nudge_ok    = (r20s >= max(0.0, dyn_NUDGE_R20-0.04) and r40s >= max(0.0, dyn_NUDGE_R40-0.06))
-            breakout_ok = (price_now > hi60ex * 1.0003)
+            nudge_ok    = (r20s >= max(0.0, dyn_NUDGE_R20-0.02) and r40s >= max(0.0, dyn_NUDGE_R40-0.03))
+            breakout_ok = (price_now > hi60ex * 1.0012)  # ~12 bp
 
         if not (nudge_ok and breakout_ok and dd_ok):
             continue
         if not spread_ok(m):
             continue
 
+        # تفاصيل للعرض
+        try:
+            bp_spread = get_spread_bp_from_book(m) or 0.0
+        except Exception:
+            bp_spread = 0.0
+        hi60ex_bp = (price_now/hi60ex - 1.0) * 10000.0 if hi60ex else 0.0
+        rank = ranks.get(m, 0)
+        sym = c.symbol
+
+        # ✅ إطلاق الشراء
         c.last_alert_at = nowt
         last_global_alert = nowt
-        saqar_buy(c.symbol)
+        saqar_buy(sym)
+
+        # أرسل تفاصيل القرار على تيليغرام
+        if TELEGRAM_ON_FIRE:
+            msg = _format_fire_msg(
+                sym=sym, mode=mode, rank=rank, score=score,
+                r5=r5_live, r10=r10_live, r20s=r20s, r40s=r40s,
+                dd60=dd60, bp_spread=bp_spread, hi60ex_bp=hi60ex_bp
+            )
+            tg_send(msg)
+
+        # عطّل الرمز لحد ما يبرد (fire-once)
+        if FIRE_ONCE_PER_COIN:
+            fired_symbols[m] = {"armed": False, "last_fire": nowt}
 
 # -----------------------------
 # الحلقات (مع prune للـ TTL)
@@ -581,7 +634,6 @@ def price_poller_loop():
                 if c.entry_price is None:
                     c.entry_price = p
                 _redis_append_price(m, ts, p, c)
-
                 # ❌ لا تمديد TTL هنا — صار عبر ingest فقط
 
             time.sleep(PER_REQUEST_GAP_SEC)
