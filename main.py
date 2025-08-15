@@ -38,16 +38,16 @@ CHASE_R5M_MAX        = 5.0
 CHASE_R20_MIN        = 0.02       # 20s
 
 # عتبات أساسية (تُعدّل حسب الوضع)
-NUDGE_R20_BASE       = 0.15       # 20s
-NUDGE_R40_BASE       = 0.20       # 40s
-BREAKOUT_BP_BASE     = 3.0        # bp
-DD60_MAX_BASE        = 0.40       # %
+NUDGE_R20_BASE       = 0.20       # 20s
+NUDGE_R40_BASE       = 0.28       # 40s
+BREAKOUT_BP_BASE     = 15.0        # bp
+DD60_MAX_BASE        = 0.35       # %
 
 ADAPT_THRESHOLDS = {
     "BULL": {
-        "NUDGE_R20": 0.18, "NUDGE_R40": 0.25,
-        "BREAKOUT_BP": 3.5, "DD60_MAX": 0.25,
-        "CHASE_R5M_MAX": 3.5, "CHASE_R20_MIN": 0.04,
+        "NUDGE_R20": 0.22, "NUDGE_R40": 0.32,
+        "BREAKOUT_BP": 18.0, "DD60_MAX": 0.30,
+        "CHASE_R5M_MAX": 3.5, "CHASE_R20_MIN": 0.05,
     },
     "NEUTRAL": {
         "NUDGE_R20": NUDGE_R20_BASE, "NUDGE_R40": NUDGE_R40_BASE,
@@ -55,9 +55,9 @@ ADAPT_THRESHOLDS = {
         "CHASE_R5M_MAX": CHASE_R5M_MAX, "CHASE_R20_MIN": CHASE_R20_MIN,
     },
     "BEAR": {
-        "NUDGE_R20": 0.03, "NUDGE_R40": 0.07,
-        "BREAKOUT_BP": 2.0, "DD60_MAX": 0.60,
-        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.015,
+        "NUDGE_R20": 0.28, "NUDGE_R40": 0.40,
+        "BREAKOUT_BP": 25.0, "DD60_MAX": 0.25,
+        "CHASE_R5M_MAX": 2.5, "CHASE_R20_MIN": 0.06,
     },
 }
 
