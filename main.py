@@ -6,6 +6,7 @@ Bot B — TopN Watcher (Adaptive, Scalp-Friendly)
 - fallback سكالب عند دفع نظيف حتى لو الاختراق مو كامل
 - preburst أسهل (عتبات أدنى + اختراق 3bp)
 - طرد أضعف عنصر بالاعتماد على score بدل r5m فقط
+- فلاتر دقة إضافية: liq_rank/volZ واتجاه 10-20s ومنع مطاردة
 - دقة جلب الأسعار كما هي (لم تُمس)
 - إشعارات "صقر"، /status و /diag
 """
@@ -26,8 +27,8 @@ PRICE_RETRIES        = 3
 
 # الغرفة / إعادة الترتيب
 ROOM_CAP             = 24          # فيك ترفعها لـ 30 إذا السيرفر مرتاح
-ALERT_TOP_N          = 14          # وسّع TopN لالتقاط فرص أكثر
-GLOBAL_ALERT_GAP     = 6           # كبح عام أخف
+ALERT_TOP_N          = 10          # وسّع TopN لالتقاط فرص أكثر
+GLOBAL_ALERT_GAP     = 7           # كبح عام
 
 # حلقات
 TICK_SEC             = 1.0         # دورة قرار
@@ -36,11 +37,11 @@ SCAN_INTERVAL_SEC    = 2.0         # سحب أسعار
 # TTL وتجديد
 TTL_MIN              = 30          # بقاء الرمز بالدقائق (0 = ∞)
 SPREAD_MAX_BP        = 100         # 1.0% سبريد أقصى (مناسب للسكالب)
-ALERT_COOLDOWN_SEC   = 90          # كولداون لكل رمز (أخف)
+ALERT_COOLDOWN_SEC   = 150         # كولداون لكل رمز
 
 # قيود مطاردة (chase guard)
 CHASE_R5M_MAX        = 6.0         # r5m كبير جداً؟
-CHASE_R20_MIN        = 0.10        # لازم 0.10% دفع خلال 20s حتى ما يكون فخ
+CHASE_R20_MIN        = 0.15        # لازم ~0.15% دفع خلال 20s حتى ما يكون فخ
 
 # عتبات أساسية (ستُعدَّل حسب وضع السوق)
 NUDGE_R20_BASE       = 0.06
@@ -513,6 +514,27 @@ def decide_and_alert():
         if c.last_price is None:
             continue
 
+        # ========= فلترة سيولة/زخم خفيفة =========
+        liq_rank = int((c.cv or {}).get("liq_rank", 9999))
+        if liq_rank > 180:
+            continue
+
+        vz = float((c.cv or {}).get("volZ", 0.0))
+        if mode == "BEAR":
+            if vz < 0.20:
+                continue
+        else:  # NEUTRAL/BULL
+            if vz < 0.40:
+                continue
+
+        # ========= منع مطاردة لو طارت منذ دخول الغرفة =========
+        if c.since_entry() > 1.5:   # ارتفع 1.5% منذ دخول الغرفة
+            continue
+
+        # ========= تأكيد اتجاه قصير جداً 10-20s =========
+        if not (c.r_change_local(10) > 0 and c.r_change_local(20) > 0):
+            continue
+
         # كبح مطاردة
         r20_loc_short = c.r_change_local(20)  # 20 ثانية محلية
         if r5_live >= dyn_CHASE_R5M_MAX and r20_loc_short < dyn_CHASE_R20_MIN:
@@ -530,7 +552,14 @@ def decide_and_alert():
         if price_now is None or hi60_loc is None:
             continue
 
-        breakout_ok = (price_now > hi60_loc * (1.0 + dyn_BREAKOUT_BP/10000.0))
+        # اختراق أقوى في NEUTRAL/BULL
+        bp_req = dyn_BREAKOUT_BP
+        if mode == "NEUTRAL":
+            bp_req = max(bp_req, 3.0)  # 3bp
+        elif mode == "BULL":
+            bp_req = max(bp_req, 4.0)  # 4bp
+        breakout_ok = (price_now > hi60_loc * (1.0 + bp_req/10000.0))
+
         nudge_ok    = (r20 >= dyn_NUDGE_R20 and r40_loc >= dyn_NUDGE_R40)
         dd_ok       = (dd60_loc <= dyn_DD60_MAX)
 
@@ -541,13 +570,13 @@ def decide_and_alert():
                         r40_loc >= max(0.0, dyn_NUDGE_R40 - 0.06))
             breakout_ok = (price_now > hi60_loc * 1.0003)  # 3bp
 
-        # Fallback: دفع نظيف حتى لو ما تحقق breakout حرفياً
+        # Fallback: دفع نظيف حتى لو ما تحقق breakout حرفياً (أدق)
         scalp_fallback = (
-            r5_live  >= 0.60 and
-            r10_live >= 0.20 and
-            r40_loc  >= 0.08 and
-            r20      >= 0.04 and
-            dd60_loc <= (dyn_DD60_MAX + 0.10) and
+            r5_live  >= 0.80 and
+            r10_live >= 0.30 and
+            r40_loc  >= 0.12 and
+            r20      >= 0.08 and
+            dd60_loc <= (dyn_DD60_MAX + 0.05) and
             spread_ok(m)
         )
 
