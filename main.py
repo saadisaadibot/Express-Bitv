@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Adaptive, Scalp-Friendly)
-- ترتيب لحظي: score = r5_live + 0.7*r10_live (Redis/Buffer)
-- تكييف عتبات حسب وضع السوق (BULL / NEUTRAL / BEAR)
-- fallback سكالب عند دفع نظيف حتى لو الاختراق مو كامل
-- preburst أسهل (عتبات أدنى + اختراق 3bp)
-- طرد أضعف عنصر بالاعتماد على score بدل r5m فقط
-- فلاتر دقة إضافية: liq_rank/volZ واتجاه 10-20s ومنع مطاردة
-- دقة جلب الأسعار كما هي (لم تُمس)
-- إشعارات "صقر"، /status و /diag
+Bot B — TopN Watcher (Adaptive) — refined
+- score = r5_live + 0.7*r10_live
+- r20 = 20s (قرار), r20m = 20m (عرض)
+- اختراق 60s يستثني آخر 2s من النافذة
+- لا تمديد TTL داخل price loop (prune دوري للمنتهية)
+- spread من /book?depth=1 (مع كاش خفيف + fallback 24h)
+- نفس دقة جلب السعر الحالية (لم تُمس)
 """
 
 import os, time, threading, re
@@ -17,44 +15,39 @@ import requests, redis
 from flask import Flask, request, jsonify
 
 # ============================================================
-# 🔧 إعدادات قابلة للتعديل (عدّلها من هنا فقط)
+# 🔧 إعدادات
 # ============================================================
-# Bitvavo / HTTP
 BITVAVO_URL          = "https://api.bitvavo.com"
 HTTP_TIMEOUT         = 8.0
 PER_REQUEST_GAP_SEC  = 0.09
 PRICE_RETRIES        = 3
 
-# الغرفة / إعادة الترتيب
-ROOM_CAP             = 24          # فيك ترفعها لـ 30 إذا السيرفر مرتاح
-ALERT_TOP_N          = 10          # وسّع TopN لالتقاط فرص أكثر
-GLOBAL_ALERT_GAP     = 7           # كبح عام
+ROOM_CAP             = 24
+ALERT_TOP_N          = 10
+GLOBAL_ALERT_GAP     = 7
 
-# حلقات
-TICK_SEC             = 1.0         # دورة قرار
-SCAN_INTERVAL_SEC    = 2.0         # سحب أسعار
+TICK_SEC             = 1.0
+SCAN_INTERVAL_SEC    = 2.0
 
-# TTL وتجديد
-TTL_MIN              = 30          # بقاء الرمز بالدقائق (0 = ∞)
-SPREAD_MAX_BP        = 100         # 1.0% سبريد أقصى (مناسب للسكالب)
-ALERT_COOLDOWN_SEC   = 150         # كولداون لكل رمز
+TTL_MIN              = 30
+SPREAD_MAX_BP        = 100        # 1.0%
+ALERT_COOLDOWN_SEC   = 150
 
-# قيود مطاردة (chase guard)
-CHASE_R5M_MAX        = 6.0         # r5m كبير جداً؟
-CHASE_R20_MIN        = 0.15        # لازم ~0.15% دفع خلال 20s حتى ما يكون فخ
+# مطاردة
+CHASE_R5M_MAX        = 5.0
+CHASE_R20_MIN        = 0.02       # 20s
 
-# عتبات أساسية (ستُعدَّل حسب وضع السوق)
-NUDGE_R20_BASE       = 0.06
-NUDGE_R40_BASE       = 0.10
-BREAKOUT_BP_BASE     = 2.0         # 2bp على قمة آخر 60 ثانية محلية
-DD60_MAX_BASE        = 0.45        # سماح سحب أكبر للسكالب
+# عتبات أساسية (تُعدّل حسب الوضع)
+NUDGE_R20_BASE       = 0.06       # 20s
+NUDGE_R40_BASE       = 0.10       # 40s
+BREAKOUT_BP_BASE     = 2.0        # bp
+DD60_MAX_BASE        = 0.40       # %
 
-# تكيّف السوق — جداول العتبات حسب الوضع
 ADAPT_THRESHOLDS = {
     "BULL": {
-        "NUDGE_R20": 0.10, "NUDGE_R40": 0.16,
-        "BREAKOUT_BP": 3.0, "DD60_MAX": 0.35,
-        "CHASE_R5M_MAX": 5.0, "CHASE_R20_MIN": 0.12,
+        "NUDGE_R20": 0.12, "NUDGE_R40": 0.18,
+        "BREAKOUT_BP": 3.0, "DD60_MAX": 0.30,
+        "CHASE_R5M_MAX": 4.0, "CHASE_R20_MIN": 0.03,
     },
     "NEUTRAL": {
         "NUDGE_R20": NUDGE_R20_BASE, "NUDGE_R40": NUDGE_R40_BASE,
@@ -63,9 +56,8 @@ ADAPT_THRESHOLDS = {
     },
     "BEAR": {
         "NUDGE_R20": 0.03, "NUDGE_R40": 0.07,
-        "BREAKOUT_BP": 2.0,     # كان 0.6bp: حسّاس زيادة
-        "DD60_MAX": 0.60,
-        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.08,
+        "BREAKOUT_BP": 2.0, "DD60_MAX": 0.60,
+        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.015,
     },
 }
 
@@ -73,9 +65,7 @@ ADAPT_THRESHOLDS = {
 REDIS_MAX_SAMPLES    = 6000
 REDIS_TRIM_EVERY     = 200
 
-# ============================================================
-# .env — لا تغيّر هنا. بس ضيف القيم في ملف .env
-# ============================================================
+# .env
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
 CHAT_ID       = os.getenv("CHAT_ID", "")
 SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "")
@@ -164,7 +154,7 @@ class Coin:
         self.buf = deque(maxlen=2400)   # ~40 دقيقة على ~1s-2s
         self.last_price = None
         self.entry_price = None
-        self.silent_until = t + 1       # وورم أب قصير
+        self.silent_until = t + 1
         self.price_fail = 0
         self.insert_count = 0
 
@@ -209,14 +199,13 @@ def ensure_coin(cv):
                 if c.entry_price is None:
                     c.entry_price = p0
                 _redis_append_price(m, nowt, p0, c)
-            if TTL_MIN > 0:
-                c.expires_at = nowt + TTL_MIN*60
+            # ⚠️ لا تمديد TTL هنا — يبقى ثابتًا منذ الإنشاء
             return
 
         if len(room) >= ROOM_CAP:
-            # طرد الأضعف حسب نفس score المستخدم للترتيب
-            def _cv_score(cv):
-                return cv.get("r5m", 0.0) + 0.7*cv.get("r10m", 0.0)
+            # طرد أضعف عنصر بحسب score = r5m + 0.7*r10m من CV إن توفّر
+            def _cv_score(cv_):
+                return float(cv_.get("r5m", 0.0)) + 0.7*float(cv_.get("r10m", 0.0))
             weakest_mk, weakest_coin = min(room.items(), key=lambda kv: _cv_score(kv[1].cv))
             incoming_score = _cv_score(feat)
             if incoming_score <= _cv_score(weakest_coin.cv):
@@ -283,7 +272,6 @@ def r_change_redis(market, seconds_ago: int, last_price_now: float):
         return None
     return pct(last_price_now, base)
 
-# لحظي: r5/r10 حي (Redis → local buffer كبديل)
 def live_r_change(market, coin: Coin, seconds: int) -> float:
     val = r_change_redis(market, seconds, coin.last_price)
     if val is None:
@@ -291,7 +279,7 @@ def live_r_change(market, coin: Coin, seconds: int) -> float:
     return val
 
 # -----------------------------
-# جلب الأسعار (عنيد + بدائل) — لم يتم تعديل الدقة
+# جلب الأسعار (عنيد + بدائل) — كما كانت
 # -----------------------------
 _last_candle_fetch = {}
 
@@ -354,6 +342,213 @@ def get_price_one(market):
 
     return None
 
+# -----------------------------
+# spread من order book (+ كاش)
+# -----------------------------
+_book_cache = {}  # market -> {"ts": float, "bp": float}
+
+def get_spread_bp_from_book(market, max_age=1.5):
+    now = time.time()
+    ent = _book_cache.get(market)
+    if ent and (now - ent["ts"]) <= max_age:
+        return ent["bp"]
+    book = http_get(f"/v2/{market}/book", params={"depth": 1})
+    try:
+        if isinstance(book, dict):
+            asks = book.get("asks") or []
+            bids = book.get("bids") or []
+            ask = float(asks[0][0]) if asks else 0.0
+            bid = float(bids[0][0]) if bids else 0.0
+            if ask>0 and bid>0:
+                mid = (ask+bid)/2.0
+                bp = (ask - bid) / mid * 10000.0
+                _book_cache[market] = {"ts": now, "bp": bp}
+                return bp
+    except Exception:
+        pass
+    return None
+
+def spread_ok(market):
+    bp = get_spread_bp_from_book(market)
+    if bp is None:
+        # fallback 24h
+        data = get_24h_cached()
+        if not data: return True
+        it = next((x for x in data if x.get("market")==market), None)
+        if not it: return True
+        try:
+            bid = float(it.get("bid", 0) or 0); ask = float(it.get("ask", 0) or 0)
+            if bid<=0 or ask<=0: return True
+            mid = (ask+bid)/2.0
+            bp = (ask - bid) / mid * 10000.0
+        except Exception:
+            return True
+    return bp <= SPREAD_MAX_BP
+
+# -----------------------------
+# أدوات قرار محلية
+# -----------------------------
+def recent_high_excl_last(c: "Coin", window_sec: int, exclude_last_sec: int = 2):
+    """أعلى سعر ضمن نافذة window_sec لكن قبل آخر exclude_last_sec."""
+    if not c.buf: return None
+    t_now = c.buf[-1][0]
+    t_lo  = t_now - window_sec
+    t_hi  = t_now - max(0, exclude_last_sec)
+    vals = [p for (t,p) in c.buf if (t_lo <= t < t_hi)]
+    return max(vals) if vals else None
+
+def recent_high_local(c: "Coin", seconds: int):
+    if not c.buf: return None
+    t_now = c.buf[-1][0]
+    vals = [p for (t,p) in c.buf if t >= t_now - seconds]
+    return max(vals) if vals else None
+
+def recent_dd_pct_local(c: "Coin", seconds: int):
+    if len(c.buf) < 2: return 0.0
+    t_now = c.buf[-1][0]
+    sub = [(t,p) for (t,p) in c.buf if t >= t_now - seconds]
+    if not sub: return 0.0
+    hi = max(p for _,p in sub); last = sub[-1][1]
+    return (hi - last) / hi * 100.0
+
+# -----------------------------
+# ذكاء وضع السوق
+# -----------------------------
+def market_mode_snapshot():
+    with room_lock:
+        rows = []
+        for m, c in room.items():
+            if c.last_price is None:
+                continue
+            r60 = r_change_redis(m, 60*60, c.last_price)
+            if r60 is None: r60 = c.r_change_local(60*60)
+            r5abs = abs(live_r_change(m, c, 5*60))
+            volZ = (c.cv or {}).get("volZ", 0.0)
+            rows.append((r60, r5abs, volZ))
+
+    if not rows:
+        return "NEUTRAL", {"heat":0.0, "breadth":0.0, "vol":0.0}
+
+    weights = [max(0.0, z + 1.0) for (_,_,z) in rows]
+    r60s    = [r for (r,_,_) in rows]
+    heat = sum(w*r for w, r in zip(weights, r60s)) / max(1e-9, sum(weights))
+    breadth = sum(1 for r in r60s if r > 0) / len(r60s)
+    vol = sum(a for (_,a,_) in rows) / len(rows)
+
+    if heat > 0.30 and breadth > 0.60:
+        mode = "BULL"
+    elif heat < -0.30 and breadth < 0.40:
+        mode = "BEAR"
+    else:
+        mode = "NEUTRAL"
+
+    return mode, {"heat": heat, "breadth": breadth, "vol": vol}
+
+# -----------------------------
+# القرار + الإشعار
+# -----------------------------
+last_global_alert = 0.0
+
+def decide_and_alert():
+    global last_global_alert
+    nowt = time.time()
+
+    # ترتيب لحظي
+    with room_lock:
+        scored = []
+        for m, c in room.items():
+            if c.last_price is None:
+                continue
+            r5  = live_r_change(m, c, 5*60)
+            r10 = live_r_change(m, c,10*60)
+            score = r5 + 0.7*r10
+            scored.append((score, r5, r10, m, c))
+        scored.sort(reverse=True)
+        top_n = scored[:max(0, ALERT_TOP_N)]
+
+    # وضع السوق
+    mode, mm = market_mode_snapshot()
+    th = ADAPT_THRESHOLDS.get(mode, ADAPT_THRESHOLDS["NEUTRAL"])
+    dyn_NUDGE_R20     = th["NUDGE_R20"]     # على 20s
+    dyn_NUDGE_R40     = th["NUDGE_R40"]     # على 40s
+    dyn_BREAKOUT_BP   = th["BREAKOUT_BP"]
+    dyn_DD60_MAX      = th["DD60_MAX"]
+    dyn_CHASE_R5M_MAX = th["CHASE_R5M_MAX"]
+    dyn_CHASE_R20_MIN = th["CHASE_R20_MIN"] # على 20s
+
+    for score, r5_live, r10_live, m, c in top_n:
+        if nowt < c.silent_until:
+            continue
+
+        # كولداون مع استثناء اختراق جديد بعد 30s
+        if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
+            hi45 = recent_high_excl_last(c, 45, exclude_last_sec=2)
+            if not (hi45 and c.last_price > hi45 * 1.0005 and (nowt - c.last_alert_at > 30)):
+                continue
+
+        if nowt - last_global_alert < GLOBAL_ALERT_GAP:
+            continue
+        if c.last_price is None:
+            continue
+
+        # كبح مطاردة (كلّها قصيرة)
+        r20s = live_r_change(m, c, 20)  # 20s
+        if r5_live >= dyn_CHASE_R5M_MAX and r20s < dyn_CHASE_R20_MIN:
+            continue
+
+        # إشارات قصيرة فقط للقرار
+        r40s   = c.r_change_local(40)
+        dd60   = recent_dd_pct_local(c, 60)
+        hi60ex = recent_high_excl_last(c, 60, exclude_last_sec=2)
+        price_now = c.last_price
+        if price_now is None or hi60ex is None:
+            continue
+
+        breakout_ok = (price_now > hi60ex * (1.0 + dyn_BREAKOUT_BP/10000.0))
+        nudge_ok    = (r20s >= dyn_NUDGE_R20 and r40s >= dyn_NUDGE_R40)
+        dd_ok       = (dd60 <= dyn_DD60_MAX)
+
+        preburst = bool((c.cv or {}).get("preburst", False))
+        if preburst:
+            nudge_ok    = (r20s >= max(0.0, dyn_NUDGE_R20-0.04) and r40s >= max(0.0, dyn_NUDGE_R40-0.06))
+            breakout_ok = (price_now > hi60ex * 1.0003)
+
+        if not (nudge_ok and breakout_ok and dd_ok):
+            continue
+        if not spread_ok(m):
+            continue
+
+        c.last_alert_at = nowt
+        last_global_alert = nowt
+        saqar_buy(c.symbol)
+
+# -----------------------------
+# الحلقات (مع prune للـ TTL)
+# -----------------------------
+def prune_expired():
+    if TTL_MIN <= 0: return
+    nowt = time.time()
+    removed = []
+    with room_lock:
+        for m, c in list(room.items()):
+            if nowt >= c.expires_at:
+                room.pop(m, None); removed.append(m)
+    if removed:
+        print(f"[PRUNE] removed expired: {', '.join(removed)}")
+
+def monitor_loop():
+    while True:
+        try:
+            prune_expired()
+            decide_and_alert()
+            if int(time.time()) % 30 == 0:
+                with room_lock:
+                    ok = sum(1 for c in room.values() if len(c.buf) >= 2 and c.last_price is not None)
+                print(f"[MONITOR] buffers ok {ok}/{len(room)}")
+        except Exception as e:
+            print("[MONITOR] error:", e)
+        time.sleep(TICK_SEC)
+
 def price_poller_loop():
     while True:
         start = time.time()
@@ -387,8 +582,7 @@ def price_poller_loop():
                     c.entry_price = p
                 _redis_append_price(m, ts, p, c)
 
-                if TTL_MIN > 0 and ts >= c.expires_at:
-                    c.expires_at = ts + 120  # تمديد بسيط إذا ما زال تحت المتابعة
+                # ❌ لا تمديد TTL هنا — صار عبر ingest فقط
 
             time.sleep(PER_REQUEST_GAP_SEC)
 
@@ -397,221 +591,11 @@ def price_poller_loop():
             time.sleep(SCAN_INTERVAL_SEC - elapsed)
 
 # -----------------------------
-# أدوات قرار محلية
-# -----------------------------
-def spread_ok(market):
-    data = get_24h_cached()
-    if not data: return True
-    it = next((x for x in data if x.get("market")==market), None)
-    if not it: return True
-    try:
-        bid = float(it.get("bid", 0) or 0); ask = float(it.get("ask", 0) or 0)
-        if bid<=0 or ask<=0: return True
-        bp = (ask - bid) / ((ask+bid)/2) * 10000
-        return bp <= SPREAD_MAX_BP
-    except Exception:
-        return True
-
-def recent_high_local(c: Coin, seconds: int):
-    if not c.buf: return None
-    t_now = c.buf[-1][0]
-    vals = [p for (t,p) in c.buf if t >= t_now - seconds]
-    return max(vals) if vals else None
-
-def recent_dd_pct_local(c: Coin, seconds: int):
-    if len(c.buf) < 2: return 0.0
-    t_now = c.buf[-1][0]
-    sub = [(t,p) for (t,p) in c.buf if t >= t_now - seconds]
-    if not sub: return 0.0
-    hi = max(p for _,p in sub); last = sub[-1][1]
-    return (hi - last) / hi * 100.0
-
-# -----------------------------
-# ذكاء وضع السوق
-# -----------------------------
-def market_mode_snapshot():
-    """يحسِب وضع السوق من الغرفة الحالية."""
-    with room_lock:
-        rows = []
-        for m, c in room.items():
-            if c.last_price is None: 
-                continue
-            # r60 دقيقة (إن لم تتوفر من Redis، نfallback محلي)
-            r60 = r_change_redis(m, 60*60, c.last_price)
-            if r60 is None: r60 = c.r_change_local(60*60)
-            r5abs = abs(live_r_change(m, c, 5*60))
-            volZ = (c.cv or {}).get("volZ", 0.0)
-            rows.append((r60, r5abs, volZ))
-
-    if not rows:
-        return "NEUTRAL", {"heat":0.0, "breadth":0.0, "vol":0.0}
-
-    # heat = متوسط r60 موزونًا بـ (volZ+1)
-    weights = [max(0.0, z + 1.0) for (_,_,z) in rows]
-    r60s    = [r for (r,_,_) in rows]
-    heat = sum(w*r for w, r in zip(weights, r60s)) / max(1e-9, sum(weights))
-
-    # breadth = نسبة الرموز ذات r60>0
-    breadth = sum(1 for r in r60s if r > 0) / len(r60s)
-
-    # vol = متوسط |r5|
-    vol = sum(a for (_,a,_) in rows) / len(rows)
-
-    # قرار الوضع
-    if heat > 0.30 and breadth > 0.60:
-        mode = "BULL"
-    elif heat < -0.30 and breadth < 0.40:
-        mode = "BEAR"
-    else:
-        mode = "NEUTRAL"
-
-    return mode, {"heat": heat, "breadth": breadth, "vol": vol}
-
-# -----------------------------
-# القرار + الإشعار
-# -----------------------------
-last_global_alert = 0.0
-
-def decide_and_alert():
-    global last_global_alert
-    nowt = time.time()
-
-    # ترتيب لحظي حسب r5(5m) + 0.7*r10(10m)
-    with room_lock:
-        scored = []
-        for m, c in room.items():
-            if c.last_price is None:
-                continue
-            r5  = live_r_change(m, c, 5*60)
-            r10 = live_r_change(m, c,10*60)
-            score = r5 + 0.7*r10
-            scored.append((score, r5, r10, m, c))
-        scored.sort(reverse=True)
-        top_n = scored[:max(0, ALERT_TOP_N)]
-
-    # وضع السوق (يؤثر على العتبات)
-    mode, mm = market_mode_snapshot()
-    th = ADAPT_THRESHOLDS.get(mode, ADAPT_THRESHOLDS["NEUTRAL"])
-    dyn_NUDGE_R20     = th["NUDGE_R20"]
-    dyn_NUDGE_R40     = th["NUDGE_R40"]
-    dyn_BREAKOUT_BP   = th["BREAKOUT_BP"]
-    dyn_DD60_MAX      = th["DD60_MAX"]
-    dyn_CHASE_R5M_MAX = th["CHASE_R5M_MAX"]
-    dyn_CHASE_R20_MIN = th["CHASE_R20_MIN"]
-
-    for score, r5_live, r10_live, m, c in top_n:
-        if nowt < c.silent_until:
-            continue
-
-        # كولداون مع استثناء "اختراق جديد" بعد 30s
-        if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
-            hi45 = recent_high_local(c, 45)
-            if not (hi45 and c.last_price > hi45 * 1.0005 and (nowt - c.last_alert_at > 30)):
-                continue
-
-        if nowt - last_global_alert < GLOBAL_ALERT_GAP:
-            continue
-        if c.last_price is None:
-            continue
-
-        # ========= فلترة سيولة/زخم خفيفة =========
-        liq_rank = int((c.cv or {}).get("liq_rank", 9999))
-        if liq_rank > 180:
-            continue
-
-        vz = float((c.cv or {}).get("volZ", 0.0))
-        if mode == "BEAR":
-            if vz < 0.20:
-                continue
-        else:  # NEUTRAL/BULL
-            if vz < 0.40:
-                continue
-
-        # ========= منع مطاردة لو طارت منذ دخول الغرفة =========
-        if c.since_entry() > 1.5:   # ارتفع 1.5% منذ دخول الغرفة
-            continue
-
-        # ========= تأكيد اتجاه قصير جداً 10-20s =========
-        if not (c.r_change_local(10) > 0 and c.r_change_local(20) > 0):
-            continue
-
-        # كبح مطاردة
-        r20_loc_short = c.r_change_local(20)  # 20 ثانية محلية
-        if r5_live >= dyn_CHASE_R5M_MAX and r20_loc_short < dyn_CHASE_R20_MIN:
-            continue
-
-        # نسب أطول من Redis (None -> 0.0)
-        r20  = r_change_redis(m, 20*60,  c.last_price) or 0.0
-        r60  = r_change_redis(m, 60*60,  c.last_price) or 0.0
-        _    = r_change_redis(m,120*60,  c.last_price) or 0.0  # محفوظ للّاحق
-
-        r40_loc  = c.r_change_local(40)       # 40 ثانية محلية
-        dd60_loc = recent_dd_pct_local(c, 60) # سحب من القمة آخر 60 ثانية
-        hi60_loc = recent_high_local(c, 60)
-        price_now = c.last_price
-        if price_now is None or hi60_loc is None:
-            continue
-
-        # اختراق أقوى في NEUTRAL/BULL
-        bp_req = dyn_BREAKOUT_BP
-        if mode == "NEUTRAL":
-            bp_req = max(bp_req, 3.0)  # 3bp
-        elif mode == "BULL":
-            bp_req = max(bp_req, 4.0)  # 4bp
-        breakout_ok = (price_now > hi60_loc * (1.0 + bp_req/10000.0))
-
-        nudge_ok    = (r20 >= dyn_NUDGE_R20 and r40_loc >= dyn_NUDGE_R40)
-        dd_ok       = (dd60_loc <= dyn_DD60_MAX)
-
-        preburst = bool((c.cv or {}).get("preburst", False))
-        if preburst:
-            # مرونة أعلى عند preburst (أسهل دخول)
-            nudge_ok = (r20 >= max(0.0, dyn_NUDGE_R20 - 0.04) and
-                        r40_loc >= max(0.0, dyn_NUDGE_R40 - 0.06))
-            breakout_ok = (price_now > hi60_loc * 1.0003)  # 3bp
-
-        # Fallback: دفع نظيف حتى لو ما تحقق breakout حرفياً (أدق)
-        scalp_fallback = (
-            r5_live  >= 0.80 and
-            r10_live >= 0.30 and
-            r40_loc  >= 0.12 and
-            r20      >= 0.08 and
-            dd60_loc <= (dyn_DD60_MAX + 0.05) and
-            spread_ok(m)
-        )
-
-        if not ((nudge_ok and breakout_ok and dd_ok) or scalp_fallback):
-            continue
-        if not spread_ok(m):
-            continue
-
-        c.last_alert_at = nowt
-        last_global_alert = nowt
-        saqar_buy(c.symbol)
-
-# -----------------------------
-# الحلقات
-# -----------------------------
-def monitor_loop():
-    while True:
-        try:
-            decide_and_alert()
-            if int(time.time()) % 30 == 0:
-                with room_lock:
-                    ok = sum(1 for c in room.values() if len(c.buf) >= 2 and c.last_price is not None)
-                print(f"[MONITOR] buffers ok {ok}/{len(room)}")
-        except Exception as e:
-            print("[MONITOR] error:", e)
-        time.sleep(TICK_SEC)
-
-# -----------------------------
 # حالة وواجهات
 # -----------------------------
-def _mins(x): 
-    try:
-        return max(0, int(x // 60))
-    except Exception:
-        return 0
+def _mins(x):
+    try: return max(0, int(x // 60))
+    except Exception: return 0
 
 def build_status_text():
     mode, mm = market_mode_snapshot()
@@ -632,8 +616,9 @@ def build_status_text():
 
         scored.sort(reverse=True)
         for rank, (score, r5, r10, m, c) in enumerate(scored, start=1):
-            r20  = r_change_redis(m, 20*60,  c.last_price) or 0.0
-            r60  = r_change_redis(m, 60*60,  c.last_price) or 0.0
+            r20s = live_r_change(m, c, 20) or 0.0
+            r20m = r_change_redis(m, 20*60, c.last_price) or 0.0  # للعرض فقط
+            r60  = r_change_redis(m, 60*60, c.last_price) or 0.0
             vz   = (c.cv or {}).get("volZ", 0.0)
 
             ttl_sec = (c.expires_at - nowt) if TTL_MIN > 0 else float("inf")
@@ -641,11 +626,10 @@ def build_status_text():
             buf_min = _mins(nowt - c.entered_at)
             star = "⭐" if rank <= ALERT_TOP_N else " "
             since = c.since_entry()
-
             sym = m.split("-")[0]
             rows.append(
                 f"{rank:02d}.{star} {sym:<6} | r5 {r5:+.2f}%  r10 {r10:+.2f}%  "
-                f"r20 {r20:+.2f}%  r60 {r60:+.2f}%  "
+                f"r20s {r20s:+.2f}%  r20m {r20m:+.2f}%  r60 {r60:+.2f}%  "
                 f"منذ دخول {since:+.2f}%  volZ {vz:+.2f}  🕒{buf_min}م  ⏳{ttl_txt}"
             )
 
@@ -660,7 +644,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "TopN Watcher B (Adaptive, Scalp-Friendly) is alive ✅"
+    return "TopN Watcher B (Adaptive) — refined ✅"
 
 @app.route("/status")
 def status_http():
@@ -681,8 +665,9 @@ def diag():
                 "entry": c.entry_price, "last": c.last_price,
                 "r5": round(live_r_change(m, c, 5*60),3),
                 "r10": round(live_r_change(m, c,10*60),3),
-                "r20": round((r_change_redis(m, 20*60,  c.last_price) or 0.0),3),
-                "r60": round((r_change_redis(m, 60*60,  c.last_price) or 0.0),3),
+                "r20s": round(live_r_change(m, c, 20) or 0.0, 3),
+                "r20m": round((r_change_redis(m, 20*60,  c.last_price) or 0.0),3),
+                "r60":  round((r_change_redis(m, 60*60,  c.last_price) or 0.0),3),
             })
     return {"room": len(room), "items": out}, 200
 
