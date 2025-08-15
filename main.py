@@ -23,7 +23,7 @@ PRICE_RETRIES        = 3
 
 # الغرفة / إعادة الترتيب
 ROOM_CAP             = 24
-ALERT_TOP_N          = 10          # نرسل فقط من أفضل N بالترتيب اللحظي
+ALERT_TOP_N          = 12          # نرسل فقط من أفضل N بالترتيب اللحظي
 GLOBAL_ALERT_GAP     = 7           # حد أدنى بالثواني بين أي إشعارين (كبح عام)
 
 # حلقات
@@ -32,18 +32,18 @@ SCAN_INTERVAL_SEC    = 2.0         # سحب أسعار
 
 # TTL وتجديد
 TTL_MIN              = 30          # بقاء الرمز بالدقائق (0 = ∞)
-SPREAD_MAX_BP        = 70          # الحد الأقصى للسبريد (basis points)
-ALERT_COOLDOWN_SEC   = 150         # كولداون لكل رمز
+SPREAD_MAX_BP        = 120          # الحد الأقصى للسبريد (basis points)
+ALERT_COOLDOWN_SEC   = 120         # كولداون لكل رمز
 
 # قيود مطاردة (chase guard)
 CHASE_R5M_MAX        = 5.0         # إذا r5m كبير جداً لكن r20 ضعيف → تجاهل
 CHASE_R20_MIN        = 0.02
 
 # عتبات أساسية (ستُعدَّل حسب وضع السوق)
-NUDGE_R20_BASE       = 0.08
-NUDGE_R40_BASE       = 0.12
+NUDGE_R20_BASE       = 0.06
+NUDGE_R40_BASE       = 0.10
 BREAKOUT_BP_BASE     = 2.0         # BP على قمة آخر 60 ثانية محلية
-DD60_MAX_BASE        = 0.25        # سحب من القمة خلال 60 ثانية (%)
+DD60_MAX_BASE        = 0.40        # سحب من القمة خلال 60 ثانية (%)
 
 # تكيّف السوق — جداول العتبات حسب الوضع
 ADAPT_THRESHOLDS = {
