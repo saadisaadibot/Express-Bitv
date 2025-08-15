@@ -402,9 +402,24 @@ def stats():
 # =========================
 # 🚀 التشغيل
 # =========================
-if __name__ == "__main__":
+_started = False
+def start_workers_once():
+    global _started
+    if _started:
+        return
     Thread(target=room_refresher, daemon=True).start()
-    Thread(target=price_poller, daemon=True).start()
-    Thread(target=analyzer, daemon=True).start()
-    # ملاحظة: لو على Railway/Gunicorn، ما تستخدم app.run()
+    Thread(target=price_poller,   daemon=True).start()
+    Thread(target=analyzer,       daemon=True).start()
+    _started = True
+
+# شغّل الخيوط فور الاستيراد (يناسب Gunicorn)
+start_workers_once()
+
+# خيار إضافي: تأكيد عند أول طلب HTTP (ما بيضر)
+@app.before_request
+def _ensure_started():
+    start_workers_once()
+
+if __name__ == "__main__":
+    # تشغيل محلي فقط
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
