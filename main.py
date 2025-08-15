@@ -24,14 +24,14 @@ PRICE_RETRIES        = 3
 
 ROOM_CAP             = int(os.getenv("ROOM_CAP", "24"))
 ALERT_TOP_N          = int(os.getenv("ALERT_TOP_N", "10"))
-GLOBAL_ALERT_GAP     = float(os.getenv("GLOBAL_ALERT_GAP", "12"))  # ثوانٍ
+GLOBAL_ALERT_GAP     = float(os.getenv("GLOBAL_ALERT_GAP", "20"))  # ثوانٍ
 
 TICK_SEC             = 1.0
 SCAN_INTERVAL_SEC    = 2.0
 
 TTL_MIN              = int(os.getenv("TTL_MIN", "30"))
 SPREAD_MAX_BP        = float(os.getenv("SPREAD_MAX_BP", "70"))   # 1.0%
-ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
+ALERT_COOLDOWN_SEC   = int(os.getenv("ALERT_COOLDOWN_SEC", "600"))
 
 # مطاردة
 CHASE_R5M_MAX        = float(os.getenv("CHASE_R5M_MAX", "5.0"))
@@ -51,9 +51,9 @@ MIN_GUARDS = {
                 "r5":    float(os.getenv("BULL_R5",    "0.5")),
                 "r10":   float(os.getenv("BULL_R10",   "0.3")),
                 "volZ":  float(os.getenv("BULL_VOLZ",  "0.0"))},
-    "NEUTRAL": {"score": float(os.getenv("NEUT_SCORE", "1.4")),
-                "r5":    float(os.getenv("NEUT_R5",    "0.9")),
-                "r10":   float(os.getenv("NEUT_R10",   "0.5")),
+    "NEUTRAL": {"score": float(os.getenv("NEUT_SCORE", "2.0")),
+                "r5":    float(os.getenv("NEUT_R5",    "1.2")),
+                "r10":   float(os.getenv("NEUT_R10",   "0.8")),
                 "volZ":  float(os.getenv("NEUT_VOLZ",  "0.0"))},
     "BEAR":    {"score": float(os.getenv("BEAR_SCORE", "2.2")),
                 "r5":    float(os.getenv("BEAR_R5",    "1.2")),
@@ -63,7 +63,7 @@ MIN_GUARDS = {
 
 # شرط تسارع
 REQUIRE_ACCEL        = os.getenv("REQUIRE_ACCEL", "1") not in ("0","false","False")
-ACCEL_MIN_R40        = float(os.getenv("ACCEL_MIN_R40", "0.0"))   # r40s يجب ألا يكون سالباً
+ACCEL_MIN_R40        = float(os.getenv("ACCEL_MIN_R40", "0.15"))   # r40s يجب ألا يكون سالباً
 
 # تشديد الـ preburst حسب الوضع
 PREBURST_TUNING = {
