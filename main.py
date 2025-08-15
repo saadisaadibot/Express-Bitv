@@ -150,6 +150,41 @@ def get_rank_from_bitvavo(coin):
     rank_map = {sym:i+1 for i,(sym,_) in enumerate(scores)}
     return rank_map.get(coin, 999)
 
+def build_status_text():
+    now = time.time()
+    rows = []
+    for c in list(watchlist):
+        dq = prices[c]
+        if not dq:
+            continue
+        cur = dq[-1][1]
+        old = None
+        for ts, pr in reversed(dq):
+            if now - ts >= 270:   # ~5m
+                old = pr
+                break
+        if old and old > 0:
+            ch5m = (cur - old) / old * 100.0
+        else:
+            ch5m = 0.0
+        rows.append((c, ch5m, cur))
+
+    # رتِّب تنازليًا حسب تغير 5m
+    rows.sort(key=lambda x: x[1], reverse=True)
+
+    lines = []
+    lines.append(f"📊 غرفة المراقبة: {len(watchlist)}/{MAX_ROOM} | Heat={heat_ewma:.2f}")
+    if not rows:
+        lines.append("— لا توجد بيانات كافية بعد.")
+        return "\n".join(lines)
+
+    for i, (c, ch5m, cur) in enumerate(rows, 1):
+        lines.append(f"{i:02d}. {c}: {ch5m:+.2f}% (5m) | 💰{cur}")
+        if i >= 30:  # منع طول زائد
+            break
+
+    return "\n".join(lines)
+    
 # =========================
 # 📣 إرسال الإشعارات
 # =========================
@@ -398,6 +433,25 @@ def stats():
         "heat": round(heat_ewma, 4),
         "roomsz": len(watchlist)
     }, 200
+
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.json or {}
+    msg = data.get("message") or {}
+    text = (msg.get("text") or "").strip().lower()
+    if not text:
+        return "ok", 200
+
+    STATUS_ALIASES = {
+        "الحالة", "/status", "/stats", "شو عم تعمل", "/شو_عم_تعمل", "status"
+    }
+
+    if text in STATUS_ALIASES:
+        send_message(build_status_text())
+        return "ok", 200
+
+    # تجاهل أي رسائل أخرى
+    return "ok", 200
 
 # =========================
 # 🚀 التشغيل
