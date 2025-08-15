@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Bot B — Lite + Telegram Status + SAQAR webhook (ENV: SAQAR_WEBHOOK)
-- يرسل تلقائياً سبب الشراء إلى تيليغرام مع كل إشارة شراء.
-- يحفظ الأسعار في Redis ويقرأ مباشرةً لتعبئة نافذة r20/r60.
+- سبب الشراء إلى تيليغرام تلقائيًا.
+- أسعار مباشرة من order book (mid) لكل عملة مراقَبة.
+- حفظ الأسعار في Redis + backfill فوري لنافذة r20/r60.
 """
 
 import os, time, threading, re
@@ -14,39 +15,38 @@ from flask import Flask, request, jsonify
 # إعدادات
 # =========================
 BITVAVO = "https://api.bitvavo.com/v2"
-POLL_SEC = 2                      # فترة جلب الأسعار
-WATCH_TTL_SEC = 6 * 60            # TTL مراقبة الرمز بعد آخر ingest
-SPREAD_CHECK_EVERY_SEC = 30       # كل كم ثانية نفحص السبريد
-GLOBAL_ALERT_GAP = 20             # فاصل أدنى بين أي إشارتين
-ALERT_COOLDOWN_SEC = 120          # كولداون للرمز بعد الإطلاق
+POLL_SEC = 2
+WATCH_TTL_SEC = 6 * 60
+SPREAD_CHECK_EVERY_SEC = 30
+GLOBAL_ALERT_GAP = 20
+ALERT_COOLDOWN_SEC = 120
 
-# Spark (شرارة مبكرة)
-SPARK_R20_MIN = 0.6               # % خلال 20 ثانية
-SPARK_R60_MIN = 0.6               # % خلال 60 ثانية
-SPARK_DD60_MAX = 0.40             # % السحب الأقصى خلال 60s
-SPARK_SPREAD_MAX_BP = 100         # bp = 1.0%
-MAX_FIRES_PER_MIN = 3             # حد أقصى إشارات/دقيقة
+# Spark
+SPARK_R20_MIN = 0.6
+SPARK_R60_MIN = 0.6
+SPARK_DD60_MAX = 0.40
+SPARK_SPREAD_MAX_BP = 100
+MAX_FIRES_PER_MIN = 3
 
-# Webhooks / Tokens (من ENV)
+# ENV
 SAQAR_WEBHOOK   = os.getenv("SAQAR_WEBHOOK", "")
 TELEGRAM_TOKEN  = os.getenv("BOT_TOKEN", "")
 CHAT_ID         = os.getenv("CHAT_ID", "")
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Redis limits
-REDIS_MAX_SAMPLES = 6000          # ~ عدة ساعات بدقة ثواني
-REDIS_EXPIRE_SEC  = 6 * 3600      # احتفاظ 6 ساعات
+REDIS_MAX_SAMPLES = 6000
+REDIS_EXPIRE_SEC  = 6 * 3600
 
 # =========================
 # Helpers
 # =========================
 app = Flask(__name__)
 session = requests.Session()
-session.headers.update({"User-Agent": "BotB-Lite/1.2"})
+session.headers.update({"User-Agent": "BotB-Lite/1.3"})
 adapter = requests.adapters.HTTPAdapter(max_retries=1, pool_connections=50, pool_maxsize=50)
 session.mount("https://", adapter); session.mount("http://", adapter)
 
-# Redis client
 rds = redis.from_url(REDIS_URL, decode_responses=True)
 
 def http_get(url, params=None, timeout=8.0):
@@ -67,8 +67,6 @@ def series_trim(buf, horizon=300):
         buf.popleft()
 
 def r_change(buf, sec):
-    """نسبة التغير خلال نافذة sec: تستخدم أول نقطة >= target كمرجع.
-       ترجع 0.0 إذا ما في مرجع أقدم من النافذة (منطقي لبداية التشغيل)."""
     if len(buf) < 2:
         return 0.0
     latest_t, latest_p = buf[-1]
@@ -78,8 +76,7 @@ def r_change(buf, sec):
     ref_p = None
     for t, p in buf:
         if t >= target:
-            ref_p = p
-            break
+            ref_p = p; break
     if ref_p is None:
         ref_p = buf[0][1]
     return pct(latest_p, ref_p)
@@ -93,15 +90,14 @@ def dd_max(buf, sec=60):
     for p in sub:
         if peak is None or p > peak: peak = p
         if peak > 0:
-            d = (p - peak) / peak * 100.0  # negative
+            d = (p - peak) / peak * 100.0
             if d < worst: worst = d
     return abs(worst)
 
 def base_symbol(m): return (m or "").upper().split("-")[0]
 
 def send_message(text: str):
-    if not (TELEGRAM_TOKEN and CHAT_ID):
-        return
+    if not (TELEGRAM_TOKEN and CHAT_ID): return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=8)
@@ -109,9 +105,7 @@ def send_message(text: str):
         pass
 
 def send_buy_reason(market: str, w: dict, buf: deque, r20: float, r60: float, dd: float):
-    """يرسل شرح سبب الشراء لتلغرام فور الإطلاق."""
-    if not (TELEGRAM_TOKEN and CHAT_ID):
-        return
+    if not (TELEGRAM_TOKEN and CHAT_ID): return
     last_price = buf[-1][1]
     spread = w.get("spreadBp", "-")
     ts_txt = time.strftime("%H:%M:%S", time.localtime(time.time()))
@@ -124,41 +118,33 @@ def send_buy_reason(market: str, w: dict, buf: deque, r20: float, r60: float, dd
     send_message(text)
 
 def post_saqar(sym):
-    if not SAQAR_WEBHOOK:
-        print("[BUY]❌ SAQAR_WEBHOOK not set"); return
+    if not SAQAR_WEBHOOK: return
     try:
         payload = {"message": f"اشتري {sym.upper()}", "text": f"اشتري {sym.upper()}"}
         r = session.post(SAQAR_WEBHOOK, json=payload, timeout=8)
-        if 200 <= r.status_code < 300:
-            print(f"[BUY]✅ {sym}")
-        else:
-            print(f"[BUY]❌ {sym} {r.status_code} body={r.text[:160]}")
-    except Exception as e:
-        print("[BUY] error:", e)
+        # صامت باللوج
+    except Exception:
+        pass
 
 # ===== Redis price helpers =====
 def _rkey(mkt): return f"px:{mkt}"
 
 def redis_append_price(mkt: str, ts: float, price: float):
-    """خزّن نقطة السعر بشكل list مع trimming و expire."""
     try:
         rds.rpush(_rkey(mkt), f"{int(ts)}|{price:.12f}")
-        # تقليم
         llen = rds.llen(_rkey(mkt))
         if llen and llen > REDIS_MAX_SAMPLES:
             rds.ltrim(_rkey(mkt), -REDIS_MAX_SAMPLES, -1)
-        # انتهاء صلاحية
         rds.expire(_rkey(mkt), REDIS_EXPIRE_SEC)
     except Exception:
         pass
 
 def redis_load_recent(mkt: str, seconds: int = 300):
-    """إرجاع [(ts,price)] من آخر seconds من Redis."""
     try:
         now_s = int(time.time())
+        cutoff = now_s - int(seconds)
         arr = rds.lrange(_rkey(mkt), -REDIS_MAX_SAMPLES, -1)
         out = []
-        cutoff = now_s - int(seconds)
         for v in arr:
             if "|" not in v: continue
             ts_s, pr_s = v.split("|", 1)
@@ -170,20 +156,21 @@ def redis_load_recent(mkt: str, seconds: int = 300):
         return []
 
 def backfill_from_redis_if_needed(mkt: str, w: dict, need_window_sec: int = 60):
-    """لو الـ buf ما فيه نافذة كافية، عبّي من Redis آخر 5 دقائق."""
     try:
         buf = w["buf"]
         if not buf or buf[0][0] > (buf[-1][0] - need_window_sec):
             hist = redis_load_recent(mkt, seconds=300)
             if hist:
-                # دمج مرتب بدون تكرار
-                seen = {(int(t), float(p)) for (t,p) in buf}
-                for t, p in hist:
-                    key = (int(t), float(p))
-                    if key not in seen:
-                        buf.append((t, p))
-                buf = deque(sorted(list(buf), key=lambda x: x[0]), maxlen=3000)
-                w["buf"].clear(); w["buf"].extend(buf)
+                # merge + sort
+                merged = list(buf) + hist
+                merged.sort(key=lambda x: x[0])
+                # dedup by ts
+                ded = []
+                last_ts = None
+                for t,p in merged:
+                    if last_ts is None or t != last_ts:
+                        ded.append((t,p)); last_ts = t
+                w["buf"].clear(); w["buf"].extend(ded[-3000:])
                 series_trim(w["buf"])
     except Exception:
         pass
@@ -263,7 +250,7 @@ def ingest():
                     "cooldownUntil": 0.0,
                     "lastSpreadTs": 0.0
                 }
-                # backfill فوري من Redis لو فيه تاريخ
+                # backfill فوري
                 hist = redis_load_recent(m, seconds=300)
                 if hist:
                     for t,p in hist:
@@ -279,20 +266,34 @@ def ingest():
     return jsonify(ok=True, added=len(items), watching=len(watch))
 
 # =========================
-# Polling
+# LIVE price (book mid) + spread
 # =========================
-def get_spread_bp(mkt):
+def get_mid_from_book(mkt):
     try:
-        book = http_get(f"{BITVAVO}/{mkt}/book", params={"depth": 1})
-        asks, bids = book.get("asks") or [], book.get("bids") or []
+        book = http_get(f"{BITVAVO}/{mkt}/book", params={"depth": 1}, timeout=6.0)
+        asks = book.get("asks") or []; bids = book.get("bids") or []
         ask = float(asks[0][0]) if asks else 0.0
         bid = float(bids[0][0]) if bids else 0.0
         if ask > 0 and bid > 0:
-            mid = (ask + bid) / 2.0
-            return (ask - bid) / mid * 10000.0
-    except:
-        return None
+            return (ask + bid) / 2.0, (ask - bid) / ((ask + bid) / 2.0) * 10000.0
+    except Exception:
+        return None, None
+    return None, None
 
+_last24 = {"ts":0, "data":None}
+def get_24h_cached():
+    now = time.time()
+    if now - _last24["ts"] > 2.0:
+        try:
+            _last24["data"] = http_get(f"{BITVAVO}/ticker/24h")
+            _last24["ts"] = now
+        except Exception:
+            _last24["data"] = None
+    return _last24["data"]
+
+# =========================
+# Polling
+# =========================
 def poll_prices_loop():
     while True:
         start = time.time()
@@ -308,40 +309,45 @@ def poll_prices_loop():
                 if nowt - watch[m]["lastSeen"] > WATCH_TTL_SEC:
                     watch.pop(m, None)
 
-        # أسعار bulk
-        price_map = {}
-        try:
-            allp = http_get(f"{BITVAVO}/ticker/price")
-            if isinstance(allp, list):
-                for it in allp:
-                    price_map[it.get("market")] = float(it.get("price") or 0.0)
-        except:
-            pass
-
-        # تحديث نقاط + السبريد + حفظ Redis
+        # لكل سوق: mid + حفظ + spread
         for m in mkts:
             with lock:
                 w = watch.get(m)
             if not w: continue
 
-            p = price_map.get(m, 0.0)
-            if p and p > 0:
+            price, bp = get_mid_from_book(m)
+            if price and price > 0:
                 ts = time.time()
                 with lock:
-                    w["buf"].append((ts, p))
+                    w["buf"].append((ts, price))
                     series_trim(w["buf"])
-                redis_append_price(m, ts, p)
+                    if bp is not None: w["spreadBp"] = round(bp)
+                redis_append_price(m, ts, price)
+            else:
+                # fallback ticker/24h
+                try:
+                    tp = http_get(f"{BITVAVO}/ticker/price", params={"market": m})
+                    p = float(tp.get("price") or 0.0) if isinstance(tp, dict) else 0.0
+                    if p > 0:
+                        ts = time.time()
+                        with lock:
+                            w["buf"].append((ts, p))
+                            series_trim(w["buf"])
+                        redis_append_price(m, ts, p)
+                except Exception:
+                    pass
 
+            # فحص السبريد دوريًا فقط إذا ما جابناه مع الـ book
             need_spread = False
             with lock:
-                need_spread = (not w["lastSpreadTs"]) or (time.time() - w["lastSpreadTs"] >= SPREAD_CHECK_EVERY_SEC)
+                need_spread = (w.get("spreadBp") is None) or (time.time() - w.get("lastSpreadTs",0) >= SPREAD_CHECK_EVERY_SEC)
             if need_spread:
-                bp = get_spread_bp(m)
+                _, bp2 = get_mid_from_book(m)
                 with lock:
                     w = watch.get(m)
-                    if w:
+                    if w and bp2 is not None:
+                        w["spreadBp"] = round(bp2)
                         w["lastSpreadTs"] = time.time()
-                        if bp is not None: w["spreadBp"] = round(bp)
 
         decide_loop()
 
@@ -359,13 +365,11 @@ def decide_loop():
     for m, w in items:
         buf = w["buf"]
         if len(buf) < 2:
-            # حاول نرجّع من Redis
             backfill_from_redis_if_needed(m, w, need_window_sec=60)
             buf = w["buf"]
             if len(buf) < 2:
                 continue
 
-        # 🔒 backfill إذا النافذة ناقصة
         latest_t = buf[-1][0]
         if buf[0][0] > (latest_t - 60):
             backfill_from_redis_if_needed(m, w, need_window_sec=60)
@@ -381,13 +385,12 @@ def decide_loop():
 
         if (r20 >= SPARK_R20_MIN and r60 >= SPARK_R60_MIN and dd <= SPARK_DD60_MAX
             and spread_ok and can_fire_global and nowt >= (w.get("cooldownUntil") or 0)):
-            # ميزانية الدقيقة
             while fire_ts and nowt - fire_ts[0] > 60:
                 fire_ts.popleft()
             if len(fire_ts) < MAX_FIRES_PER_MIN:
                 fire_ts.append(nowt)
-                post_saqar(w["symbol"])                 # 1) شراء لصقر
-                send_buy_reason(m, w, buf, r20, r60, dd) # 2) سبب الشراء تيليغرام
+                post_saqar(w["symbol"])
+                send_buy_reason(m, w, buf, r20, r60, dd)
                 w["cooldownUntil"] = nowt + ALERT_COOLDOWN_SEC
 
 # =========================
@@ -412,11 +415,9 @@ def send_status_report():
         for m, w in watch.items():
             buf = w["buf"]
             if not buf:
-                # جرّب نسحب من Redis للعرض فقط
                 backfill_from_redis_if_needed(m, w, need_window_sec=60)
                 buf = w["buf"]
-            if not buf:
-                continue
+            if not buf: continue
             last = buf[-1][1]
             r20 = r_change(buf, 20)
             r60 = r_change(buf, 60)
