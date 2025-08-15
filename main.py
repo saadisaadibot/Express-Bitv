@@ -31,23 +31,23 @@ SCAN_INTERVAL_SEC    = 2.0
 
 TTL_MIN              = 30
 SPREAD_MAX_BP        = 100        # 1.0%
-ALERT_COOLDOWN_SEC   = 150
+ALERT_COOLDOWN_SEC   = 300
 
 # مطاردة
 CHASE_R5M_MAX        = 5.0
 CHASE_R20_MIN        = 0.02       # 20s
 
 # عتبات أساسية (تُعدّل حسب الوضع)
-NUDGE_R20_BASE       = 0.06       # 20s
-NUDGE_R40_BASE       = 0.10       # 40s
-BREAKOUT_BP_BASE     = 2.0        # bp
+NUDGE_R20_BASE       = 0.15       # 20s
+NUDGE_R40_BASE       = 0.20       # 40s
+BREAKOUT_BP_BASE     = 3.0        # bp
 DD60_MAX_BASE        = 0.40       # %
 
 ADAPT_THRESHOLDS = {
     "BULL": {
-        "NUDGE_R20": 0.12, "NUDGE_R40": 0.18,
-        "BREAKOUT_BP": 3.0, "DD60_MAX": 0.30,
-        "CHASE_R5M_MAX": 4.0, "CHASE_R20_MIN": 0.03,
+        "NUDGE_R20": 0.18, "NUDGE_R40": 0.25,
+        "BREAKOUT_BP": 3.5, "DD60_MAX": 0.25,
+        "CHASE_R5M_MAX": 3.5, "CHASE_R20_MIN": 0.04,
     },
     "NEUTRAL": {
         "NUDGE_R20": NUDGE_R20_BASE, "NUDGE_R40": NUDGE_R40_BASE,
