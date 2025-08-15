@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bot B — TopN Watcher (Adaptive)
-- ترتيب الغرفة لحظيًا: score = r5_live + 0.7*r10_live (Redis/Buffer)
-- ذكاء تكيّفي حسب وضع السوق (BULL / NEUTRAL / BEAR)
-- Redis history px:* (يمسح مرة واحدة عند الإقلاع)
+Bot B — TopN Watcher (Adaptive, Scalp-Friendly)
+- ترتيب لحظي: score = r5_live + 0.7*r10_live (Redis/Buffer)
+- تكييف عتبات حسب وضع السوق (BULL / NEUTRAL / BEAR)
+- fallback سكالب عند دفع نظيف حتى لو الاختراق مو كامل
+- preburst أسهل (عتبات أدنى + اختراق 3bp)
+- طرد أضعف عنصر بالاعتماد على score بدل r5m فقط
+- دقة جلب الأسعار كما هي (لم تُمس)
 - إشعارات "صقر"، /status و /diag
 """
 
@@ -22,9 +25,9 @@ PER_REQUEST_GAP_SEC  = 0.09
 PRICE_RETRIES        = 3
 
 # الغرفة / إعادة الترتيب
-ROOM_CAP             = 24
-ALERT_TOP_N          = 12          # نرسل فقط من أفضل N بالترتيب اللحظي
-GLOBAL_ALERT_GAP     = 7           # حد أدنى بالثواني بين أي إشعارين (كبح عام)
+ROOM_CAP             = 24          # فيك ترفعها لـ 30 إذا السيرفر مرتاح
+ALERT_TOP_N          = 14          # وسّع TopN لالتقاط فرص أكثر
+GLOBAL_ALERT_GAP     = 6           # كبح عام أخف
 
 # حلقات
 TICK_SEC             = 1.0         # دورة قرار
@@ -32,25 +35,25 @@ SCAN_INTERVAL_SEC    = 2.0         # سحب أسعار
 
 # TTL وتجديد
 TTL_MIN              = 30          # بقاء الرمز بالدقائق (0 = ∞)
-SPREAD_MAX_BP        = 120          # الحد الأقصى للسبريد (basis points)
-ALERT_COOLDOWN_SEC   = 120         # كولداون لكل رمز
+SPREAD_MAX_BP        = 100         # 1.0% سبريد أقصى (مناسب للسكالب)
+ALERT_COOLDOWN_SEC   = 90          # كولداون لكل رمز (أخف)
 
 # قيود مطاردة (chase guard)
-CHASE_R5M_MAX        = 5.0         # إذا r5m كبير جداً لكن r20 ضعيف → تجاهل
-CHASE_R20_MIN        = 0.02
+CHASE_R5M_MAX        = 6.0         # r5m كبير جداً؟
+CHASE_R20_MIN        = 0.10        # لازم 0.10% دفع خلال 20s حتى ما يكون فخ
 
 # عتبات أساسية (ستُعدَّل حسب وضع السوق)
 NUDGE_R20_BASE       = 0.06
 NUDGE_R40_BASE       = 0.10
-BREAKOUT_BP_BASE     = 2.0         # BP على قمة آخر 60 ثانية محلية
-DD60_MAX_BASE        = 0.40        # سحب من القمة خلال 60 ثانية (%)
+BREAKOUT_BP_BASE     = 2.0         # 2bp على قمة آخر 60 ثانية محلية
+DD60_MAX_BASE        = 0.45        # سماح سحب أكبر للسكالب
 
 # تكيّف السوق — جداول العتبات حسب الوضع
 ADAPT_THRESHOLDS = {
     "BULL": {
-        "NUDGE_R20": 0.12, "NUDGE_R40": 0.18,
-        "BREAKOUT_BP": 3.0, "DD60_MAX": 0.30,
-        "CHASE_R5M_MAX": 4.0, "CHASE_R20_MIN": 0.03,
+        "NUDGE_R20": 0.10, "NUDGE_R40": 0.16,
+        "BREAKOUT_BP": 3.0, "DD60_MAX": 0.35,
+        "CHASE_R5M_MAX": 5.0, "CHASE_R20_MIN": 0.12,
     },
     "NEUTRAL": {
         "NUDGE_R20": NUDGE_R20_BASE, "NUDGE_R40": NUDGE_R40_BASE,
@@ -59,8 +62,9 @@ ADAPT_THRESHOLDS = {
     },
     "BEAR": {
         "NUDGE_R20": 0.03, "NUDGE_R40": 0.07,
-        "BREAKOUT_BP": 0.6, "DD60_MAX": 0.60,
-        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.015,
+        "BREAKOUT_BP": 2.0,     # كان 0.6bp: حسّاس زيادة
+        "DD60_MAX": 0.60,
+        "CHASE_R5M_MAX": 7.0, "CHASE_R20_MIN": 0.08,
     },
 }
 
@@ -209,8 +213,12 @@ def ensure_coin(cv):
             return
 
         if len(room) >= ROOM_CAP:
-            weakest_mk, weakest_coin = min(room.items(), key=lambda kv: kv[1].cv.get("r5m", 0.0))
-            if float(feat.get("r5m", 0.0)) <= float(weakest_coin.cv.get("r5m", 0.0)):
+            # طرد الأضعف حسب نفس score المستخدم للترتيب
+            def _cv_score(cv):
+                return cv.get("r5m", 0.0) + 0.7*cv.get("r10m", 0.0)
+            weakest_mk, weakest_coin = min(room.items(), key=lambda kv: _cv_score(kv[1].cv))
+            incoming_score = _cv_score(feat)
+            if incoming_score <= _cv_score(weakest_coin.cv):
                 return
             room.pop(weakest_mk, None)
 
@@ -282,7 +290,7 @@ def live_r_change(market, coin: Coin, seconds: int) -> float:
     return val
 
 # -----------------------------
-# جلب الأسعار (عنيد + بدائل)
+# جلب الأسعار (عنيد + بدائل) — لم يتم تعديل الدقة
 # -----------------------------
 _last_candle_fetch = {}
 
@@ -493,8 +501,13 @@ def decide_and_alert():
     for score, r5_live, r10_live, m, c in top_n:
         if nowt < c.silent_until:
             continue
+
+        # كولداون مع استثناء "اختراق جديد" بعد 30s
         if nowt - c.last_alert_at < ALERT_COOLDOWN_SEC:
-            continue
+            hi45 = recent_high_local(c, 45)
+            if not (hi45 and c.last_price > hi45 * 1.0005 and (nowt - c.last_alert_at > 30)):
+                continue
+
         if nowt - last_global_alert < GLOBAL_ALERT_GAP:
             continue
         if c.last_price is None:
@@ -523,11 +536,22 @@ def decide_and_alert():
 
         preburst = bool((c.cv or {}).get("preburst", False))
         if preburst:
-            # مرونة أعلى عند preburst
-            nudge_ok = (r20 >= max(0.08, dyn_NUDGE_R20-0.04) and r40_loc >= max(0.14, dyn_NUDGE_R40-0.06))
-            breakout_ok = (price_now > hi60_loc * 1.0003)
+            # مرونة أعلى عند preburst (أسهل دخول)
+            nudge_ok = (r20 >= max(0.0, dyn_NUDGE_R20 - 0.04) and
+                        r40_loc >= max(0.0, dyn_NUDGE_R40 - 0.06))
+            breakout_ok = (price_now > hi60_loc * 1.0003)  # 3bp
 
-        if not (nudge_ok and breakout_ok and dd_ok):
+        # Fallback: دفع نظيف حتى لو ما تحقق breakout حرفياً
+        scalp_fallback = (
+            r5_live  >= 0.60 and
+            r10_live >= 0.20 and
+            r40_loc  >= 0.08 and
+            r20      >= 0.04 and
+            dd60_loc <= (dyn_DD60_MAX + 0.10) and
+            spread_ok(m)
+        )
+
+        if not ((nudge_ok and breakout_ok and dd_ok) or scalp_fallback):
             continue
         if not spread_ok(m):
             continue
@@ -583,7 +607,6 @@ def build_status_text():
             r60  = r_change_redis(m, 60*60,  c.last_price) or 0.0
             vz   = (c.cv or {}).get("volZ", 0.0)
 
-            # عرض بالدقائق:
             ttl_sec = (c.expires_at - nowt) if TTL_MIN > 0 else float("inf")
             ttl_txt = "∞" if TTL_MIN == 0 else f"{_mins(ttl_sec)}م"
             buf_min = _mins(nowt - c.entered_at)
@@ -592,7 +615,7 @@ def build_status_text():
 
             sym = m.split("-")[0]
             rows.append(
-                f"{rank:02d}.{star} {sym:<5} | r5 {r5:+.2f}%  r10 {r10:+.2f}%  "
+                f"{rank:02d}.{star} {sym:<6} | r5 {r5:+.2f}%  r10 {r10:+.2f}%  "
                 f"r20 {r20:+.2f}%  r60 {r60:+.2f}%  "
                 f"منذ دخول {since:+.2f}%  volZ {vz:+.2f}  🕒{buf_min}م  ⏳{ttl_txt}"
             )
@@ -608,7 +631,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "TopN Watcher B (Adaptive) is alive ✅"
+    return "TopN Watcher B (Adaptive, Scalp-Friendly) is alive ✅"
 
 @app.route("/status")
 def status_http():
