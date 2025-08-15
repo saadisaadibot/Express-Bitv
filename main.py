@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot B — Lite + Telegram Status + SAQAR webhook (ENV: SAQAR_WEBHOOK)
+- يرسل تلقائياً سبب الشراء إلى تيليغرام مع كل إشارة شراء.
 """
 
 import os, time, threading, re
@@ -82,6 +83,30 @@ def dd_max(buf, sec=60):
 
 def base_symbol(m): return (m or "").upper().split("-")[0]
 
+def send_message(text: str):
+    if not (TELEGRAM_TOKEN and CHAT_ID):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=8)
+    except Exception:
+        pass  # نتجنب لوج مزعج
+
+def send_buy_reason(market: str, w: dict, buf: deque, r20: float, r60: float, dd: float):
+    """يرسل شرح سبب الشراء لتلغرام فور الإطلاق."""
+    if not (TELEGRAM_TOKEN and CHAT_ID):
+        return
+    last_price = buf[-1][1]
+    spread = w.get("spreadBp", "-")
+    ts_txt = time.strftime("%H:%M:%S", time.localtime(time.time()))
+    text = (
+        f"🧾 سبب شراء {market}:\n"
+        f"💰 السعر {last_price:.6f}\n"
+        f"r20 {r20:+.2f}% | r60 {r60:+.2f}% | DD60 {dd:+.2f}%\n"
+        f"spread {spread}bp | ⏱ {ts_txt}"
+    )
+    send_message(text)
+
 def post_saqar(sym):
     if not SAQAR_WEBHOOK:
         print("[BUY]❌ SAQAR_WEBHOOK not set"); return
@@ -95,15 +120,6 @@ def post_saqar(sym):
             print(f"[BUY]❌ {sym} {r.status_code} body={r.text[:160]}")
     except Exception as e:
         print("[BUY] error:", e)
-
-def send_message(text):
-    if not (TELEGRAM_TOKEN and CHAT_ID): 
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        session.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=8)
-    except Exception as e:
-        print("[TG] error:", e)
 
 # =========================
 # حالة داخلية
@@ -201,7 +217,7 @@ def get_spread_bp(mkt):
         if ask > 0 and bid > 0:
             mid = (ask + bid) / 2.0
             return (ask - bid) / mid * 10000.0
-    except: 
+    except:
         return None
 
 def poll_prices_loop():
@@ -259,7 +275,7 @@ def poll_prices_loop():
             time.sleep(POLL_SEC - elapsed)
 
 # =========================
-# Logic (Spark فقط)
+# Logic (Spark فقط) + سبب الشراء لتلغرام
 # =========================
 def decide_loop():
     nowt = time.time()
@@ -267,7 +283,7 @@ def decide_loop():
         items = list(watch.items())
     for m, w in items:
         buf = w["buf"]
-        if len(buf) < 2: 
+        if len(buf) < 2:
             continue
         r20 = r_change(buf, 20)
         r60 = r_change(buf, 60)
@@ -282,7 +298,11 @@ def decide_loop():
                 fire_ts.popleft()
             if len(fire_ts) < MAX_FIRES_PER_MIN:
                 fire_ts.append(nowt)
+                # 1) أرسل أمر الشراء لصقر
                 post_saqar(w["symbol"])
+                # 2) أرسل سبب الشراء لتلغرام فوراً
+                send_buy_reason(m, w, buf, r20, r60, dd)
+                # 3) كولداون للرمز
                 w["cooldownUntil"] = nowt + ALERT_COOLDOWN_SEC
 
 # =========================
@@ -307,7 +327,7 @@ def send_status_report():
         rows = []
         for m, w in watch.items():
             buf = w["buf"]
-            if not buf: 
+            if not buf:
                 continue
             last = buf[-1][1]
             r20 = r_change(buf, 20)
