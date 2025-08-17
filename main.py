@@ -14,7 +14,7 @@ app = Flask(__name__)
 SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))        # كل كم ثانية نقرأ الأسعار
 BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180)) # كل كم ثانية نحدّث الغرفة
 MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))            # حجم غرفة المراقبة
-RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))         # لا إشعار إلا إذا Top N عند الإرسال
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 18))         # لا إشعار إلا إذا Top N عند الإرسال
 
 # أنماط الإشعار الأساسية (قبل التكييف)
 BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))    # نمط top10: 1% + 1%
