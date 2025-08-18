@@ -33,7 +33,7 @@ GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))  # مهلة إح�
 
 # --- انحياز 24h بسيط (بدون تغيير منطق الجمع/الإشعار) ---
 DAILY_EASE_MAX_24H   = float(os.getenv("DAILY_EASE_MAX_24H", 5.0))   # إذا d24 ≤ هذا → تسهيل
-DAILY_TIGHT_MIN_24H  = float(os.getenv("DAILY_TIGHT_MIN_24H", 28.0)) # إذا d24 ≥ هذا → تصعيب
+DAILY_TIGHT_MIN_24H  = float(os.getenv("DAILY_TIGHT_MIN_24H", 25.0)) # إذا d24 ≥ هذا → تصعيب
 EASE_M_FACTOR        = float(os.getenv("EASE_M_FACTOR", 0.85))       # m_local = m * 0.85
 TIGHT_M_FACTOR       = float(os.getenv("TIGHT_M_FACTOR", 1.20))      # m_local = m * 1.20
 
