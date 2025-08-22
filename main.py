@@ -501,7 +501,7 @@ def telegram_webhook():
 # 🚀 التشغيل
 # =========================
 _started = False
-#def start_workers_once():
+def start_workers_once():
     global _started
     if _started:
         return
