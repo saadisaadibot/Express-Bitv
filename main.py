@@ -168,7 +168,7 @@ def get_5m_top_symbols(limit=MAX_ROOM):
         # نحافظ على 20 دقيقة تقريبًا
         cutoff = now - 1200
         while dq and dq[0][0] < cutoff:
-            dq.pop(0)
+            dq.popleft()  # ✅ الصحيح مع deque
 
     changes.sort(key=lambda x: x[1], reverse=True)
     return [c[0] for c in changes[:limit]]
