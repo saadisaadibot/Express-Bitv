@@ -11,31 +11,47 @@ app = Flask(__name__)
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))       # كل كم ثانية نقرأ الأسعار
-BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))# كل كم ثانية نحدّث الغرفة
-MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))           # حجم غرفة المراقبة
-RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))        # لا إشعار إلا إذا Top N عند الإرسال
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))        # كل كم ثانية نقرأ الأسعار
+BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180)) # كل كم ثانية نحدّث الغرفة
+MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))            # حجم غرفة المراقبة
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))         # لا إشعار إلا إذا Top N عند الإرسال
 
 # أنماط الإشعار الأساسية (قبل التكييف)
-BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))   # نمط top10: 1% + 1%
-BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")    # نمط top1: 2% ثم 1% ثم 2% خلال 5 دقائق
-SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))    # نافذة النمط القوي (ثواني)
-STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))   # نافذة 1% + 1% (ثواني)
+BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))    # نمط top10: 1% + 1%
+BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")     # نمط top1: 2% ثم 1% ثم 2% خلال 5 دقائق
+SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))     # نافذة النمط القوي (ثواني)
+STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))    # نافذة 1% + 1% (ثواني)
 
 # تكييف حسب حرارة السوق
-HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120)) # نقيس الحرارة عبر آخر دقيقتين
-HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))    # كم % خلال 60 ث لنحسبها حركة
-HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))     # EWMA لنعومة الحرارة
+HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))  # نقيس الحرارة عبر آخر دقيقتين
+HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))     # كم % خلال 60 ث لنحسبها حركة
+HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))      # EWMA لنعومة الحرارة
 
 # منع السبام
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))  # كولداون لكل عملة
-GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))  # مهلة إحماء بعد التشغيل
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))   # كولداون لكل عملة
+GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))   # مهلة إحماء بعد التشغيل
 
-# --- انحياز 24h بسيط (بدون تغيير منطق الجمع/الإشعار) ---
+# --- انحياز 24h بسيط ---
 DAILY_EASE_MAX_24H   = float(os.getenv("DAILY_EASE_MAX_24H", 5.0))   # إذا d24 ≤ هذا → تسهيل
 DAILY_TIGHT_MIN_24H  = float(os.getenv("DAILY_TIGHT_MIN_24H", 25.0)) # إذا d24 ≥ هذا → تصعيب
-EASE_M_FACTOR        = float(os.getenv("EASE_M_FACTOR", 0.70))       # m_local = m * 0.85
+EASE_M_FACTOR        = float(os.getenv("EASE_M_FACTOR", 0.70))       # m_local = m * 0.70
 TIGHT_M_FACTOR       = float(os.getenv("TIGHT_M_FACTOR", 1.20))      # m_local = m * 1.20
+
+# === عتبات Exploder Score ===
+TH_TOP1              = float(os.getenv("TH_TOP1", 70.0))         # شرط إضافي لنمط top1
+TH_TOP10             = float(os.getenv("TH_TOP10", 62.0))        # شرط إضافي لنمط top10
+
+# دفتر الأوامر — حدود سيولة/سبريد عامة (تُستخدم داخل السكور)
+OB_MAX_SPREAD_BP     = float(os.getenv("OB_MAX_SPREAD_BP", 60.0))
+OB_MIN_BID_EUR_REF   = float(os.getenv("OB_MIN_BID_EUR_REF", 500.0)) # مرجع لتطبيع السيولة
+OB_CACHE_SEC         = int(os.getenv("OB_CACHE_SEC", 5))
+
+# كاش الشموع
+CANDLES_CACHE_SEC    = int(os.getenv("CANDLES_CACHE_SEC", 10))
+
+# تصفية عملات "وهمية"/مستقرة (اختياري)
+EXCLUDE_STABLES      = int(os.getenv("EXCLUDE_STABLES", 1))
+STABLE_SET = {"USDT","USDC","DAI","TUSD","FDUSD","EUR","EURS","USDe","PYUSD","XAUT"}
 
 # توصيلات
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
@@ -54,8 +70,10 @@ last_alert = {}                         # coin -> ts
 heat_ewma = 0.0                         # حرارة السوق الملسّاة
 start_time = time.time()
 
-# كاش تغيّر 24h
-_daily24_cache = {}  # coin -> {"pct": float, "ts": epoch}
+# كاش تغيّر 24h / الشموع / دفتر الأوامر
+_daily24_cache = {}   # coin -> {"pct": float, "ts": epoch}
+_candles_cache = {}   # (coin, interval) -> {"data": list, "ts": epoch}
+_ob_cache      = {}   # market -> {"data": dict, "ts": epoch}
 
 # =========================
 # 🛰️ دوال مساعدة (Bitvavo)
@@ -96,7 +114,6 @@ def get_daily_change_pct(coin):
     if resp and resp.status_code == 200:
         try:
             data = resp.json()
-            # قد تكون "priceChangePercentage"
             pct = float(data.get("priceChangePercentage", 0.0))
         except Exception:
             pass
@@ -105,9 +122,9 @@ def get_daily_change_pct(coin):
 
 def get_5m_top_symbols(limit=MAX_ROOM):
     """
-    نجمع أفضل العملات بفريم 5m اعتمادًا على الشموع (فرق الإغلاق الحالي عن إغلاق قبل 5m).
+    نجمع أفضل العملات بفريم 5m اعتمادًا على السلسلة المحلية (فرق الإغلاق الحالي عن إغلاق قبل ~5m).
+    نعتمد فقط أسواق EUR وبحالة trading، ونستبعد العملات المستقرة (اختياري).
     """
-    # نجلب كل الأسواق مقابل اليورو
     resp = http_get(f"{BASE_URL}/markets")
     if not resp or resp.status_code != 200:
         return []
@@ -116,14 +133,17 @@ def get_5m_top_symbols(limit=MAX_ROOM):
     try:
         markets = resp.json()
         for m in markets:
-            if m.get("quote") == "EUR" and m.get("status") == "trading":
-                base = m.get("base")
-                if base and base.isalpha() and len(base) <= 6:
-                    symbols.append(base)
+            if m.get("quote") != "EUR" or m.get("status") != "trading":
+                continue
+            base = m.get("base")
+            if not base or not base.isalpha() or len(base) > 6:
+                continue
+            if EXCLUDE_STABLES and base.upper() in STABLE_SET:
+                continue
+            symbols.append(base)
     except Exception:
         pass
 
-    # نحسب تغيّر 5m بالاعتماد على سعر الآن وسعر محفوظ قبل ~300ث
     now = time.time()
     changes = []
     for base in symbols:
@@ -145,18 +165,18 @@ def get_5m_top_symbols(limit=MAX_ROOM):
 
         # حدّث السلسلة
         dq.append((now, cur))
-        # نحافظ على 15 دقيقة تقريبًا
-        cutoff = now - 900
+        # نحافظ على 20 دقيقة تقريبًا
+        cutoff = now - 1200
         while dq and dq[0][0] < cutoff:
-            dq.popleft()
+            dq.pop(0)
 
     changes.sort(key=lambda x: x[1], reverse=True)
     return [c[0] for c in changes[:limit]]
 
 def get_rank_from_bitvavo(coin):
     """
-    يحسب ترتيب العملة لحظيًا ضمن Top حسب تغيّر 5m المحلي (من deque).
-    إذا ما قدر يحدده، يرجع رقم كبير (خارج التوب).
+    ترتيب العملة لحظيًا ضمن Top حسب تغيّر 5m المحلي.
+    إذا ما قدر يحدده، يرجع 999.
     """
     now = time.time()
     scores = []
@@ -167,19 +187,56 @@ def get_rank_from_bitvavo(coin):
             if now - ts >= 270:
                 old = pr
                 break
-        cur = prices[c][-1][1] if dq else get_price(c)
+        cur = dq[-1][1] if dq else get_price(c)
         if cur is None:
             continue
-        if old:
-            ch = (cur - old) / old * 100.0
-        else:
-            ch = 0.0
+        ch = ((cur - old) / old * 100.0) if old else 0.0
         scores.append((c, ch))
 
     scores.sort(key=lambda x: x[1], reverse=True)
     rank_map = {sym:i+1 for i,(sym,_) in enumerate(scores)}
     return rank_map.get(coin, 999)
 
+# =========================
+# 📚 دفتر أوامر + ميزاته (مع كاش)
+# =========================
+def fetch_orderbook(market):
+    now = time.time()
+    rec = _ob_cache.get(market)
+    if rec and now - rec["ts"] < OB_CACHE_SEC:
+        return rec["data"]
+    resp = http_get(f"{BASE_URL}/{market}/book", timeout=6)
+    if not resp or resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+        if data and data.get("bids") and data.get("asks"):
+            _ob_cache[market] = {"data": data, "ts": now}
+            return data
+    except Exception:
+        pass
+    return None
+
+def ob_features(market):
+    """
+    يرجّع dict: {spread_bp, bid_eur, imb}
+    """
+    ob = fetch_orderbook(market)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return None
+    try:
+        bid_p, bid_q = float(ob["bids"][0][0]), float(ob["bids"][0][1])
+        ask_p, ask_q = float(ob["asks"][0][0]), float(ob["asks"][0][1])
+    except Exception:
+        return None
+    spread_bp = (ask_p - bid_p) / ((ask_p + bid_p)/2.0) * 10000.0
+    bid_eur   = bid_p * bid_q
+    imb       = bid_q / max(1e-9, ask_q)
+    return {"spread_bp": spread_bp, "bid_eur": bid_eur, "imb": imb}
+
+# =========================
+# 🧾 نص الحالة
+# =========================
 def build_status_text():
     def pct_change_from_lookback(dq, lookback_sec, now_ts):
         if not dq:
@@ -212,7 +269,7 @@ def build_status_text():
         r1m  = pct_change_from_lookback(dq, 60,  now)
         r5m  = pct_change_from_lookback(dq, 300, now)
         r15m = pct_change_from_lookback(dq, 900, now)
-        dd20 = drawdown_20m(dq, now)  # غالباً سالبة
+        dd20 = drawdown_20m(dq, now)
         rank = get_rank_from_bitvavo(c)
         rows.append((c, r1m, r5m, r15m, dd20, rank))
 
@@ -231,7 +288,7 @@ def build_status_text():
             break
 
     return "\n".join(lines)
-    
+
 # =========================
 # 📣 إرسال الإشعارات
 # =========================
@@ -257,7 +314,7 @@ def notify_buy(coin, tag, change_text=None):
 
     msg = f"🚀 {coin} {tag} #top{rank}"
     if change_text:
-        msg = f"🚀 {coin} {change_text} #top{rank}"
+        msg = f"🚀 {coin} {change_text} #{tag} #top{rank}"
     send_message(msg)
 
     # إلى صقر (اختياري)
@@ -269,7 +326,7 @@ def notify_buy(coin, tag, change_text=None):
             pass
 
 # =========================
-# 🔥 حساب حرارة السوق + تكييف العتبات
+# 🔥 حرارة السوق + تكييف العتبات
 # =========================
 def compute_market_heat():
     """
@@ -284,7 +341,6 @@ def compute_market_heat():
         dq = prices[c]
         if len(dq) < 2:
             continue
-        # نبحث عن سعر قبل ~60ث
         old = None
         cur = dq[-1][1]
         for ts, pr in reversed(dq):
@@ -318,7 +374,138 @@ def adaptive_multipliers():
     return m
 
 # =========================
-# 🧩 منطق الأنماط (top10 / top1)
+# 🕯️ شموع + ATR + Vol
+# =========================
+def get_candles(coin, interval="1m", limit=60):
+    """
+    يرجّع قائمة شموع [[time, open, high, low, close, volume], ...]
+    Bitvavo: GET /{market}/candles?interval=1m&limit=60
+    مع كاش بسيط لتخفيف الضغط.
+    """
+    now = time.time()
+    key = (coin, interval)
+    rec = _candles_cache.get(key)
+    if rec and now - rec["ts"] < CANDLES_CACHE_SEC:
+        return rec["data"]
+
+    market = f"{coin}-EUR"
+    resp = http_get(f"{BASE_URL}/{market}/candles", {"interval": interval, "limit": limit}, timeout=8)
+    data = []
+    if resp and resp.status_code == 200:
+        try:
+            raw = resp.json()
+            if isinstance(raw, list):
+                data = raw
+        except Exception:
+            data = []
+    _candles_cache[key] = {"data": data, "ts": now}
+    return data
+
+def _atr(candles, n=14):
+    if len(candles) < n+1:
+        return 0.0
+    trs = []
+    prev_close = float(candles[0][4])
+    for c in candles[1:]:
+        high = float(c[2]); low = float(c[3]); close = float(c[4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+        if len(trs) >= n:
+            break
+    return (sum(trs)/len(trs)) if trs else 0.0
+
+# =========================
+# 🧨 Exploder Score
+# =========================
+def exploder_score(coin):
+    """
+    سكور (0..100) يفضّل المرشّحين لانفجار قوي:
+    - زخم 1د وتسارع قصير
+    - انفجار حجم (آخر 5د مقابل خط أساس 30د)
+    - توسع تذبذب (ATR قصير/طويل)
+    - ضغط دفتر أوامر (imb جيد, spread ضيق, سيولة معقولة)
+    - خروج من نطاق ضيق
+    """
+    now = time.time()
+    dq = prices[coin]
+    if not dq:
+        return 0.0
+
+    # r1m/r5m/r15m من deque
+    def pct_back(lb):
+        old = None; cur = dq[-1][1]
+        for ts, pr in reversed(dq):
+            if now - ts >= lb:
+                old = pr; break
+        return ((cur - old)/old*100.0) if (old and old > 0) else 0.0
+
+    r1  = pct_back(60)
+    r5  = pct_back(300)
+    r15 = pct_back(900)
+
+    # تسارع r1m: الآن مقابل r1m قبل 120ث
+    r1_old = 0.0
+    old_cur = None; old_old = None
+    for ts, pr in reversed(dq):
+        if now - ts >= 120:
+            old_cur = pr; break
+    if old_cur:
+        for ts, pr in reversed(dq):
+            if now - ts >= 180:
+                old_old = pr; break
+        if old_old and old_old > 0:
+            r1_old = (old_cur - old_old)/old_old*100.0
+    accel = r1 - r1_old
+
+    # شموع 1m
+    c1m = get_candles(coin, "1m", 60)
+
+    # انفجار حجم: sum آخر 5د ÷ (متوسط 30د * 5)
+    vol5 = sum(float(c[5]) for c in c1m[-5:]) if len(c1m) >= 5 else 0.0
+    vol30 = (sum(float(c[5]) for c in c1m[-30:]) / 30.0) if len(c1m) >= 30 else 0.0
+    vol_spike = (vol5 / (vol30*5.0)) if (vol30 and vol30 > 0) else 0.0  # baseline 5 دقائق
+
+    # توسّع التذبذب: ATR قصير ÷ طويل
+    atr_short = _atr(c1m[-20:], n=14) if len(c1m) >= 20 else 0.0
+    atr_long  = _atr(c1m[-60:], n=14) if len(c1m) >= 60 else (atr_short or 1.0)
+    vol_expansion = (atr_short/atr_long) if atr_long > 0 else 0.0
+
+    # نطاق ضيق 30د ثم اختراق إيجابي
+    def range_pct(candles, n):
+        if len(candles) < n: return 0.0
+        hi = max(float(c[2]) for c in candles[-n:])
+        lo = min(float(c[3]) for c in candles[-n:])
+        mid = (hi+lo)/2.0
+        return ((hi-lo)/mid*100.0) if mid>0 else 0.0
+    rng30 = range_pct(c1m, 30)
+    tight_then_break = 1.0 if (rng30 <= 0.8 and r5 >= 1.0) else 0.0
+
+    # دفتر الأوامر
+    feats = ob_features(f"{coin}-EUR") or {"spread_bp":9999, "bid_eur":0, "imb":0}
+    spread_ok = 1.0 if feats["spread_bp"] <= OB_MAX_SPREAD_BP else 0.0
+    liq_ok    = min(1.0, feats["bid_eur"]/OB_MIN_BID_EUR_REF)  # ≥ مرجع → 1.0
+    imb_ok    = min(1.0, feats["imb"]/2.0)                      # 2.0 → 1.0
+
+    # عقوبة لو r15 سلبي قوي (خطر ارتداد)
+    penalty = -10.0 if r15 <= -2.0 else 0.0
+
+    score = (
+        22.0 * max(0.0, min(1.5, r1/1.5)) +     # زخم 1م
+        18.0 * max(0.0, min(1.5, accel/1.5)) +  # تسارع
+        22.0 * max(0.0, min(2.0, vol_spike)) +  # انفجار حجم
+        14.0 * max(0.0, min(2.0, vol_expansion)) +
+        10.0 * tight_then_break +
+        7.0  * spread_ok +
+        5.0  * liq_ok +
+        4.0  * imb_ok +
+        penalty
+    )
+
+    return max(0.0, min(100.0, score))
+
+# =========================
+# 🧩 أنماط (top10 / top1) كما هي
 # =========================
 def check_top10_pattern(coin, m):
     """
@@ -403,7 +590,6 @@ def room_refresher():
                     watchlist.add(s)
                 # نحافظ على الحجم الأقصى
                 if len(watchlist) > MAX_ROOM:
-                    # نُبقي الأقوى (حسب آخر قراءة تغيّر 5m)
                     ranked = sorted(list(watchlist), key=lambda c: get_rank_from_bitvavo(c))
                     watchlist.clear()
                     for c in ranked[:MAX_ROOM]:
@@ -443,21 +629,24 @@ def analyzer():
                 syms = list(watchlist)
 
             for s in syms:
-                # ===== انحياز 24h: فقط تعديل المَعْدل m_local، لا تغيير بالمنطق =====
+                # انحياز 24h ← يؤثر فقط على الم عامل الأنماط (مش على السكور)
                 d24 = get_daily_change_pct(s)
                 m_local = m
                 if d24 <= DAILY_EASE_MAX_24H:
-                    m_local = m * EASE_M_FACTOR      # تسهيل للعملات المنخفضة/الهادئة
+                    m_local = m * EASE_M_FACTOR
                 elif d24 >= DAILY_TIGHT_MIN_24H:
-                    m_local = m * TIGHT_M_FACTOR     # تصعيب للعملات المنفوخة يوميًا
+                    m_local = m * TIGHT_M_FACTOR
 
-                # نمط top1 أولًا (أقوى)
-                if check_top1_pattern(s, m_local):
-                    notify_buy(s, tag="top1")
+                # احسب Exploder Score
+                score = exploder_score(s)
+
+                # نسمح بالإشعار فقط إذا تحقق النمط **وال** سكور ≥ العتبة
+                if check_top1_pattern(s, m_local) and score >= TH_TOP1:
+                    notify_buy(s, tag="top1", change_text=f"🔥 Exploder {score:.0f}")
                     continue
-                # ثم top10
-                if check_top10_pattern(s, m_local):
-                    notify_buy(s, tag="top10")
+
+                if check_top10_pattern(s, m_local) and score >= TH_TOP10:
+                    notify_buy(s, tag="top10", change_text=f"⚡ Exploder {score:.0f}")
         except Exception as e:
             print("analyzer error:", e)
 
