@@ -11,8 +11,8 @@ app = Flask(__name__)
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 5))       # كل كم ثانية نقرأ الأسعار
-BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))# كل كم ثانية نحدّث الغرفة
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 2))       # كل كم ثانية نقرأ الأسعار
+BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 60))# كل كم ثانية نحدّث الغرفة
 MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))           # حجم غرفة المراقبة
 RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))        # لا إشعار إلا إذا Top N عند الإرسال
 
@@ -29,7 +29,7 @@ HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))     # EWMA لنعو�
 
 # منع السبام
 BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))  # كولداون لكل عملة
-GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))  # مهلة إحماء بعد التشغيل
+GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 10))  # مهلة إحماء بعد التشغيل
 
 # توصيلات
 BOT_TOKEN            = os.getenv("BOT_TOKEN")
