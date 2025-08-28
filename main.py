@@ -51,9 +51,9 @@ EASE_M_FACTOR        = float(os.getenv("EASE_M_FACTOR", 0.70))
 TIGHT_M_FACTOR       = float(os.getenv("TIGHT_M_FACTOR", 1.20))
 
 # عتبات Exploder
-TH_TOP1              = float(os.getenv("TH_TOP1", 70.0))
-TH_TOP10             = float(os.getenv("TH_TOP10", 62.0))
-TH_PRE               = float(os.getenv("TH_PRE", 54.0))            # حد أدنى لإشارة pre
+TH_TOP1              = float(os.getenv("TH_TOP1", 60.0))
+TH_TOP10             = float(os.getenv("TH_TOP10", 50.0))
+TH_PRE               = float(os.getenv("TH_PRE", 40.0))            # حد أدنى لإشارة pre
 
 # دفتر الأوامر
 OB_MAX_SPREAD_BP     = float(os.getenv("OB_MAX_SPREAD_BP", 60.0))
