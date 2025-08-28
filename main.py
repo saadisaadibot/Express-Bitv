@@ -108,15 +108,37 @@ def http_get(url, params=None, timeout=8):
             time.sleep(0.3)
     return None
 
-def get_price(symbol):
-    market = f"{symbol}-EUR"
-    resp = http_get(f"{BASE_URL}/ticker/price", {"market": market})
+# ---- Bulk price cache ----
+PX_CACHE_SEC = float(os.getenv("PX_CACHE_SEC", "1.5"))
+_px_cache = {"ts": 0.0, "map": {}}
+
+def refresh_bulk_prices():
+    resp = http_get(f"{BASE_URL}/ticker/price", timeout=6)
     if not resp or resp.status_code != 200:
-        return None
+        return False
     try:
-        return float(resp.json()["price"])
+        arr = resp.json()
+        mp = {}
+        for it in arr:
+            m = it.get("market"); p = it.get("price")
+            if not m or not p:
+                continue
+            try:
+                mp[m] = float(p)
+            except:
+                pass
+        _px_cache["ts"] = time.time()
+        _px_cache["map"] = mp
+        return True
     except Exception:
-        return None
+        return False
+
+def get_price(symbol):
+    """يقرأ السعر من كاش bulk (يُحدّث تلقائياً إذا تقادم)."""
+    now = time.time()
+    if now - _px_cache["ts"] > PX_CACHE_SEC:
+        refresh_bulk_prices()
+    return _px_cache["map"].get(f"{symbol}-EUR")
 
 def get_daily_change_pct(coin):
     now = time.time()
@@ -154,13 +176,18 @@ def get_5m_top_symbols(limit=MAX_ROOM):
 
     now = time.time()
     changes = []
+
+    # نحدّث كاش الأسعار مرة واحدة ونستخدمه
+    refresh_bulk_prices()
+    pxmap = dict(_px_cache["map"])
+
     for base in symbols:
         dq = prices[base]
         old = None
         for ts, pr in reversed(dq):
             if now - ts >= 270:
                 old = pr; break
-        cur = get_price(base)
+        cur = pxmap.get(f"{base}-EUR")
         if cur is None:
             continue
         ch = (cur - old) / old * 100.0 if old else 0.0
@@ -177,6 +204,8 @@ def get_5m_top_symbols(limit=MAX_ROOM):
 def get_rank_from_bitvavo(coin):
     now = time.time()
     scores = []
+
+    # استخدم آخر أسعار محفوظة قدر الإمكان
     for c in list(watchlist):
         dq = prices[c]
         old = None
@@ -532,13 +561,15 @@ def room_refresher():
         time.sleep(BATCH_INTERVAL_SEC)
 
 def price_poller():
-    # REST fallback فقط (WS يغطي معظم الحالات)
+    # REST bulk: تحديث كل الرموز دفعة واحدة
     while True:
         now = time.time()
         with lock:
             syms = list(watchlist)
+        refresh_bulk_prices()
+        pxmap = dict(_px_cache["map"])
         for s in syms:
-            pr = get_price(s)
+            pr = pxmap.get(f"{s}-EUR")
             if pr is None:
                 continue
             dq = prices[s]
@@ -560,6 +591,11 @@ def analyzer():
                 syms = list(watchlist)
 
             for s in syms:
+                dq = prices[s]
+                # حارس ركود: تجاهل الرمز إذا آخر سعر قديم
+                if not dq or (time.time() - dq[-1][0] > max(WS_STALENESS_SEC, SCAN_INTERVAL * 2)):
+                    continue
+
                 # انحياز 24h للأنماط فقط
                 d24 = get_daily_change_pct(s)
                 m_local = m * (EASE_M_FACTOR if d24 <= DAILY_EASE_MAX_24H else (TIGHT_M_FACTOR if d24 >= DAILY_TIGHT_MIN_24H else 1.0))
@@ -575,7 +611,7 @@ def analyzer():
                     notify_buy(s, tag="top10", score=score, extra_note="⚡")
                     continue
 
-                # Pre-Exploder (مبكر): أخف شروط + حد أدنى للسكّور
+                # Pre-Exploder (مبكر)
                 if score >= TH_PRE and pre_exploder_check(s, det):
                     notify_buy(s, tag="pre", score=score, extra_note="⏳")
         except Exception as e:
@@ -631,6 +667,18 @@ def health():
 @app.route("/stats", methods=["GET"])
 def stats():
     return {"watchlist": list(watchlist), "heat": round(heat_ewma, 4), "roomsz": len(watchlist)}, 200
+
+@app.route("/debug_stale", methods=["GET"])
+def debug_stale():
+    now = time.time()
+    rows = []
+    with lock:
+        for c in list(watchlist):
+            dq = prices[c]
+            age = round(now - dq[-1][0], 2) if dq else None
+            rows.append({"coin": c, "last_age_sec": age, "points": len(dq)})
+    rows.sort(key=lambda x: (x["last_age_sec"] is None, x["last_age_sec"] or 1e9))
+    return {"stale": rows[:50], "heat": round(heat_ewma, 3)}, 200
 
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
