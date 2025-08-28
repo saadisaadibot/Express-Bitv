@@ -16,8 +16,8 @@ app = Flask(__name__)
 # =========================
 SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 2))          # REST fallback
 BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))   # تحديث الغرفة
-MAX_ROOM             = int(os.getenv("MAX_ROOM", 20))
-RANK_FILTER          = int(os.getenv("RANK_FILTER", 10))           # لا إشعار إلا إذا Top N عند الإرسال
+MAX_ROOM             = int(os.getenv("MAX_ROOM", 30))
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 15))           # لا إشعار إلا إذا Top N عند الإرسال
 
 # أنماط الإشعار الأساسية
 BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))      # نمط top10: 1% + 1%
@@ -27,12 +27,12 @@ STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))
 
 # WS و التحليل السريع
 USE_WS               = int(os.getenv("USE_WS", 1))
-WS_STALENESS_SEC     = float(os.getenv("WS_STALENESS_SEC", 2.0))
+WS_STALENESS_SEC     = float(os.getenv("WS_STALENESS_SEC", 1.0))
 ANALYZER_TICK_SEC    = float(os.getenv("ANALYZER_TICK_SEC", 0.5))  # سرعة التحليل
 
 # Booster (كسر الكولداون إذا زادت القوة بوضوح)
 BOOST_ENABLE         = int(os.getenv("BOOST_ENABLE", 1))
-BOOST_SCORE_GAP      = float(os.getenv("BOOST_SCORE_GAP", 8.0))    # قفزة سكّور لإعادة التنبيه
+BOOST_SCORE_GAP      = float(os.getenv("BOOST_SCORE_GAP", 5.0))    # قفزة سكّور لإعادة التنبيه
 BOOST_MIN_DELAY_SEC  = int(os.getenv("BOOST_MIN_DELAY_SEC", 30))   # أقل زمن بين التنبيهين
 
 # تكييف حرارة السوق
@@ -42,7 +42,7 @@ HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))
 
 # منع السبام
 BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))     # كولداون افتراضي
-GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 30))
+GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 10))
 
 # انحياز 24h
 DAILY_EASE_MAX_24H   = float(os.getenv("DAILY_EASE_MAX_24H", 5.0))
