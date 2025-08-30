@@ -14,26 +14,26 @@ app = Flask(__name__)
 # =========================
 # ⚙️ إعدادات قابلة للتعديل
 # =========================
-SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 2))          # REST fallback
-BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 180))   # تحديث الغرفة
+SCAN_INTERVAL        = int(os.getenv("SCAN_INTERVAL", 2))            # REST bulk tick
+BATCH_INTERVAL_SEC   = int(os.getenv("BATCH_INTERVAL_SEC", 45))      # كان 180
 MAX_ROOM             = int(os.getenv("MAX_ROOM", 30))
-RANK_FILTER          = int(os.getenv("RANK_FILTER", 15))           # لا إشعار إلا إذا Top N عند الإرسال
+RANK_FILTER          = int(os.getenv("RANK_FILTER", 15))             # لا إشعار إلا إذا Top N عند الإرسال (إلا إذا force)
 
 # أنماط الإشعار الأساسية
-BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))      # نمط top10: 1% + 1%
-BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")       # نمط top1: 2 → 1 → 2 خلال نافذة
+BASE_STEP_PCT        = float(os.getenv("BASE_STEP_PCT", 1.0))        # نمط top10: 1% + 1%
+BASE_STRONG_SEQ      = os.getenv("BASE_STRONG_SEQ", "2,1,2")         # نمط top1: 2 → 1 → 2 خلال نافذة
 SEQ_WINDOW_SEC       = int(os.getenv("SEQ_WINDOW_SEC", 300))
 STEP_WINDOW_SEC      = int(os.getenv("STEP_WINDOW_SEC", 180))
 
 # WS و التحليل السريع
 USE_WS               = int(os.getenv("USE_WS", 1))
 WS_STALENESS_SEC     = float(os.getenv("WS_STALENESS_SEC", 1.0))
-ANALYZER_TICK_SEC    = float(os.getenv("ANALYZER_TICK_SEC", 0.5))  # سرعة التحليل
+ANALYZER_TICK_SEC    = float(os.getenv("ANALYZER_TICK_SEC", 0.5))    # سرعة التحليل
 
 # Booster (كسر الكولداون إذا زادت القوة بوضوح)
 BOOST_ENABLE         = int(os.getenv("BOOST_ENABLE", 1))
-BOOST_SCORE_GAP      = float(os.getenv("BOOST_SCORE_GAP", 5.0))    # قفزة سكّور لإعادة التنبيه
-BOOST_MIN_DELAY_SEC  = int(os.getenv("BOOST_MIN_DELAY_SEC", 30))   # أقل زمن بين التنبيهين
+BOOST_SCORE_GAP      = float(os.getenv("BOOST_SCORE_GAP", 5.0))      # قفزة سكّور لإعادة التنبيه
+BOOST_MIN_DELAY_SEC  = int(os.getenv("BOOST_MIN_DELAY_SEC", 30))     # أقل زمن بين التنبيهين
 
 # تكييف حرارة السوق
 HEAT_LOOKBACK_SEC    = int(os.getenv("HEAT_LOOKBACK_SEC", 120))
@@ -41,33 +41,33 @@ HEAT_RET_PCT         = float(os.getenv("HEAT_RET_PCT", 0.6))
 HEAT_SMOOTH          = float(os.getenv("HEAT_SMOOTH", 0.3))
 
 # منع السبام
-BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))     # كولداون افتراضي
+BUY_COOLDOWN_SEC     = int(os.getenv("BUY_COOLDOWN_SEC", 900))       # كولداون افتراضي
 GLOBAL_WARMUP_SEC    = int(os.getenv("GLOBAL_WARMUP_SEC", 10))
 
-# انحياز 24h
+# انحياز 24h (خفّفنا التشديد)
 DAILY_EASE_MAX_24H   = float(os.getenv("DAILY_EASE_MAX_24H", 5.0))
-DAILY_TIGHT_MIN_24H  = float(os.getenv("DAILY_TIGHT_MIN_24H", 25.0))
+DAILY_TIGHT_MIN_24H  = float(os.getenv("DAILY_TIGHT_MIN_24H", 40.0))  # كان 25.0
 EASE_M_FACTOR        = float(os.getenv("EASE_M_FACTOR", 0.70))
-TIGHT_M_FACTOR       = float(os.getenv("TIGHT_M_FACTOR", 1.20))
+TIGHT_M_FACTOR       = float(os.getenv("TIGHT_M_FACTOR", 1.05))       # كان 1.20
 
 # عتبات Exploder
 TH_TOP1              = float(os.getenv("TH_TOP1", 60.0))
 TH_TOP10             = float(os.getenv("TH_TOP10", 50.0))
-TH_PRE               = float(os.getenv("TH_PRE", 40.0))            # حد أدنى لإشارة pre
+TH_PRE               = float(os.getenv("TH_PRE", 40.0))               # حد أدنى لإشارة pre
 
-# دفتر الأوامر
-OB_MAX_SPREAD_BP     = float(os.getenv("OB_MAX_SPREAD_BP", 60.0))
+# دفتر الأوامر (أوسع قليلاً للإدراجات)
+OB_MAX_SPREAD_BP     = float(os.getenv("OB_MAX_SPREAD_BP", 100.0))    # كان 60.0
 OB_MIN_BID_EUR_REF   = float(os.getenv("OB_MIN_BID_EUR_REF", 500.0))
 OB_CACHE_SEC         = int(os.getenv("OB_CACHE_SEC", 5))
 
 # كاش الشموع
 CANDLES_CACHE_SEC    = int(os.getenv("CANDLES_CACHE_SEC", 10))
 
-# Pre-Exploder (سِكويز + تسارع + حجم/دفتر أوامر)
-PRE_R10_MIN          = float(os.getenv("PRE_R10_MIN", 0.40))       # % خلال 10 ثوان
-PRE_ACCEL_MIN        = float(os.getenv("PRE_ACCEL_MIN", 0.25))     # r10 - r30
-PRE_VOLSPIKE_MIN     = float(os.getenv("PRE_VOLSPIKE_MIN", 0.5))   # vol5 / (avg30*5)
-PRE_TIGHT_RANGE_MAX  = float(os.getenv("PRE_TIGHT_RANGE_MAX", 0.8))# نطاق 30 شمعة 1m
+# Pre-Exploder (سِكويز + تسارع + حجم/دفتر أوامر) — مرنة أكثر
+PRE_R10_MIN          = float(os.getenv("PRE_R10_MIN", 0.40))          # % خلال 10 ثوان
+PRE_ACCEL_MIN        = float(os.getenv("PRE_ACCEL_MIN", 0.25))        # r10 - r30
+PRE_VOLSPIKE_MIN     = float(os.getenv("PRE_VOLSPIKE_MIN", 0.5))      # vol5 / (avg30*5)
+PRE_TIGHT_RANGE_MAX  = float(os.getenv("PRE_TIGHT_RANGE_MAX", 1.5))   # كان 0.8
 
 # تصفية المستقرة
 EXCLUDE_STABLES      = int(os.getenv("EXCLUDE_STABLES", 1))
@@ -155,25 +155,35 @@ def get_daily_change_pct(coin):
     _daily24_cache[coin] = {"pct": pct, "ts": now}
     return pct
 
-def get_5m_top_symbols(limit=MAX_ROOM):
-    resp = http_get(f"{BASE_URL}/markets")
-    if not resp or resp.status_code != 200:
-        return []
-    symbols = []
-    try:
-        markets = resp.json()
-        for m in markets:
-            if m.get("quote") != "EUR" or m.get("status") != "trading":
-                continue
-            base = m.get("base")
-            if not base or not base.isalpha() or len(base) > 6:
-                continue
-            if EXCLUDE_STABLES and base.upper() in STABLE_SET:
-                continue
-            symbols.append(base)
-    except Exception:
-        pass
+# --- كل أزواج EUR (للتغذية الشاملة) ---
+ALL_EUR = {"ts": 0.0, "syms": []}
+ALL_EUR_TTL = 600
 
+def get_all_eur_symbols():
+    now = time.time()
+    if ALL_EUR["syms"] and now - ALL_EUR["ts"] < ALL_EUR_TTL:
+        return ALL_EUR["syms"]
+    resp = http_get(f"{BASE_URL}/markets")
+    syms = []
+    if resp and resp.status_code == 200:
+        try:
+            markets = resp.json()
+            for m in markets:
+                if m.get("quote") != "EUR" or m.get("status") != "trading":
+                    continue
+                base = m.get("base")
+                if not base or not base.isalpha() or len(base) > 6:
+                    continue
+                if EXCLUDE_STABLES and base.upper() in STABLE_SET:
+                    continue
+                syms.append(base)
+        except Exception:
+            pass
+    ALL_EUR.update({"ts": now, "syms": syms})
+    return syms
+
+def get_5m_top_symbols(limit=MAX_ROOM):
+    symbols = get_all_eur_symbols()
     now = time.time()
     changes = []
 
@@ -181,20 +191,25 @@ def get_5m_top_symbols(limit=MAX_ROOM):
     refresh_bulk_prices()
     pxmap = dict(_px_cache["map"])
 
+    LOOKBACK = 120  # كان 270s
     for base in symbols:
         dq = prices[base]
+        if not dq:  # ماعنا نقاط كافية بعد
+            pr = pxmap.get(f"{base}-EUR")
+            if pr is not None:
+                dq.append((now, pr))
+            continue
+        cur = dq[-1][1]
         old = None
         for ts, pr in reversed(dq):
-            if now - ts >= 270:
+            if now - ts >= LOOKBACK:
                 old = pr; break
-        cur = pxmap.get(f"{base}-EUR")
-        if cur is None:
-            continue
-        ch = (cur - old) / old * 100.0 if old else 0.0
-        changes.append((base, ch))
+        if old and old > 0:
+            ch = (cur - old) / old * 100.0
+            changes.append((base, ch))
 
-        dq.append((now, cur))
-        cutoff = now - 1200
+        # تنظيف
+        cutoff = now - 3600
         while dq and dq[0][0] < cutoff:
             dq.popleft()
 
@@ -204,21 +219,36 @@ def get_5m_top_symbols(limit=MAX_ROOM):
 def get_rank_from_bitvavo(coin):
     now = time.time()
     scores = []
-
-    # استخدم آخر أسعار محفوظة قدر الإمكان
     for c in list(watchlist):
         dq = prices[c]
+        if not dq: 
+            continue
+        cur = dq[-1][1]
         old = None
         for ts, pr in reversed(dq):
-            if now - ts >= 270:
+            if now - ts >= 120:
                 old = pr; break
-        cur = dq[-1][1] if dq else get_price(c)
-        if cur is None:
-            continue
-        ch = ((cur - old)/old*100.0) if old else 0.0
-        scores.append((c, ch))
+        if old and old > 0:
+            ch = ((cur - old)/old*100.0)
+            scores.append((c, ch))
     scores.sort(key=lambda x: x[1], reverse=True)
     return {sym:i+1 for i,(sym,_) in enumerate(scores)}.get(coin, 999)
+
+# رتبة مؤقتة إذا خارج الغرفة (منع 999 القاتلة)
+def safe_rank(coin):
+    rk = get_rank_from_bitvavo(coin)
+    if rk != 999:
+        return rk
+    dq = prices[coin]
+    if dq and len(dq) >= 2:
+        now = time.time()
+        cur = dq[-1][1]
+        old = next((pr for ts,pr in reversed(dq) if now-ts>=120), None)
+        if old and old>0:
+            r120 = (cur-old)/old*100.0
+            if r120 >= 2.0:
+                return 1
+    return 50
 
 # =========================
 # 📚 دفتر الأوامر + ميزاته (مع كاش)
@@ -475,7 +505,7 @@ def pre_exploder_check(coin, details):
     شروط مرنة: نطاق ضيّق + تسارع قصير + حجم/OB محترم
     - r10 ≥ PRE_R10_MIN
     - accel_short = r10 - r30 ≥ PRE_ACCEL_MIN
-    - rng30 <= PRE_TIGHT_RANGE_MAX
+    - rng30 <= PRE_TIGHT_RANGE_MAX (أو نتجاهله إذا عمر الشموع قصير)
     - vol_spike ≥ PRE_VOLSPIKE_MIN (أو OB جيّد)
     """
     now = time.time()
@@ -495,10 +525,30 @@ def pre_exploder_check(coin, details):
     ob_good = (spread_bp <= OB_MAX_SPREAD_BP and bid_eur >= 0.4*OB_MIN_BID_EUR_REF and imb >= 1.1)
     vol_good = (vol_spike >= PRE_VOLSPIKE_MIN) or ob_good
 
-    return (r10 >= PRE_R10_MIN and accel_short >= PRE_ACCEL_MIN and rng30 <= PRE_TIGHT_RANGE_MAX and vol_good)
+    c1m = get_candles(coin, "1m", 60)
+    short_history = len(c1m) < 30  # إدراج/تاريخ قصير
+
+    return (r10 >= PRE_R10_MIN and accel_short >= PRE_ACCEL_MIN
+            and (short_history or rng30 <= PRE_TIGHT_RANGE_MAX)
+            and vol_good)
 
 # =========================
-# 📣 إرسال الإشعارات (مع Booster)
+# 🧲 مدخل ساخن (التقاط مبكر قبل الأنماط الثقيلة)
+# =========================
+def hot_entry(coin):
+    now = time.time()
+    dq = prices[coin]
+    if len(dq) < 6: return False
+    r60   = _pct_back_seconds(dq, 60, now)
+    r120  = _pct_back_seconds(dq, 120, now)
+    r300  = _pct_back_seconds(dq, 300, now)
+    accel = r60 - r120
+    feats = ob_features(f"{coin}-EUR") or {}
+    spread_ok = feats.get("spread_bp", 9999) <= OB_MAX_SPREAD_BP
+    return (r60 >= 1.2 and r300 >= 3.0 and accel >= 0.5 and spread_ok)
+
+# =========================
+# 📣 إرسال الإشعارات (مع Booster + Force)
 # =========================
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -510,11 +560,11 @@ def send_message(text):
     except Exception as e:
         print("Telegram error:", e)
 
-def _notify_core(coin, tag, extra):
-    rank = get_rank_from_bitvavo(coin)
-    if rank > RANK_FILTER:
+def _notify_core(coin, tag, extra, force=False):
+    rk = safe_rank(coin)  # بدّلنا لـ safe_rank
+    if (not force) and rk > RANK_FILTER:
         return False
-    msg = f"🚀 {coin} {extra} #{tag} #top{rank}"
+    msg = f"🚀 {coin} {extra} #{tag} #top{rk}"
     send_message(msg)
     if SAQAR_WEBHOOK:
         try:
@@ -536,7 +586,9 @@ def notify_buy(coin, tag, score, extra_note=""):
     if (now - la_ts < BUY_COOLDOWN_SEC) and not can_boost:
         return
 
-    ok = _notify_core(coin, tag, f"{extra_note} Exploder {score:.0f}")
+    # تجاوز فلتر #topN بحالات السكّور الصارخ
+    force = (score >= TH_TOP1 + 8)
+    ok = _notify_core(coin, tag, f"{extra_note} Exploder {score:.0f}", force=force)
     if ok:
         last_alert_ts[coin] = now
         last_alert_info[coin] = {"ts": now, "score": score, "tag": tag}
@@ -561,11 +613,10 @@ def room_refresher():
         time.sleep(BATCH_INTERVAL_SEC)
 
 def price_poller():
-    # REST bulk: تحديث كل الرموز دفعة واحدة
+    """تغذية أسعار شاملة لكل أزواج EUR (مش بس watchlist)."""
     while True:
         now = time.time()
-        with lock:
-            syms = list(watchlist)
+        syms = get_all_eur_symbols()
         refresh_bulk_prices()
         pxmap = dict(_px_cache["map"])
         for s in syms:
@@ -574,7 +625,7 @@ def price_poller():
                 continue
             dq = prices[s]
             dq.append((now, pr))
-            cutoff = now - 1200
+            cutoff = now - 3600
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
         time.sleep(SCAN_INTERVAL)
@@ -596,11 +647,16 @@ def analyzer():
                 if not dq or (time.time() - dq[-1][0] > max(WS_STALENESS_SEC, SCAN_INTERVAL * 2)):
                     continue
 
-                # انحياز 24h للأنماط فقط
+                # انحياز 24h للأنماط فقط (خفّفنا التشديد)
                 d24 = get_daily_change_pct(s)
                 m_local = m * (EASE_M_FACTOR if d24 <= DAILY_EASE_MAX_24H else (TIGHT_M_FACTOR if d24 >= DAILY_TIGHT_MIN_24H else 1.0))
 
                 score, det = exploder_score(s)
+
+                # 🔥 مدخل ساخن قبل الأنماط الثقيلة
+                if hot_entry(s):
+                    notify_buy(s, tag="hot", score=max(score, TH_PRE+5), extra_note="🚨")
+                    continue
 
                 # ترتيب الأولوية: top1 > top10 > pre
                 if check_top1_pattern(s, m_local) and score >= TH_TOP1:
@@ -647,7 +703,7 @@ def build_status_text():
         r5m  = pct_change_from_lookback(dq, 300, now)
         r15m = pct_change_from_lookback(dq, 900, now)
         dd20 = drawdown_20m(dq, now)
-        rank = get_rank_from_bitvavo(c)
+        rank = safe_rank(c)
         rows.append((c, r1m, r5m, r15m, dd20, rank))
     rows.sort(key=lambda x: x[2], reverse=True)
 
@@ -733,7 +789,7 @@ def _ws_on_message(ws, message):
             with lock:
                 dq = prices[base]
                 dq.append((now, p))
-                cutoff = now - 1200
+                cutoff = now - 3600
                 while dq and dq[0][0] < cutoff:
                     dq.popleft()
         except Exception:
