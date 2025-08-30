@@ -1,6 +1,6 @@
-gunicorn
-waitress
-Flask
-redis
+flask
 requests
+redis
 python-dotenv
+gunicorn
+websocket-client   # <— المهم
