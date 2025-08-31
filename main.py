@@ -847,8 +847,8 @@ def _ws_manager():
 # =========================
 # 🚀 التشغيل
 # =========================
-_started = False
-def start_workers_once():
+_started = #False
+#def start_workers_once():
     global _started
     if _started: return
     Thread(target=room_refresher, daemon=True).start()
