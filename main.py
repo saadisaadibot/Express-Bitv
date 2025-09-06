@@ -1,215 +1,220 @@
 # -*- coding: utf-8 -*-
 """
-Daily Accumulation & ExplodeSoon Scanner (Bitvavo EUR) — Research Mode
-- يمسح كل أزواج -EUR ببطء لكن بدقة، يُخرِج Top10 + Daily Pick لعملة مرشحة للانفجار خلال 24h.
-- لا يغيّر أي شيء في بوت التداول. فقط تحليل/تلغرام.
-
-ENV:
-  BOT_TOKEN, CHAT_ID (اختياريان لإرسال الملخص)
-  REDIS_URL (اختياري للتخزين المؤقت)
+Smart Weekly Scanner — Diplomatic + Telegram
+- /scan  → يفحص ويرسل جدول العملات المطابقة + جدول "آخر ساعة ملحوظة"
+- يدعم Webhook عبر Flask أو تشغيل مباشر من الطرفية
 """
 
-import os, time, json, math, statistics as st, traceback
-from collections import deque, defaultdict
-import requests, redis
+import os, time, math, traceback
+from datetime import datetime, timezone
+import ccxt, pandas as pd
+from tabulate import tabulate
+from dotenv import load_dotenv
 
-BASE_URL = "https://api.bitvavo.com/v2"
-HTTP_TIMEOUT = 8
+# Telegram
+import requests
+from flask import Flask, request, jsonify
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID")
-REDIS_URL = os.getenv("REDIS_URL")
-r = redis.from_url(REDIS_URL) if REDIS_URL else None
+load_dotenv()
 
-# ---------- Utils ----------
-def tg(msg):
-    if not (BOT_TOKEN and CHAT_ID): print(msg); return
+# ===== إعدادات من البيئة =====
+EXCHANGE         = os.getenv("EXCHANGE", "bitvavo").lower()
+QUOTE            = os.getenv("QUOTE", "EUR").upper()
+TIMEFRAME        = os.getenv("TIMEFRAME", "1h")
+DAYS             = int(os.getenv("DAYS", "7"))
+MIN_WEEKLY_POP   = float(os.getenv("MIN_WEEKLY_POP", "10.0"))
+SIG_1H           = float(os.getenv("SIG_1H", "2.0"))
+MAX_MARKETS      = int(os.getenv("MAX_MARKETS", "300"))
+REQUEST_SLEEP_MS = int(os.getenv("REQUEST_SLEEP_MS", "80"))
+
+# Telegram
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID      = os.getenv("CHAT_ID", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+PORT         = int(os.getenv("PORT", "8080"))
+
+# ===== Flask (Webhook) =====
+app = Flask(__name__)
+
+def make_exchange(name: str):
+    if not hasattr(ccxt, name):
+        raise ValueError(f"Exchange '{name}' غير مدعوم.")
+    klass = getattr(ccxt, name)
+    return klass({"enableRateLimit": True})
+
+def now_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def ms_days_ago(n: int):
+    return now_ms() - n * 24 * 60 * 60 * 1000
+
+def pct(a, b):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg[:4000]},
-            timeout=7
-        )
-    except Exception as e:
-        print("TG err:", e)
-
-def get(url, timeout=HTTP_TIMEOUT):
-    return requests.get(url, timeout=timeout).json()
-
-def clamp(x, lo, hi):
-    return lo if x < lo else hi if x > hi else x
-
-def pct(a,b):  # ((a/b)-1)*100
-    return ((a/b)-1.0)*100.0 if b>0 else 0.0
-
-def linreg_slope(y):
-    """انحدار خطي بسيط (slope) على لوغ السعر — بدون numpy."""
-    n = len(y)
-    if n < 3: return 0.0
-    xs = range(n)
-    xbar = (n-1)/2.0
-    ybar = sum(y)/n
-    num = sum((x-xbar)*(y[x]-ybar) for x in xs)
-    den = sum((x-xbar)*(x-xbar) for x in xs)
-    return num/den if den>0 else 0.0
-
-# ---------- Data pulls ----------
-def list_markets_eur():
-    rows = get(f"{BASE_URL}/ticker/24h")
-    mkts = []
-    if isinstance(rows, list):
-        for r0 in rows:
-            m = r0.get("market","")
-            if m.endswith("-EUR"):
-                try:
-                    last = float(r0.get("last",0) or 0)
-                    if last>0: mkts.append(m)
-                except: pass
-    return mkts
-
-def candles(market, interval="1m", limit=300):
-    try:
-        rows = get(f"{BASE_URL}/{market}/candles?interval={interval}&limit={limit}")
-        # row: [ts,open,high,low,close,volume]
-        return rows if isinstance(rows, list) else []
-    except Exception as e:
-        return []
-
-def orderbook(market, depth=3):
-    try:
-        j = get(f"{BASE_URL}/{market}/book")
-        if not j or not j.get("bids") or not j.get("asks"): return None
-        bids = [(float(p), float(q)) for p,q,*_ in j["bids"][:depth]]
-        asks = [(float(p), float(q)) for p,q,*_ in j["asks"][:depth]]
-        best_bid, best_ask = bids[0][0], asks[0][0]
-        spread_bp = (best_ask-best_bid)/((best_ask+best_bid)/2.0) * 10000.0
-        bid_eur = sum(p*q for p,q in bids)
-        ask_eur = sum(p*q for p,q in asks)
-        imb = (bid_eur / max(1e-9, ask_eur))
-        return {"spread_bp": spread_bp, "imb": imb, "bid_eur": bid_eur, "ask_eur": ask_eur}
+        return (a - b) / b * 100.0 if b not in (0, None) else float("nan")
     except Exception:
+        return float("nan")
+
+def diplomatic_sleep(ms: int):
+    time.sleep(ms / 1000.0)
+
+def list_quote_markets(ex, quote="EUR"):
+    markets = ex.load_markets()
+    syms = []
+    for m, info in markets.items():
+        if info.get("active", True) and info.get("quote") == quote:
+            syms.append(m)
+            if len(syms) >= MAX_MARKETS:
+                break
+    if not syms:
+        raise RuntimeError(f"لا توجد أسواق {quote}. جرّب QUOTE=USDT.")
+    return syms
+
+def fetch_week_ohlcv(ex, symbol, timeframe="1h", days=7):
+    since = ms_days_ago(days)
+    limit = 200
+    return ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+
+def analyze_symbol(ohlcv):
+    if not ohlcv or len(ohlcv) < 5:
         return None
-
-# ---------- Feature engineering ----------
-def compute_features(market):
-    """
-    يُرجع dict بميزات:
-      slope1h, slope3h (٪/ساعة تقريبًا على لوغ السعر)
-      accel, r15, squeeze_ratio, vol_push, ob_spread_bp, ob_imb, near_high
-    """
-    c1 = candles(market, "1m", 240)  # ~4h
-    if len(c1) < 120: return None
-    closes = [float(c[4]) for c in c1]
-    vols   = [float(c[5]) for c in c1]
-    # لوغ السعر يُحسّن الانحدار
-    logs = [math.log(max(1e-12, p)) for p in closes]
-
-    # نوافذ
-    last60  = logs[-60:]    # ~1h
-    last180 = logs[-180:]   # ~3h
-    slope1h = linreg_slope(last60)   * 60  # لكل ساعة (تقريبي)
-    slope3h = linreg_slope(last180)  * 60
-    accel   = slope1h - slope3h
-
-    # r15 (%)
-    p_now = closes[-1]; p_15 = closes[-16] if len(closes)>=16 else closes[0]
-    r15 = pct(p_now, p_15)
-
-    # Squeeze (Bollinger bandwidth now / median of last 3h)
-    def boll_width(arr, n=20):
-        if len(arr)<n: return None
-        sub = arr[-n:]
-        m = sum(sub)/n
-        std = math.sqrt(sum((x-m)**2 for x in sub)/n)
-        up, dn = m+2*std, m-2*std
-        return (up-dn)/max(1e-12, m)
-    bw_now = boll_width(closes, 20) or 0.0
-    bws = []
-    for i in range(60, 180):  # لقطات قديمة داخل 3h
-        w = boll_width(closes[:i], 20)
-        if w: bws.append(w)
-    median_bw = st.median(bws) if bws else bw_now
-    squeeze_ratio = bw_now / max(1e-9, median_bw)  # أصغر = انقباض أقوى
-
-    # Volume push (آخر 10m / متوسط 60m)
-    v10 = sum(vols[-10:]) / max(1, 10)
-    v60 = sum(vols[-60:]) / max(1, 60)
-    vol_push = v10 / max(1e-9, v60)
-
-    # قرب من قمة 24h (وزن خفيف)
-    hi_24 = max(closes[-240:]) if len(closes)>=240 else max(closes)
-    near_high = p_now / max(1e-9, hi_24)
-
-    ob = orderbook(market) or {}
-    ob_spread_bp = ob.get("spread_bp", 999.0)
-    ob_imb = ob.get("imb", 0.0)
-
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    weekly_low = float(df["low"].min())
+    weekly_high = float(df["high"].max())
+    last_close = float(df["close"].iloc[-1])
+    prev_close = float(df["close"].iloc[-2]) if len(df)>=2 else float("nan")
     return {
-        "market": market,
-        "slope1h": slope1h, "slope3h": slope3h, "accel": accel, "r15": r15,
-        "squeeze_ratio": squeeze_ratio, "vol_push": vol_push,
-        "ob_spread_bp": ob_spread_bp, "ob_imb": ob_imb, "near_high": near_high,
-        "price": p_now,
+        "weekly_low": weekly_low,
+        "weekly_high": weekly_high,
+        "last_close": last_close,
+        "prev_close": prev_close,
+        "up_from_week_low_pct": pct(last_close, weekly_low),
+        "last_hour_change_pct": pct(last_close, prev_close),
+        "samples": len(df),
+        "last_ts": int(df["ts"].iloc[-1]),
     }
 
-def score_row(feat):
-    # تطبيع وخليط نقاط (0–100)
-    accel = clamp(feat["accel"], -0.5, 0.5)
-    r15   = clamp(feat["r15"],  -1.5,  1.5)
-    spread= feat["ob_spread_bp"]
-    imb   = feat["ob_imb"]
-    squeeze = feat["squeeze_ratio"]
-    volp    = clamp(feat["vol_push"], 0.5, 3.0)
-
-    # Momentum/Accel (0–45)
-    mom = 25.0 * clamp((accel - 0.02)/0.18, 0.0, 1.0) + 20.0 * clamp((r15 - 0.05)/0.30, 0.0, 1.0)
-
-    # Squeeze أفضل لما <1 (انقباض)
-    sq  = 20.0 * clamp((1.2 - squeeze)/1.0, 0.0, 1.0)
-
-    # Volume push (0–15)
-    vp  = 15.0 * clamp((volp - 0.9)/1.6, 0.0, 1.0)
-
-    # Order-book (0–20): سبريد ضيق + ميل قوي
-    ob_sp = 10.0 * clamp((200.0 - spread)/150.0, 0.0, 1.0)
-    ob_im = 10.0 * clamp((imb - 0.95)/0.6,       0.0, 1.0)
-
-    score = mom + sq + vp + ob_sp + ob_im
-    return score
-
-# ---------- Main scan ----------
-def scan_all(topn=10):
-    mkts = list_markets_eur()
-    rows = []
-    for i, m in enumerate(mkts):
+def scan_once():
+    ex = make_exchange(EXCHANGE)
+    symbols = list_quote_markets(ex, QUOTE)
+    rows, errors = [], []
+    for sym in symbols:
         try:
-            f = compute_features(m)
-            if not f: continue
-            s = score_row(f)
-            f["score"] = round(s, 2)
-            rows.append(f)
-            if r:
-                r.hset("daily:features", m, json.dumps(f))
+            res = analyze_symbol(fetch_week_ohlcv(ex, sym, TIMEFRAME, DAYS))
+            if not res: 
+                continue
+            if math.isnan(res["up_from_week_low_pct"]) or res["up_from_week_low_pct"] < MIN_WEEKLY_POP:
+                continue
+            rows.append({"symbol": sym, **res,
+                         "sig_last_hour": (res["last_hour_change_pct"] if not math.isnan(res["last_hour_change_pct"]) else -999) >= SIG_1H})
         except Exception as e:
-            print("scan err", m, e)
-        # بطيء لكن ثابت
-        time.sleep(0.12)
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    return rows[:topn], (rows[0] if rows else None)
+            errors.append((sym, str(e)))
+        finally:
+            diplomatic_sleep(REQUEST_SLEEP_MS)
+    df = pd.DataFrame(rows)
+    if len(df):
+        df.sort_values(by=["up_from_week_low_pct","last_hour_change_pct"], ascending=[False,False], inplace=True)
+    return df, errors
 
-def main_once():
-    top, best = scan_all(10)
-    if not best:
-        tg("❌ لا نتائج."); return
-    lines = ["📈 Daily ExplodeSoon — Top 10 (Bitvavo EUR)\n"]
-    for i, f in enumerate(top, 1):
-        m = f["market"].replace("-EUR","")
-        lines.append(f"{i:>2}. {m:<8} | score {f['score']:.1f} | acc {f['accel']:.3f} | r15 {f['r15']:+.2f}% | sq {f['squeeze_ratio']:.2f} | vol× {f['vol_push']:.2f} | ob {f['ob_spread_bp']:.0f}bp/{f['ob_imb']:.2f}")
-    lines.append("\n⭐️ Daily Pick: " + best["market"].replace("-EUR","") + f" — score {best['score']:.1f} @ €{best['price']:.6f}")
-    msg = "\n".join(lines)
-    tg(msg)
-    if r:
-        r.set("daily:last_pick", best["market"])
+# ===== Telegram helpers =====
+def tg_send_text(text: str, chat_id: str = None, disable_web_page_preview=True):
+    if not BOT_TOKEN or not (chat_id or CHAT_ID):
+        print("⚠️ Telegram غير مضبوط (BOT_TOKEN/CHAT_ID).")
+        return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id or CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": disable_web_page_preview
+    }
+    try:
+        r = requests.post(url, json=data, timeout=15)
+        return r.json()
+    except Exception as e:
+        print("Telegram send error:", e)
+        return None
 
+def chunk_and_send(md_text: str, header=None):
+    CHUNK = 3800  # أقل من حد 4096
+    if header:
+        tg_send_text(header)
+    if not md_text:
+        return
+    parts = [md_text[i:i+CHUNK] for i in range(0, len(md_text), CHUNK)]
+    for p in parts:
+        tg_send_text(p)
+
+def df_to_md(df: pd.DataFrame, cols):
+    view = df[cols].copy()
+    # تقريب
+    for c in ["last_close","weekly_low","weekly_high"]:
+        if c in view.columns: view[c] = view[c].map(lambda x: round(float(x), 8))
+    for c in ["up_from_week_low_pct","last_hour_change_pct"]:
+        if c in view.columns: view[c] = view[c].map(lambda x: round(float(x), 3))
+    table = tabulate(view, headers="keys", tablefmt="github", showindex=False)
+    # تأمين Markdown (بسيط)
+    return f"```\n{table}\n```"
+
+def run_and_report(custom_chat_id=None):
+    start = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    tg_send_text(f"⏳ بدء المسح — EXCHANGE={EXCHANGE} QUOTE={QUOTE} TF={TIMEFRAME} DAYS={DAYS}\n*Start:* `{start}`", custom_chat_id)
+
+    df, errors = scan_once()
+    if df is None or len(df)==0:
+        tg_send_text(f"⚠️ لا توجد عملات مطابقة (≥ {MIN_WEEKLY_POP:.2f}% فوق قاع الأسبوع).", custom_chat_id)
+        if errors:
+            tg_send_text(f"ملاحظات أخطاء ({len(errors)}). مثال: `{errors[0][0]} → {errors[0][1][:160]}`", custom_chat_id)
+        return
+
+    md_all = df_to_md(df, ["symbol","last_close","weekly_low","weekly_high","up_from_week_low_pct","last_hour_change_pct","samples"])
+    chunk_and_send(md_all, header=f"✅ عملات ≥ *{MIN_WEEKLY_POP:.2f}%* فوق قاع الأسبوع:")
+
+    notable = df[df["sig_last_hour"]==True]
+    if len(notable):
+        md_notable = df_to_md(notable, ["symbol","last_close","last_hour_change_pct","up_from_week_low_pct"])
+        chunk_and_send(md_notable, header=f"🚀 ارتفاع ملحوظ آخر ساعة (≥ *{SIG_1H:.2f}%*):")
+    else:
+        tg_send_text(f"ℹ️ لا يوجد ارتفاع ملحوظ آخر ساعة حسب العتبة SIG_1H={SIG_1H:.2f}%", custom_chat_id)
+
+    end = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    tg_send_text(f"✅ انتهى الفحص — *End:* `{end}`", custom_chat_id)
+
+# ===== Webhook endpoints =====
+@app.route(f"/tg/{WEBHOOK_SECRET}", methods=["POST"])
+def tg_webhook():
+    try:
+        update = request.json or {}
+        msg = update.get("message") or update.get("edited_message") or {}
+        text = (msg.get("text") or "").strip()
+        chat_id = str(msg.get("chat",{}).get("id", CHAT_ID))
+        if text.startswith("/start"):
+            tg_send_text("أهلاً! استخدم الأمر `/scan` لبدء الفحص.", chat_id)
+        elif text.startswith("/scan"):
+            # يسمح بباراميترات خفيفة: /scan MIN_WEEKLY_POP=12 SIG_1H=3 QUOTE=USDT
+            try:
+                parts = text.split()
+                for p in parts[1:]:
+                    if "=" in p:
+                        k,v = p.split("=",1)
+                        k=k.upper()
+                        if k=="MIN_WEEKLY_POP": globals()["MIN_WEEKLY_POP"]=float(v)
+                        elif k=="SIG_1H": globals()["SIG_1H"]=float(v)
+                        elif k=="QUOTE": globals()["QUOTE"]=v.upper()
+                run_and_report(chat_id)
+            except Exception as e:
+                tg_send_text(f"❌ خطأ: {e}", chat_id)
+        else:
+            tg_send_text("أوامر متاحة: `/scan` أو `/scan QUOTE=USDT MIN_WEEKLY_POP=12 SIG_1H=3`", chat_id)
+        return jsonify(ok=True)
+    except Exception as e:
+        print("Webhook error:", e)
+        return jsonify(ok=False)
+
+# ===== تشغيل محلي/يدوي =====
 if __name__ == "__main__":
-    main_once()
+    mode = os.getenv("MODE","run").lower()
+    if mode == "web":
+        app.run(host="0.0.0.0", port=PORT)
+    else:
+        # تشغيل يدوي وإرسال النتيجة إلى تيليغرام
+        run_and_report()
