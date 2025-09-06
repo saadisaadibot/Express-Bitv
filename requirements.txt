@@ -4,3 +4,6 @@ redis
 python-dotenv
 gunicorn
 websocket-client   # <— المهم
+ccxt
+pandas
+tabulate
