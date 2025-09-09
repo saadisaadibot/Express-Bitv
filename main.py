@@ -45,8 +45,8 @@ PORT      = int(os.getenv("PORT", "8080"))
 SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "").strip()  # بدون /hook؛ الدالة تضيفه
 
 # ----- أوتو-سكان -----
-AUTO_SCAN_ENABLED  = int(os.getenv("AUTO_SCAN_ENABLED", "0"))   # 1 = شغال
-AUTO_PERIOD_SEC    = int(os.getenv("AUTO_PERIOD_SEC", "180"))   # كل 3 دقائق
+AUTO_SCAN_ENABLED  = int(os.getenv("AUTO_SCAN_ENABLED", "1"))   # 1 = شغال
+AUTO_PERIOD_SEC    = int(os.getenv("AUTO_PERIOD_SEC", "360"))   # كل 3 دقائق
 
 # ----- كولداون داخلي للإشارات -----
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "120"))
