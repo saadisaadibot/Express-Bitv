@@ -22,6 +22,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("CHAT_ID", "").strip()
 PORT      = int(os.getenv("PORT", "8080"))
 
+# === صقر (الشراء) ===
+SAQAR_WEBHOOK       = os.getenv("SAQAR_WEBHOOK", "").strip()
+SAQAR_MODE          = os.getenv("SAQAR_MODE", "text").strip().lower()  # text | json
+SAQAR_SIGNATURE     = os.getenv("SAQAR_SIGNATURE", "")                 # اتركه فاضي إذا هيك صقر بدو
+SAQAR_COOLDOWN_SEC  = int(os.getenv("SAQAR_COOLDOWN_SEC", "120"))
+
+# ذاكرة بسيطة لمنع التكرار لكل عملة
+_LAST_SIGNAL_TS = {}
+
 app = Flask(__name__)
 
 def make_exchange(name: str):
@@ -110,6 +119,86 @@ def chunk_and_send(md_text: str, header=None):
     for i in range(0, len(md_text), CHUNK):
         tg_send_text(md_text[i:i+CHUNK])
 
+# ====== صقر: إرسال إشارة شراء ======
+def _sym_to_base(sym: str) -> str:
+    # "ADA/EUR" -> "ADA"
+    return sym.split("/")[0].strip().upper()
+
+def _can_signal(symbol_base: str) -> bool:
+    now = time.time()
+    ts = _LAST_SIGNAL_TS.get(symbol_base, 0)
+    return (now - ts) >= SAQAR_COOLDOWN_SEC
+
+def _mark_signaled(symbol_base: str):
+    _LAST_SIGNAL_TS[symbol_base] = time.time()
+
+def send_to_saqar_text(symbol_base: str, reason: str = "", price: float = None):
+    if not SAQAR_WEBHOOK: 
+        tg_send_text(f"⚠️ SAQAR_WEBHOOK غير مضبوط. تجاهلت إشارة {symbol_base}.")
+        return False
+    payload = {
+        "text": f"اشتري {symbol_base}",
+        "signature": SAQAR_SIGNATURE  # اتركها "" إذا لازم توقيع فاضي
+    }
+    try:
+        r = requests.post(SAQAR_WEBHOOK, json=payload, timeout=8)
+        ok = (200 <= r.status_code < 300)
+        tg_send_text(f"📬 أرسلت لصقر: *اشتري {symbol_base}* (status={r.status_code})\nسبب: {reason}")
+        return ok
+    except Exception as e:
+        tg_send_text(f"❌ فشل إرسال لصقر {symbol_base}: `{e}`")
+        return False
+
+def send_to_saqar_json(symbol_base: str, reason: str = "", price: float = None):
+    if not SAQAR_WEBHOOK: 
+        tg_send_text(f"⚠️ SAQAR_WEBHOOK غير مضبوط. تجاهلت إشارة {symbol_base}.")
+        return False
+    payload = {
+        "coin": symbol_base,
+        "quote": QUOTE,
+        "action": "buy",
+        "reason": reason,
+        "price": price,
+        "ts": int(time.time()),
+        "signature": SAQAR_SIGNATURE
+    }
+    try:
+        r = requests.post(SAQAR_WEBHOOK, json=payload, timeout=8)
+        ok = (200 <= r.status_code < 300)
+        tg_send_text(f"📬 JSON لصقر: *{symbol_base}* (status={r.status_code})\nسبب: {reason}")
+        return ok
+    except Exception as e:
+        tg_send_text(f"❌ فشل إرسال JSON لصقر {symbol_base}: `{e}`")
+        return False
+
+def maybe_signal_saqar(row):
+    """
+    يقرّر إذا بدنا نرسل إشارة شراء لصقر.
+    شرط افتراضي: sig_last_hour=True + فوق قاع الأسبوع بما فيه الكفاية (محسوب مسبقاً).
+    تقدر تضيف شروط دفتر أوامر لاحقاً إذا بتحب.
+    """
+    symbol = row["symbol"]             # "ADA/EUR"
+    base   = _sym_to_base(symbol)      # "ADA"
+    price  = float(row["last_close"])
+    why    = f"{base}/{QUOTE}: ساعة {row['last_hour_change_pct']:.2f}% ، فوق قاع الأسبوع {row['up_from_week_low_pct']:.2f}%"
+
+    if not row.get("sig_last_hour", False):
+        return False
+
+    if not _can_signal(base):
+        # صامتًا: ضمن الكولداون
+        return False
+
+    ok = False
+    if SAQAR_MODE == "json":
+        ok = send_to_saqar_json(base, why, price)
+    else:
+        ok = send_to_saqar_text(base, why, price)
+
+    if ok:
+        _mark_signaled(base)
+    return ok
+
 def run_and_report(custom_chat_id=None):
     start = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     tg_send_text(f"⏳ بدء المسح — EXCHANGE={EXCHANGE} QUOTE={QUOTE} TF={TIMEFRAME} DAYS={DAYS}\n*Start:* `{start}`", custom_chat_id)
@@ -118,21 +207,35 @@ def run_and_report(custom_chat_id=None):
         tg_send_text(f"⚠️ لا توجد عملات مطابقة (≥ {MIN_WEEKLY_POP:.2f}% فوق قاع الأسبوع).", custom_chat_id)
         if errors: tg_send_text(f"ملاحظات ({len(errors)}): `{errors[0][0]} → {errors[0][1][:160]}`", custom_chat_id)
         return
+
+    # 1) تقرير عام
     md_all = df_to_md(df, ["symbol","last_close","weekly_low","weekly_high","up_from_week_low_pct","last_hour_change_pct","samples"])
     chunk_and_send(md_all, header=f"✅ عملات ≥ *{MIN_WEEKLY_POP:.2f}%* فوق قاع الأسبوع:")
+
+    # 2) فرص ملحوظة
     notable = df[df["sig_last_hour"]==True]
     if len(notable):
         md_notable = df_to_md(notable, ["symbol","last_close","last_hour_change_pct","up_from_week_low_pct"])
         chunk_and_send(md_notable, header=f"🚀 ارتفاع ملحوظ آخر ساعة (≥ *{SIG_1H:.2f}%*):")
+
+        # 3) **إطلاق إشارات شراء لصقر** لكل عملة لافتة (مع كولداون)
+        sent = 0
+        for _, row in notable.iterrows():
+            try:
+                if maybe_signal_saqar(row):
+                    sent += 1
+            except Exception as e:
+                tg_send_text(f"❌ خطأ أثناء إرسال لصقر {row.get('symbol')}: `{e}`")
+        tg_send_text(f"📡 صقر: تم إرسال {sent} إشارة شراء.", custom_chat_id)
     else:
         tg_send_text(f"ℹ️ لا يوجد ارتفاع ملحوظ آخر ساعة (SIG_1H={SIG_1H:.2f}%).", custom_chat_id)
+
     end = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     tg_send_text(f"✅ انتهى الفحص — *End:* `{end}`", custom_chat_id)
 
 @app.route("/", methods=["GET"])
 def health(): return "ok", 200
 
-# ✅ المسار الجديد:
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
@@ -141,7 +244,9 @@ def telegram_webhook():
         text = (msg.get("text") or "").strip()
         chat_id = str(msg.get("chat",{}).get("id", CHAT_ID))
         if text.startswith("/start"):
-            tg_send_text("أهلاً! استخدم الأمر `/scan` لبدء الفحص.\nمثال: `/scan QUOTE=USDT MIN_WEEKLY_POP=12 SIG_1H=3`", chat_id)
+            tg_send_text(
+                "أهلاً! استخدم الأمر `/scan` لبدء الفحص.\n"
+                "مثال: `/scan QUOTE=USDT MIN_WEEKLY_POP=12 SIG_1H=3`", chat_id)
         elif text.startswith("/scan"):
             # باراميترات سريعة من الرسالة
             try:
