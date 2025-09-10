@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Auto-Signal Scanner — Bitvavo (EUR) → Saqar /hook
-- فلتر أسبوعي/ساعة/5m (5% / 1% / 0.5%)
-- طبقة Pulse (squeeze + OB + flow + vol) مع Score/Flags
-- Top-by-volume (اختياري) + Debug لأسباب الرفض
+Auto-Signal Scanner — Pulse-First Mode
+- كل 3 دقائق: فحص كامل السوق بالدفتر (OB+flow+vol+squeeze).
+- يختار أعلى pulse_score مباشرة (بدون فلتر أسبوع/ساعة/5m).
+- كاش للسكيز لتخفيف الضغط على API.
 """
 
 import os, time, math, statistics as st
@@ -19,29 +19,24 @@ from flask import Flask, request, jsonify
 load_dotenv()
 app = Flask(__name__)
 
-# ----- إعدادات أساسية -----
 EXCHANGE   = os.getenv("EXCHANGE", "bitvavo").lower()
 QUOTE      = os.getenv("QUOTE", "EUR").upper()
-TIMEFRAME  = os.getenv("TIMEFRAME", "1h")
-MIN_WEEKLY_POP = float(os.getenv("MIN_WEEKLY_POP", "5.0"))
-SIG_1H     = float(os.getenv("SIG_1H", "1.0"))
-SIG_5M     = float(os.getenv("SIG_5M", "0.5"))
 MAX_MARKETS= int(os.getenv("MAX_MARKETS", "300"))
 REQUEST_SLEEP_MS = int(os.getenv("REQUEST_SLEEP_MS", "80"))
 
-# ----- Top-by-volume (اختياري) -----
-USE_TOP_BY_VOLUME = os.getenv("USE_TOP_BY_VOLUME", "1") == "1"
-TOP_BY_VOLUME_N   = int(os.getenv("TOP_BY_VOLUME_N", "120"))
-
 # ----- Pulse Layer -----
-TOP_MICRO_N        = int(os.getenv("TOP_MICRO_N", "30"))
 MAX_SPREAD_BP      = float(os.getenv("MAX_SPREAD_BP", "50"))
 REQ_BID_IMB        = float(os.getenv("REQ_BID_IMB", "1.4"))
 MIN_BUY_TAKE_RATIO = float(os.getenv("MIN_BUY_TAKE_RATIO", "0.55"))
 VOL_SPIKE_PCT      = float(os.getenv("VOL_SPIKE_PCT", "50"))
 SQUEEZE_PCTL       = float(os.getenv("SQUEEZE_PCTL", "40"))
 MIN_SCORE          = float(os.getenv("MIN_SCORE", "1.0"))
-PULSE_MIN_FLAGS    = int(os.getenv("PULSE_MIN_FLAGS", "1"))  # عدد شروط Pulse المطلوبة
+
+PULSE_FIRST = os.getenv("PULSE_FIRST","1")=="1"
+OB_FLOW_TOP_N = int(os.getenv("OB_FLOW_TOP_N","180"))
+VOL5M_TOP_N   = int(os.getenv("VOL5M_TOP_N","60"))
+SQUEEZE_REFRESH_MIN = int(os.getenv("SQUEEZE_REFRESH_MIN","30"))
+_SQ_CACHE = {}  # symbol -> {"ts": epoch, "pctl": float}
 
 # ----- تيليغرام -----
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -66,7 +61,6 @@ def diplomatic_sleep(ms): time.sleep(ms/1000.0)
 def safe(x,d=float("nan")):
     try: return float(x)
     except: return d
-
 def tg_send_text(text, chat_id=None):
     if not BOT_TOKEN: return
     try:
@@ -80,54 +74,8 @@ def tg_send_text(text, chat_id=None):
 # ========= Market Data =========
 def list_quote_markets(ex, quote="EUR"):
     markets = ex.load_markets()
-    if not USE_TOP_BY_VOLUME:
-        out = [m for m, info in markets.items() if info.get("active", True) and info.get("quote") == quote]
-        return out[:MAX_MARKETS]
-    # Top by 24h quote volume
-    try:
-        tix = ex.fetch_tickers()
-    except Exception:
-        out = [m for m, info in markets.items() if info.get("active", True) and info.get("quote") == quote]
-        return out[:MAX_MARKETS]
-    rows = []
-    for sym, info in markets.items():
-        if not info.get("active", True) or info.get("quote") != quote:
-            continue
-        tk = tix.get(sym) or {}
-        last = tk.get("last") or tk.get("close")
-        base_vol = tk.get("baseVolume") or (tk.get("info", {}) or {}).get("volume")
-        try:
-            qvol = float(base_vol) * float(last) if base_vol and last else 0.0
-        except: qvol = 0.0
-        rows.append((sym, qvol))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    N = min(TOP_BY_VOLUME_N, MAX_MARKETS)
-    return [sym for sym, _ in rows[:N]]
-
-# NOTE: نتجنب start/end → limit فقط لتفادي خطأ 205
-def fetch_week_ohlcv(ex, symbol):
-    return ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=200)
-
-def analyze_symbol(ohlcv):
-    if not ohlcv or len(ohlcv) < 3: return None
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-    last = float(df["close"].iloc[-1]); prev = float(df["close"].iloc[-2]); wlow = float(df["low"].min())
-    return {
-        "weekly_low": wlow,
-        "weekly_high": float(df["high"].max()),
-        "last_close": last,
-        "prev_close": prev,
-        "up_from_week_low_pct": pct(last, wlow),
-        "last_hour_change_pct": pct(last, prev)
-    }
-
-def get_5m_change_pct(ex, sym):
-    try:
-        o = ex.fetch_ohlcv(sym, "5m", limit=3)
-        if not o or len(o) < 2: return float("nan")
-        return pct(o[-1][4], o[-2][4])
-    except Exception:
-        return float("nan")
+    out = [m for m, info in markets.items() if info.get("active", True) and info.get("quote") == quote]
+    return out[:MAX_MARKETS]
 
 # ========= Pulse Features =========
 def bb_bandwidth(closes, window=20, k=2):
@@ -136,19 +84,25 @@ def bb_bandwidth(closes, window=20, k=2):
     sd = (sum((c-mu)**2 for c in seg)/len(seg))**0.5
     return (2*k*sd)/mu*100 if mu>0 else float("nan")
 
-def get_1h_squeeze(ex, sym):
-    try:
-        o = ex.fetch_ohlcv(sym, "1h", limit=200)
-        if not o or len(o) < 40: return {"squeeze_pctl": float("nan")}
-        closes = [safe(r[4]) for r in o]
-        bw_now = bb_bandwidth(closes)
-        hist = [bb_bandwidth(closes[:i]) for i in range(20, len(closes))]
-        hist = [h for h in hist if math.isfinite(h)]
-        if not hist or not math.isfinite(bw_now): return {"squeeze_pctl": float("nan")}
-        rank = sum(1 for h in hist if h <= bw_now)
-        return {"squeeze_pctl": rank/len(hist)*100.0}
-    except Exception:
-        return {"squeeze_pctl": float("nan")}
+def get_1h_squeeze_once(ex, sym):
+    o = ex.fetch_ohlcv(sym, "1h", limit=200)
+    if not o or len(o)<40: return float("nan")
+    closes = [safe(r[4]) for r in o]
+    bw_now = bb_bandwidth(closes)
+    hist = [bb_bandwidth(closes[:i]) for i in range(20,len(closes))]
+    hist = [h for h in hist if math.isfinite(h)]
+    if not hist or not math.isfinite(bw_now): return float("nan")
+    rank = sum(1 for h in hist if h<=bw_now)
+    return rank/len(hist)*100.0
+
+def get_squeeze_cached(ex, sym):
+    now = time.time()
+    item = _SQ_CACHE.get(sym)
+    if item and (now - item["ts"]) < SQUEEZE_REFRESH_MIN*60:
+        return item["pctl"]
+    pctl = get_1h_squeeze_once(ex, sym)
+    _SQ_CACHE[sym] = {"ts": now, "pctl": pctl}
+    return pctl
 
 def get_ob(ex, sym, depth=25):
     try:
@@ -186,123 +140,98 @@ def get_volspike(ex, sym):
     except Exception:
         return {"vol_spike_pct": float("nan")}
 
-# ========= Scan =========
-def scan_once():
+def get_5m_change_pct(ex, sym):
+    try:
+        o = ex.fetch_ohlcv(sym, "5m", limit=3)
+        if not o or len(o) < 2: return float("nan")
+        return pct(o[-1][4], o[-2][4])
+    except Exception:
+        return float("nan")
+
+# ========= Pulse-first Scan =========
+def scan_pulse_first():
     ex = make_exchange(EXCHANGE)
     syms = list_quote_markets(ex, QUOTE)
-    rows = []
+
+    # المرحلة A: OB + Flow
+    prelim = []
     for sym in syms:
         try:
-            r = analyze_symbol(fetch_week_ohlcv(ex, sym))
-            if not r: continue
-            if math.isnan(r["up_from_week_low_pct"]) or r["up_from_week_low_pct"] < MIN_WEEKLY_POP:
-                continue
-            rows.append({"symbol": sym, **r})
-        except Exception as e:
-            print("scan error:", sym, e)
+            ob = get_ob(ex, sym)
+            fl = get_flow(ex, sym)
+            ob_ok = math.isfinite(ob["spread_bp"]) and ob["spread_bp"] <= MAX_SPREAD_BP and \
+                    math.isfinite(ob["bid_imb"]) and ob["bid_imb"] >= REQ_BID_IMB
+            fl_ok = math.isfinite(fl["buy_take_ratio"]) and fl["buy_take_ratio"] >= MIN_BUY_TAKE_RATIO
+            pre_score = (1.6 if ob_ok else 0) + (0.9 if fl_ok else 0)
+            prelim.append({"symbol": sym, **ob, **fl, "pre_score": pre_score, "pre_flags": int(ob_ok)+int(fl_ok)})
+        except: pass
         diplomatic_sleep(REQUEST_SLEEP_MS)
-    df = pd.DataFrame(rows)
-    if len(df):
-        df["last_5m_change_pct"] = df["symbol"].map(lambda s: get_5m_change_pct(ex, s))
-        df["sig_5m"] = df["last_5m_change_pct"] >= SIG_5M
-        df["sig_last_hour"] = df["last_hour_change_pct"] >= SIG_1H
-    return df
+    df = pd.DataFrame(prelim)
+    if not len(df): return pd.DataFrame()
 
-# ========= Pulse & Pick =========
-def enrich_pulse(df):
-    if df is None or not len(df): return pd.DataFrame()
-    ex = make_exchange(EXCHANGE)
-    top = df.head(min(TOP_MICRO_N, len(df))).to_dict("records")
-    out = []
-    for r in top:
-        sym = r["symbol"]
-        sq = get_1h_squeeze(ex, sym)
-        ob = get_ob(ex, sym)
-        fl = get_flow(ex, sym)
-        vs = get_volspike(ex, sym)
-        score = 0.0; flags = 0
-        if math.isfinite(sq.get("squeeze_pctl", float("nan"))) and sq["squeeze_pctl"] <= SQUEEZE_PCTL:
+    # المرحلة B: حجم + تغير 5m
+    df.sort_values(by=["pre_score","bid_imb"], ascending=False, inplace=True)
+    df = df.head(min(OB_FLOW_TOP_N, len(df))).reset_index(drop=True)
+    df["vol_spike_pct"] = df["symbol"].map(lambda s: get_volspike(ex, s)["vol_spike_pct"])
+    df["last_5m_change_pct"] = df["symbol"].map(lambda s: get_5m_change_pct(ex, s))
+
+    # المرحلة C: سكيز
+    df.sort_values(by=["pre_score","vol_spike_pct","last_5m_change_pct"], ascending=False, inplace=True)
+    df = df.head(min(VOL5M_TOP_N, len(df))).reset_index(drop=True)
+    df["squeeze_pctl"] = df["symbol"].map(lambda s: get_squeeze_cached(ex, s))
+
+    # جمع النقاط
+    rows = []
+    for r in df.to_dict("records"):
+        score = r["pre_score"]; flags = r["pre_flags"]
+        if math.isfinite(r.get("vol_spike_pct",float("nan"))) and r["vol_spike_pct"] >= VOL_SPIKE_PCT:
+            score += 0.9; flags += 1
+        if math.isfinite(r.get("squeeze_pctl",float("nan"))) and r["squeeze_pctl"] <= SQUEEZE_PCTL:
             score += 1.0; flags += 1
-        if math.isfinite(ob.get("spread_bp", float("nan"))) and ob["spread_bp"] <= MAX_SPREAD_BP \
-           and math.isfinite(ob.get("bid_imb", float("nan"))) and ob["bid_imb"] >= REQ_BID_IMB:
-            score += 1.6; flags += 1
-        if math.isfinite(fl.get("buy_take_ratio", float("nan"))) and fl["buy_take_ratio"] >= MIN_BUY_TAKE_RATIO:
-            score += 0.9; flags += 1
-        if math.isfinite(vs.get("vol_spike_pct", float("nan"))) and vs["vol_spike_pct"] >= VOL_SPIKE_PCT:
-            score += 0.9; flags += 1
-        r.update(sq); r.update(ob); r.update(fl); r.update(vs)
         r["pulse_score"] = score; r["pulse_flags"] = flags
-        out.append(r)
-        diplomatic_sleep(int(REQUEST_SLEEP_MS/2))
-    return pd.DataFrame(out)
-
-def pick_best(df_micro):
-    if df_micro is None or not len(df_micro): return None
-    cand = df_micro[
-        (df_micro["sig_5m"]) &
-        (df_micro["sig_last_hour"]) &
-        (df_micro["pulse_score"] >= MIN_SCORE) &
-        (df_micro["pulse_flags"] >= PULSE_MIN_FLAGS)
-    ]
-    if not len(cand): return None
-    cand = cand.sort_values(by=["pulse_score","last_5m_change_pct","last_hour_change_pct"], ascending=False)
-    return cand.iloc[0].to_dict()
+        rows.append(r)
+    return pd.DataFrame(rows)
 
 # ========= Saqar Bridge =========
-def _can_signal(base): return (time.time() - _LAST_SIGNAL_TS.get(base, 0)) >= SIGNAL_COOLDOWN_SEC
-def _mark(base): _LAST_SIGNAL_TS[base] = time.time()
-
+def _can_signal(base): return (time.time()-_LAST_SIGNAL_TS.get(base,0))>=SIGNAL_COOLDOWN_SEC
+def _mark(base): _LAST_SIGNAL_TS[base]=time.time()
 def send_saqar(base):
-    if not SAQAR_WEBHOOK:
-        tg_send_text("⚠️ SAQAR_WEBHOOK غير مضبوط.")
-        return False
+    if not SAQAR_WEBHOOK: return False
     try:
-        r = requests.post(SAQAR_WEBHOOK.rstrip("/") + "/hook",
-                          json={"cmd":"buy","coin":base}, timeout=8)
+        r=requests.post(SAQAR_WEBHOOK.rstrip("/")+"/hook",json={"cmd":"buy","coin":base},timeout=8)
         tg_send_text(f"📡 صقر ← buy {base} | status={r.status_code} | resp=`{(r.text or '')[:200]}`")
-        return 200 <= r.status_code < 300
+        return 200<=r.status_code<300
     except Exception as e:
-        tg_send_text(f"❌ فشل إرسال لصقر: `{e}`")
-        return False
+        tg_send_text(f"❌ فشل إرسال لصقر: `{e}`"); return False
 
 # ========= Run =========
 def run_and_report(chat=None):
     try:
-        df = scan_once()
+        if not PULSE_FIRST:
+            tg_send_text("⚠️ PULSE_FIRST=0. الوضع الحالي Pulse-only فقط.", chat); return
+        df = scan_pulse_first()
         if not len(df):
-            tg_send_text("ℹ️ لا نتائج بعد الفلتر الأساسي.", chat); return
-        micro = enrich_pulse(df)
-        best = pick_best(micro)
-        if best:
-            base = best["symbol"].split("/")[0]
-            if _can_signal(base):
-                tg_send_text(f"🧠 مرشح: *{best['symbol']}* | score={best['pulse_score']:.1f} flags={best['pulse_flags']}")
-                if send_saqar(base): _mark(base)
-            else:
-                tg_send_text(f"⏳ كولداون نشط لـ {base}.")
+            tg_send_text("ℹ️ لا مرشح Pulse.", chat); return
+        cand = df[df["pulse_score"]>=MIN_SCORE].sort_values(
+            by=["pulse_score","last_5m_change_pct","bid_imb"], ascending=False
+        ).head(1).iloc[0].to_dict()
+        base = cand["symbol"].split("/")[0]
+        if _can_signal(base):
+            tg_send_text(f"🧠 مرشح: *{cand['symbol']}* | sc={cand['pulse_score']:.1f} fl={cand['pulse_flags']} | "
+                         f"SQ:{'✅' if math.isfinite(cand.get('squeeze_pctl',float('nan'))) and cand['squeeze_pctl']<=SQUEEZE_PCTL else '❌'} "
+                         f"OB:{'✅' if cand.get('pre_score',0)>=1.6 else '❌'} "
+                         f"FL:{'✅' if cand.get('pre_flags',0)>=1 else '❌'} "
+                         f"VOL:{'✅' if math.isfinite(cand.get('vol_spike_pct',float('nan'))) and cand['vol_spike_pct']>=VOL_SPIKE_PCT else '❌'}")
+            if send_saqar(base): _mark(base)
         else:
-            # Debug مختصر: أعلى 5 دون العتبة ولماذا
-            if micro is not None and len(micro):
-                top = micro.sort_values(by=["pulse_score"], ascending=False).head(5)
-                def ok(v): return "✅" if v else "❌"
-                lines=[]
-                for _, r in top.iterrows():
-                    ob_ok   = (math.isfinite(r.get("spread_bp", float("nan"))) and r["spread_bp"] <= MAX_SPREAD_BP) and \
-                              (math.isfinite(r.get("bid_imb", float("nan"))) and r["bid_imb"] >= REQ_BID_IMB)
-                    sq_ok   = (math.isfinite(r.get("squeeze_pctl", float("nan"))) and r["squeeze_pctl"] <= SQUEEZE_PCTL)
-                    flow_ok = (math.isfinite(r.get("buy_take_ratio", float("nan"))) and r["buy_take_ratio"] >= MIN_BUY_TAKE_RATIO)
-                    vol_ok  = (math.isfinite(r.get("vol_spike_pct", float("nan"))) and r["vol_spike_pct"] >= VOL_SPIKE_PCT)
-                    lines.append(f"{r['symbol']} | sc={r['pulse_score']:.1f} flg={int(r['pulse_flags'])} | SQ:{ok(sq_ok)} OB:{ok(ob_ok)} FL:{ok(flow_ok)} VOL:{ok(vol_ok)}")
-                tg_send_text("ℹ️ لا مرشح Pulse كافي (score/flags).\n🔎 أعلى 5:\n" + "\n".join(lines), chat)
-            else:
-                tg_send_text("ℹ️ لا مرشح Pulse كافي (score/flags).", chat)
+            tg_send_text(f"⏳ كولداون نشط لـ {base}.", chat)
     except Exception as e:
         tg_send_text(f"🐞 run_and_report: `{e}`")
 
 # ========= Auto Loop =========
 def auto_scan_loop():
     if not AUTO_SCAN_ENABLED: return
-    tg_send_text(f"🤖 Auto-Scan كل {AUTO_PERIOD_SEC}s | MIN_SCORE={MIN_SCORE} | FLAGS≥{PULSE_MIN_FLAGS}")
+    tg_send_text(f"🤖 Auto-Scan {AUTO_PERIOD_SEC}s | Pulse-First mode")
     while True:
         try: run_and_report()
         except Exception as e: tg_send_text(f"🐞 AutoScan error: `{e}`")
@@ -314,25 +243,14 @@ def health(): return "ok", 200
 
 @app.route("/webhook", methods=["POST"])
 def tg_webhook():
-    try:
-        upd = request.json or {}
-        msg = upd.get("message") or upd.get("edited_message") or {}
-        txt = (msg.get("text") or "").strip()
-        chat_id = str(msg.get("chat", {}).get("id", CHAT_ID))
-        if txt.startswith("/scan"): run_and_report(chat_id)
-        else: tg_send_text("أرسل `/scan` للتشغيل الفوري.", chat_id)
-        return jsonify(ok=True)
-    except Exception as e:
-        print("Webhook error:", e); return jsonify(ok=False), 200
-
-# مسار اختبار للإرسال لصقر: /test_buy?coin=ADA
-@app.route("/test_buy", methods=["GET"])
-def test_buy():
-    coin = (request.args.get("coin") or "ADA").upper()
-    ok = send_saqar(coin)
-    return jsonify(ok=ok, coin=coin), (200 if ok else 500)
+    upd=request.json or {}; msg=upd.get("message") or {}
+    txt=(msg.get("text") or "").strip()
+    chat_id=str(msg.get("chat",{}).get("id",CHAT_ID))
+    if txt.startswith("/scan"): run_and_report(chat_id)
+    else: tg_send_text("أرسل `/scan` للتشغيل الفوري.", chat_id)
+    return jsonify(ok=True)
 
 # ========= Main =========
-if __name__ == "__main__":
-    Thread(target=auto_scan_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+if __name__=="__main__":
+    Thread(target=auto_scan_loop,daemon=True).start()
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","8080")))
