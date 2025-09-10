@@ -33,12 +33,12 @@ REQUEST_SLEEP_MS = int(os.getenv("REQUEST_SLEEP_MS", "80"))
 
 # ----- Pulse Layer -----
 TOP_MICRO_N        = int(os.getenv("TOP_MICRO_N", "30"))
-MAX_SPREAD_BP      = float(os.getenv("MAX_SPREAD_BP", "20"))
+MAX_SPREAD_BP      = float(os.getenv("MAX_SPREAD_BP", "50"))
 REQ_BID_IMB        = float(os.getenv("REQ_BID_IMB", "1.7"))
 MIN_BUY_TAKE_RATIO = float(os.getenv("MIN_BUY_TAKE_RATIO", "0.60"))
 VOL_SPIKE_PCT      = float(os.getenv("VOL_SPIKE_PCT", "70"))
 SQUEEZE_PCTL       = float(os.getenv("SQUEEZE_PCTL", "35"))
-MIN_SCORE          = float(os.getenv("MIN_SCORE", "2.0"))
+MIN_SCORE          = float(os.getenv("MIN_SCORE", "1.0"))
 
 # ----- تيليغرام -----
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
