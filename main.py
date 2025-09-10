@@ -48,7 +48,7 @@ SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "").strip()
 
 # ----- أوتو-سكان -----
 AUTO_SCAN_ENABLED  = int(os.getenv("AUTO_SCAN_ENABLED", "1"))
-AUTO_PERIOD_SEC    = int(os.getenv("AUTO_PERIOD_SEC", "600"))
+AUTO_PERIOD_SEC    = int(os.getenv("AUTO_PERIOD_SEC", "180"))
 
 SIGNAL_COOLDOWN_SEC = int(os.getenv("SIGNAL_COOLDOWN_SEC", "180"))
 _LAST_SIGNAL_TS = {}
