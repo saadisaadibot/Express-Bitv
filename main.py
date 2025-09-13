@@ -30,19 +30,19 @@ REQUEST_SLEEP_MS      = int(os.getenv("REQUEST_SLEEP_MS", "120"))
 # --------- وضع Oscillation (ساعة واحدة) ----------
 MODE                 = os.getenv("MODE", "oscillation").lower()     # "oscillation" | "pulse" | "mixed" (نستخدم oscillation هنا)
 CAPTURE_MIN_PCT      = float(os.getenv("CAPTURE_MIN_PCT", "0.6"))   # عتبة ±% للدورة المقبولة
-MAX_SPREAD_BP        = float(os.getenv("MAX_SPREAD_BP", "50"))      # 50 bp = 0.50%
-VOL1M_MIN_EUR        = float(os.getenv("VOL1M_MIN_EUR", "1500"))    # حد أدنى سيولة 1m
-VOL5M_MIN_EUR        = float(os.getenv("VOL5M_MIN_EUR", "7500"))    # حد أدنى سيولة 5m
+MAX_SPREAD_BP        = float(os.getenv("MAX_SPREAD_BP", "70"))      # 50 bp = 0.50%
+VOL1M_MIN_EUR        = float(os.getenv("VOL1M_MIN_EUR", "1000"))    # حد أدنى سيولة 1m
+VOL5M_MIN_EUR        = float(os.getenv("VOL5M_MIN_EUR", "5000"))    # حد أدنى سيولة 5m
 PUMP_CAP_1M_PCT      = float(os.getenv("PUMP_CAP_1M_PCT", "3.5"))   # حماية ضخ 1m
 BID_IMB_MIN          = float(os.getenv("BID_IMB_MIN", "1.3"))
-FLOW_MIN             = float(os.getenv("FLOW_MIN", "0.55"))         # buy_take_ratio
-OSC_THRESHOLD        = float(os.getenv("OSC_THRESHOLD", "1.8"))     # حد قبول السكور النهائي
+FLOW_MIN             = float(os.getenv("FLOW_MIN", "0.50"))         # buy_take_ratio
+OSC_THRESHOLD        = float(os.getenv("OSC_THRESHOLD", "1.6"))     # حد قبول السكور النهائي
 
 # مراحل الفرز لتقليل النداءات
-TOP_UNIVERSE         = int(os.getenv("TOP_UNIVERSE", "100"))        # Top EUR pairs
+TOP_UNIVERSE         = int(os.getenv("TOP_UNIVERSE", "120"))        # Top EUR pairs
 OB_PRE_TOP_N         = int(os.getenv("OB_PRE_TOP_N", "120"))        # نفحص OB/سبريد لنطاق أوسع قليلاً
 VOL_PRE_TOP_N        = int(os.getenv("VOL_PRE_TOP_N", "60"))        # نفحص 5m لحزمة أصغر
-FLOW_TOP_N           = int(os.getenv("FLOW_TOP_N", "25"))           # نفحص trades فقط لأفضل 25
+FLOW_TOP_N           = int(os.getenv("FLOW_TOP_N", "40"))           # نفحص trades فقط لأفضل 25
 
 # ----- Telegram -----
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
