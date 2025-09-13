@@ -1,22 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah — On-Demand Signal Provider (Best-of-50, 1h→1m)
-- لا جدولة.
-- /ready (من صقر) → فلترة لحظية → اختيار أقوى مرشح من Top50 1h → إرسال لصقر /hook
-- /scan (يدوي)     → نفس الفلترة وإرسال لصقر (لتشغيل أول دورة مثلاً)
+Abosiyah — On-Demand Signal Provider (Best-of-50, 1h→1m) + Telegram /webhook
+- /scan من تيليغرام: يشغّل فلترة Best-of-50 بالخلفية ويرسل Top1 لصقر.
+- /ready من صقر: عند كل خروج، يشغّل فلترة جديدة ويرسل Top1 لصقر.
+- بدون جدولة تلقائية؛ كل شيء On-Demand.
 
-المنطق:
-1) انتقاء Top50 حسب حجم آخر ساعة (EUR) لكل أزواج EUR.
-2) لكل زوج من الـ50:
-   - فلتر دفتر أوامر: spread ≤ 35bp، bid/ask imbalance ≥ 1.10
-   - اختراق 1m: close الآن > High(20) السابق ≥ +0.10%
-   - حجم 1m ≥ 2.0× ميديان آخر 20 شمعة 1m
-   - Pump guard: Δ1m < 3% و Δ3m < 5%
-   - score = 1.2*breakout_pct + 0.8*min(vol_mult,5) + 0.3*min(bid_imb,2) - 0.2*(spread_bp/100)
-3) اختيار أعلى score (إن وجد) → إرسال base لصقر.
+ENV المطلوبة:
+BOT_TOKEN, CHAT_ID, SAQAR_WEBHOOK, EXCHANGE=bitvavo, QUOTE=EUR, REQUEST_SLEEP_MS(اختياري)...
 """
 
 import os, time, statistics as st, requests
+from threading import Thread
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import ccxt
@@ -26,33 +20,35 @@ load_dotenv()
 app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID     = os.getenv("CHAT_ID", "").strip()
+CHAT_ID     = (os.getenv("CHAT_ID", "") or "").strip()   # لتقييد الأوامر على شات واحد
 SAQAR_URL   = os.getenv("SAQAR_WEBHOOK", "").strip()
 
 EXCHANGE    = os.getenv("EXCHANGE", "bitvavo").lower()
 QUOTE       = os.getenv("QUOTE", "EUR").upper()
 
-# لطّف الضغط على API
-REQUEST_SLEEP_MS = int(os.getenv("REQUEST_SLEEP_MS", "70"))  # غيّره حسب الحاجة
+REQUEST_SLEEP_MS = int(os.getenv("REQUEST_SLEEP_MS", "70"))
 
-# عتبات بسيطة، قابلة للتعديل
-MAX_SPREAD_BP    = float(os.getenv("MAX_SPREAD_BP", "35"))   # ≤ 0.35%
+# عتبات
+MAX_SPREAD_BP    = float(os.getenv("MAX_SPREAD_BP", "35"))
 MIN_BID_IMB      = float(os.getenv("MIN_BID_IMB", "1.10"))
 MIN_BREAKOUT_PCT = float(os.getenv("MIN_BREAKOUT_PCT", "0.10"))
 MIN_VOL_MULT     = float(os.getenv("MIN_VOL_MULT", "2.0"))
 
 # ===== Telegram =====
-def tg_send_text(text):
+def tg_send_text(text, chat_id=None):
     if not BOT_TOKEN:
         print("TG:", text); return
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text},
+            json={"chat_id": chat_id or CHAT_ID, "text": text},
             timeout=8
         )
     except Exception as e:
         print("tg_send error:", e)
+
+def _auth_chat(chat_id: str) -> bool:
+    return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
 
 # ===== Utils =====
 def diplomatic_sleep(ms): time.sleep(ms/1000.0)
@@ -78,8 +74,10 @@ def get_ob(ex, sym, depth=5):
     except Exception:
         return None
 
-# ===== Saqar hook =====
+# ===== Hook إلى صقر =====
 def send_saqar(base: str):
+    if not SAQAR_URL:
+        tg_send_text("⚠️ SAQAR_WEBHOOK غير مضبوط."); return False
     url = SAQAR_URL.rstrip("/") + "/hook"
     payload = {"cmd": "buy", "coin": base.upper(), "ts": int(time.time()*1000), "ttl": 60}
     try:
@@ -104,7 +102,7 @@ def run_filter_and_pick():
             if not info.get("active", True) or info.get("quote") != QUOTE:
                 continue
             o1h = fetch_ohlcv_safe(ex, sym, "1h", 2)
-            if not o1h:
+            if not o1h: 
                 continue
             last = float(o1h[-1][4])
             vol  = float(o1h[-1][5])
@@ -116,7 +114,7 @@ def run_filter_and_pick():
     rows.sort(key=lambda x: x[1], reverse=True)
     top_syms = [sym for sym,_ in rows[:50]]
 
-    # B) تقييم 1m + دفتر أوامر لكل من الـ50
+    # B) تقييم 1m + دفتر أوامر
     candidates = []
     for sym in top_syms:
         try:
@@ -179,16 +177,20 @@ def run_filter_and_pick():
     )
     return top["base"]
 
-# ===== Endpoints =====
-@app.route("/scan", methods=["GET"])
-def scan_manual():
-    tg_send_text("🔎 بدء فلترة Best-of-50…")
+# ===== Handlers =====
+def do_scan_and_send(chat_id=None):
+    tg_send_text("🔎 بدء فلترة Best-of-50…", chat_id)
     coin = run_filter_and_pick()
     if not coin:
-        tg_send_text("⏸ لا يوجد مرشح مناسب الآن.")
-        return jsonify(ok=False, err="no_candidate")
+        tg_send_text("⏸ لا يوجد مرشح مناسب الآن.", chat_id); 
+        return
     ok = send_saqar(coin)
-    return jsonify(ok=ok, coin=coin)
+    tg_send_text(f"📡 أرسلت {coin} إلى صقر | ok={ok}", chat_id)
+
+@app.route("/scan", methods=["GET"])
+def scan_manual_http():
+    Thread(target=do_scan_and_send, daemon=True).start()
+    return jsonify(ok=True, msg="scan started"), 200
 
 @app.route("/ready", methods=["POST"])
 def on_ready():
@@ -196,20 +198,36 @@ def on_ready():
     coin   = data.get("coin")
     reason = data.get("reason")
     pnl    = data.get("pnl_eur")
-
     try:
         pnl_txt = f"{float(pnl):.4f}€" if pnl is not None else "—"
     except:
         pnl_txt = "—"
-
     tg_send_text(f"✅ صقر أنهى {coin} (سبب={reason}, ربح={pnl_txt}). فلترة جديدة…")
+    Thread(target=do_scan_and_send, daemon=True).start()
+    return jsonify(ok=True)
 
-    coin2 = run_filter_and_pick()
-    if not coin2:
-        tg_send_text("⏸ لا يوجد مرشح جديد الآن.")
-        return jsonify(ok=True, err="no_candidate")
-    ok = send_saqar(coin2)
-    return jsonify(ok=ok, coin=coin2)
+# ===== Telegram Webhook =====
+@app.route("/webhook", methods=["POST"])
+def tg_webhook():
+    upd = request.get_json(silent=True) or {}
+    msg = upd.get("message") or upd.get("edited_message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", "")) or None
+    text = (msg.get("text") or "").strip()
+
+    if not chat_id or (not _auth_chat(chat_id)):
+        return jsonify(ok=True), 200
+
+    if text.startswith("/scan"):
+        tg_send_text("⏳ جارٍ الفحص بالخلفية…", chat_id)
+        Thread(target=do_scan_and_send, args=(chat_id,), daemon=True).start()
+        return jsonify(ok=True), 200
+
+    if text.startswith("/ping"):
+        tg_send_text("pong ✅", chat_id); 
+        return jsonify(ok=True), 200
+
+    tg_send_text("أوامر: /scan ، /ping", chat_id)
+    return jsonify(ok=True), 200
 
 @app.route("/", methods=["GET"])
 def home():
