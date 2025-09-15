@@ -1,23 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Lite — Smart scanner with auto-retry until it finds a coin, then wait.
-- No link secret at all.
-- If no candidate found: retry every RETRY_SECS.
-- Once a coin is sent to Saqer, pause scanning and wait:
-  * resume automatically on /ready if AUTOSCAN_ON_READY=1
-  * or manually via /scan
-- Sturdier EMA handling (no IndexError when candles < 200).
-
-ENV:
-  BOT_TOKEN, CHAT_ID
-  SAQAR_WEBHOOK              # e.g. https://saqer.up.railway.app (no trailing slash)
-  EXCHANGE=bitvavo, QUOTE=EUR
-  TOP_UNIVERSE=120, MAX_WORKERS=6, REQUEST_SLEEP_MS=40, MAX_RPS=8, REPORT_TOP3=1
-  AUTOSCAN_ON_READY=1
-  RETRY_SECS=60              # retry interval when nothing found
+Abosiyah Lite — Scanner بلا قفل:
+- /scan: يبدّل فوراً لأي حلقة قديمة ويبدأ سكان جديد حتى يلاقي مرشح ويرسله.
+- /ready: لو AUTOSCAN_ON_READY=1 يبدأ سكان جديد فوراً (أيضاً بلا قفل).
+- لا يوجد STATE/LOCK. التحكم عبر RUN_ID: كل سكان جديد يزيد المعرف ويُنهي القديم سلمياً.
+- فلترة ذكية (RSI+ADX+ATR+EMA+Breakout+OB) + إعادة محاولة كل RETRY_SECS عند عدم وجود مرشح.
 """
 
-import os, time, math, statistics as st, requests, ccxt
+import os, time, statistics as st, requests, ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Thread
 from flask import Flask, request, jsonify
@@ -65,7 +55,7 @@ def throttle():
         if wait > 0: time.sleep(wait)
         _last_ts = time.time()
 
-def diplomatic_sleep(ms):
+def diplomatic_sleep(ms): 
     if ms>0: time.sleep(ms/1000.0)
 
 def fetch_ohlcv(sym, tf, limit):
@@ -89,7 +79,7 @@ def send_saqar(base: str):
     if not SAQAR_URL:
         tg_send("⚠️ SAQAR_WEBHOOK غير مضبوط."); return False
     url = SAQAR_URL + "/hook"
-    payload = {"action":"buy","coin":base.upper()}  # Saqer only needs these
+    payload = {"action":"buy","coin":base.upper()}
     headers = {"Content-Type":"application/json"}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=(6,20))
@@ -149,9 +139,9 @@ def _adx(highs, lows, closes, n=14):
     if tr14<=0: return 0.0
     pDI=(pDM14/tr14)*100.0; mDI=(mDM14/tr14)*100.0
     dx=(abs(pDI-mDI)/max(pDI+mDI,1e-9))*100.0
-    return dx  # تقريبي
+    return dx
 
-# ===== Universe: أعلى سيولة بالساعة ثم تصفية دقيقة =====
+# ===== Universe + تقييم =====
 def list_top_by_1h_volume():
     mk = _ex.load_markets()
     syms = [s for s,i in mk.items() if i.get("active",True) and i.get("quote")==QUOTE]
@@ -166,28 +156,20 @@ def list_top_by_1h_volume():
     return [s for s,_ in rows[:50]]
 
 def _eval_fast(sym: str):
-    """
-    فلترة ذكية على 1m (حتى 240 كاندل) + Orderbook + سرعة متوقعة.
-    مع حماية كاملة لو الـEMA ناقص.
-    """
     ob = fetch_orderbook(sym, depth=10)
     if not ob: return None
-
     o1 = fetch_ohlcv(sym, "1m", 240)
-    if len(o1) < 60:   # أقل شي بيانات معقولة
-        return None
+    if len(o1) < 60: return None
 
     closes=[float(x[4]) for x in o1]
     highs =[float(x[2]) for x in o1]
     lows  =[float(x[3]) for x in o1]
-
     lc = closes[-1]
 
-    # EMA50/200 مع حماية
-    ema50_series  = _series_ema(closes, 50)
-    ema200_series = _series_ema(closes, 200)
-    ema50  = ema50_series[-1]  if ema50_series  else None
-    ema200 = ema200_series[-1] if ema200_series else None
+    ema50  = _series_ema(closes, 50)
+    ema200 = _series_ema(closes, 200)
+    ema50  = ema50[-1]  if ema50  else None
+    ema200 = ema200[-1] if ema200 else None
     trend_up = (ema50 is not None and ema200 is not None and ema50 > ema200)
 
     rsi = _rsi(closes, 14) or 50.0
@@ -195,23 +177,20 @@ def _eval_fast(sym: str):
     atr = _atr(highs, lows, closes, 14) or 0.0
     atr_pct = (atr/lc)*100.0 if lc>0 and atr>0 else 0.0
 
-    # Breakout مقابل أعلى قمة آخر 20 شمعة (قبل الحالية)
     prev20 = o1[-21:-1] if len(o1) >= 21 else o1[:-1]
     h20 = max(float(x[2]) for x in prev20) if prev20 else lc
     brk_pct = ((lc/max(h20,1e-9))-1.0)*100.0 if lc>0 else 0.0
     brk_pct = max(brk_pct, 0.0)
 
-    # Volume spike
     medv = st.median([float(x[5]) for x in prev20 if float(x[5])>0]) if prev20 else 0.0
     v_spike = (float(o1[-1][5])/max(medv,1e-9)) if medv>0 else 0.0
 
-    # Momentum قصير جداً
-    def pct(a,b):
+    def pct(a,b): 
         try: return (a/b-1.0)*100.0
         except: return 0.0
-    mom1 = pct(closes[-1], closes[-2])                  if len(closes)>=2 else 0.0
-    mom3 = pct(closes[-1], closes[-4])                  if len(closes)>=4 else 0.0
-    mom5 = pct(closes[-1], closes[-6])                  if len(closes)>=6 else 0.0
+    mom1 = pct(closes[-1], closes[-2]) if len(closes)>=2 else 0.0
+    mom3 = pct(closes[-1], closes[-4]) if len(closes)>=4 else 0.0
+    mom5 = pct(closes[-1], closes[-6]) if len(closes)>=6 else 0.0
 
     # Hard filters
     if not trend_up: return None
@@ -221,7 +200,6 @@ def _eval_fast(sym: str):
     if ob["bid_imb"] < 1.10: return None
     if not (0.08 <= atr_pct <= 0.80): return None
 
-    # Pulse/Score
     pulse = max(mom1,0.0) + 0.5*max(mom3,0.0) + 0.25*max(mom5,0.0) + 0.5*brk_pct + 0.5*(atr_pct/1.0)
     rsi_bias = -abs(rsi-60.0)/6.0
     score = (
@@ -234,18 +212,10 @@ def _eval_fast(sym: str):
         0.25*(ob["spread_bp"]/10.0)
     )
 
-    return {
-        "symbol": sym,
-        "base": sym.split("/")[0],
-        "score": float(score),
-        "rsi": float(rsi),
-        "adx": float(adx),
-        "atr_pct": float(atr_pct),
-        "brk": float(brk_pct),
-        "mom1": float(mom1),
-        "spr": float(ob["spread_bp"]),
-        "imb": float(ob["bid_imb"])
-    }
+    return {"symbol": sym, "base": sym.split("/")[0], "score": float(score),
+            "rsi": float(rsi), "adx": float(adx), "atr_pct": float(atr_pct),
+            "brk": float(brk_pct), "mom1": float(mom1),
+            "spr": float(ob["spread_bp"]), "imb": float(ob["bid_imb"])}
 
 def run_filter_and_pick():
     top_syms = list_top_by_1h_volume()
@@ -261,12 +231,10 @@ def run_filter_and_pick():
     cands.sort(key=lambda r: r["score"], reverse=True)
     return cands[0], cands[:3]
 
-# ===== state machine =====
-STATE = "idle"     # idle | scanning | waiting
-STOP_FLAG = False
+# ===== تشغيل بلا قفل عبر RUN_ID =====
+RUN_ID = 0  # أي سكان جديد يزيده، والحلقة القديمة تخرج لو تغيّر
 
-def _pick_once(relax=False):
-    """محاولة واحدة للفلترة؛ ترجع top1, top3 أو (None, [])."""
+def _pick_once():
     top1, top3 = run_filter_and_pick()
     if REPORT_TOP3 and top3:
         lines = [f"{i}) {r['symbol']} | sc={r['score']:.2f} | brk={r['brk']:.2f}% "
@@ -274,53 +242,38 @@ def _pick_once(relax=False):
                  f"mom1={r['mom1']:.2f}% spr={r['spr']:.0f}bp ob={r['imb']:.2f}"
                  for i,r in enumerate(top3,1)]
         tg_send("🎯 Top3:\n" + "\n".join(lines))
-    return top1, top3
+    return top1
 
-def scan_loop_until_sent():
-    global STATE, STOP_FLAG
-    STATE = "scanning"
-    try:
-        while not STOP_FLAG:
-            tg_send("🔎 فلترة…")
-            top1, _ = _pick_once()
-            if top1:
-                tg_send(f"🧠 Top1: {top1['symbol']} | score={top1['score']:.2f}")
-                ok = send_saqar(top1["base"])
-                tg_send(f"📡 أرسلت {top1['base']} إلى صقر | ok={ok}")
-                STATE = "waiting"
-                return
-            tg_send(f"⏸ لا يوجد مرشح — إعادة المحاولة بعد {RETRY_SECS}s.")
-            for _ in range(RETRY_SECS):
-                if STOP_FLAG: return
-                time.sleep(1)
-    finally:
-        # لو خرجنا بسبب stop أو خطأ، نرجع idle
-        if STATE != "waiting":
-            STATE = "idle"
+def _scan_loop(my_id: int):
+    tg_send(f"🔎 بدء فلترة (run={my_id})…")
+    while True:
+        # لو تم إطلاق سكان جديد، اخرج بهدوء
+        if my_id != RUN_ID: 
+            tg_send(f"↩️ أوقفت حلقة قديمة (run={my_id}) بسبب سكان أحدث (run={RUN_ID}).")
+            return
+        top1 = _pick_once()
+        if top1:
+            tg_send(f"🧠 Top1: {top1['symbol']} | score={top1['score']:.2f}")
+            ok = send_saqar(top1["base"])
+            tg_send(f"📡 أرسلت {top1['base']} إلى صقر | ok={ok} | run={my_id}")
+            return  # انتهى هذا السكان — لا قفل ولا انتظار
+        tg_send(f"⏸ لا يوجد مرشح — إعادة المحاولة بعد {RETRY_SECS}s (run={my_id}).")
+        for _ in range(RETRY_SECS):
+            if my_id != RUN_ID: return
+            time.sleep(1)
 
 def start_scan_loop():
-    global STOP_FLAG
-    STOP_FLAG = False
-    if STATE in ("scanning","waiting"):
-        tg_send(f"ℹ️ المتحكم بالحالة: STATE={STATE} — تجاهلت /scan.")
-        return
-    Thread(target=scan_loop_until_sent, daemon=True).start()
-
-def stop_scan_loop():
-    global STOP_FLAG, STATE
-    STOP_FLAG = True
-    STATE = "idle"
+    global RUN_ID
+    RUN_ID += 1
+    this_id = RUN_ID
+    Thread(target=_scan_loop, args=(this_id,), daemon=True).start()
+    tg_send(f"▶️ scan triggered (run={this_id})")
 
 # ===== HTTP =====
 @app.route("/scan", methods=["GET"])
 def scan_manual_http():
     start_scan_loop()
-    return jsonify(ok=True, state=STATE), 200
-
-@app.route("/stop", methods=["GET"])
-def stop_manual_http():
-    stop_scan_loop()
-    return jsonify(ok=True, state=STATE), 200
+    return jsonify(ok=True, run=RUN_ID), 200
 
 @app.route("/ready", methods=["POST"])
 def on_ready():
@@ -332,11 +285,9 @@ def on_ready():
     try: pnl_txt = f"{float(pnl):.4f}€" if pnl is not None else "—"
     except: pnl_txt = "—"
     tg_send(f"✅ صقر أنهى {coin} (سبب={reason}, ربح={pnl_txt}).")
-    # جاهزين لدورة جديدة؟
     if AUTOSCAN_ON_READY == 1:
-        tg_send("♻️ بدء دورة سكان جديدة تلقائيًا…")
         start_scan_loop()
-    return jsonify(ok=True, state=STATE)
+    return jsonify(ok=True, run=RUN_ID)
 
 # ===== Telegram webhook =====
 @app.route("/webhook", methods=["POST"])
@@ -348,14 +299,12 @@ def tg_webhook():
     if not chat_id or not _auth_chat(chat_id): return jsonify(ok=True), 200
     if text.startswith("/scan"):
         start_scan_loop(); return jsonify(ok=True), 200
-    if text.startswith("/stop"):
-        stop_scan_loop(); tg_send("⏹ تم إيقاف السكان."); return jsonify(ok=True), 200
     if text.startswith("/ping"):
-        tg_send(f"pong ✅ | state={STATE}"); return jsonify(ok=True), 200
-    tg_send("أوامر: /scan ، /stop ، /ping"); return jsonify(ok=True), 200
+        tg_send(f"pong ✅ | run={RUN_ID}"); return jsonify(ok=True), 200
+    tg_send("أوامر: /scan ، /ping"); return jsonify(ok=True), 200
 
 @app.get("/")
-def home(): return f"Abosiyah Lite — Smart loop (state={STATE}) ✅", 200
+def home(): return f"Abosiyah Lite — no-lock ✅ (run={RUN_ID})", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
