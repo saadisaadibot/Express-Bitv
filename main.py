@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Lite — يرسل Top1 إلى صقر عند /scan فقط.
-- لا يوجد قفل "مشغول".
-- يستقبل /ready من صقر (اختياري: يعمل سكان تلقائي بعدها إذا AUTOSCAN_ON_READY=1).
+Abosiyah Lite — ترشيح أذكى وإرسال Top1 إلى صقر عند /scan.
+- لا سر بين السيرفرين (LINK_SECRET مُلغى تماماً هنا).
+- /ready يقبل بدون أي هيدر سري.
+- فلترة مطوّرة: RSI+ADX+ATR+EMA+Breakout+OB Imbalance+Spread+Volume Spike + تقدير سرعة الوصول لـ ~0.3%
 
 ENV:
   BOT_TOKEN, CHAT_ID
   SAQAR_WEBHOOK              # مثال: https://saqer.up.railway.app  (بدون سلاش أخير)
-  LINK_SECRET                # اختياري: سر مشترك للهيدر X-Link-Secret
   EXCHANGE=bitvavo, QUOTE=EUR
   TOP_UNIVERSE=120, MAX_WORKERS=6, REQUEST_SLEEP_MS=40, MAX_RPS=8, REPORT_TOP3=1
-  TP_EUR_DEFAULT=0.05, SL_PCT_DEFAULT=-2
-  AUTOSCAN_ON_READY=0        # 1 لتفعيل سكان تلقائي بعد ready
+  AUTOSCAN_ON_READY=0
 """
 
-import os, time, statistics as st, requests, ccxt
+import os, time, math, statistics as st, requests, ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from flask import Flask, request, jsonify
@@ -27,7 +26,6 @@ app = Flask(__name__)
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
 SAQAR_URL   = os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/")
-LINK_SECRET = os.getenv("LINK_SECRET","").strip()
 
 EXCHANGE    = os.getenv("EXCHANGE","bitvavo").lower()
 QUOTE       = os.getenv("QUOTE","EUR").upper()
@@ -37,9 +35,6 @@ MAX_WORKERS       = max(1, int(os.getenv("MAX_WORKERS","6")))
 REQUEST_SLEEP_MS  = int(os.getenv("REQUEST_SLEEP_MS","40"))
 MAX_RPS           = float(os.getenv("MAX_RPS","8"))
 REPORT_TOP3       = int(os.getenv("REPORT_TOP3","1"))
-
-TP_EUR_DEFAULT    = float(os.getenv("TP_EUR_DEFAULT","0.05"))
-SL_PCT_DEFAULT    = float(os.getenv("SL_PCT_DEFAULT","-2"))
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","0"))
 
 # ===== Telegram =====
@@ -65,14 +60,14 @@ def throttle():
         if wait > 0: time.sleep(wait)
         _last_ts = time.time()
 
-def diplomatic_sleep(ms): 
+def diplomatic_sleep(ms):
     if ms>0: time.sleep(ms/1000.0)
 
 def fetch_ohlcv(sym, tf, limit):
     try: throttle(); return _ex.fetch_ohlcv(sym, tf, limit=limit) or []
     except: return []
 
-def fetch_orderbook(sym, depth=5):
+def fetch_orderbook(sym, depth=10):
     try:
         throttle(); ob = _ex.fetch_order_book(sym, limit=depth)
         if not ob or not ob.get("bids") or not ob.get("asks"): return None
@@ -84,14 +79,13 @@ def fetch_orderbook(sym, depth=5):
         return {"bid":bid,"ask":ask,"spread_bp":spr_bp,"bid_imb":imb}
     except: return None
 
-# ===== send to Saqer (UNIFIED PAYLOAD) =====
+# ===== إرسال إلى صقر (بدون أي سر) =====
 def send_saqar(base: str):
     if not SAQAR_URL:
         tg_send("⚠️ SAQAR_WEBHOOK غير مضبوط."); return False
     url = SAQAR_URL + "/hook"
-    payload = {"action":"buy","coin":base.upper(),"tp_eur":TP_EUR_DEFAULT,"sl_pct":SL_PCT_DEFAULT}
+    payload = {"action":"buy","coin":base.upper()}  # صقر يحتاج هدول فقط
     headers = {"Content-Type":"application/json"}
-    if LINK_SECRET: headers["X-Link-Secret"] = LINK_SECRET
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=(6,20))
         if 200 <= r.status_code < 300:
@@ -102,48 +96,176 @@ def send_saqar(base: str):
         tg_send(f"❌ خطأ إرسال لصقر: {e}")
     return False
 
-# ===== universe / scoring =====
+# ===== مؤشرات خفيفة =====
+def _ema(arr, n):
+    if not arr or len(arr) < n: return None
+    k = 2.0/(n+1.0)
+    ema = arr[0]
+    for v in arr[1:]:
+        ema = v*k + ema*(1-k)
+    return ema
+
+def _series_ema(arr, n):
+    if not arr or len(arr) < n: return []
+    k = 2.0/(n+1.0)
+    out = [arr[0]]
+    for v in arr[1:]:
+        out.append(v*k + out[-1]*(1-k))
+    return out
+
+def _rsi(closes, n=14):
+    if len(closes) < n+1: return None
+    gains=0.0; losses=0.0
+    for i in range(-n,0):
+        d = closes[i]-closes[i-1]
+        if d>=0: gains += d
+        else: losses += -d
+    avg_gain = gains/n; avg_loss = (losses/n) if losses>0 else 1e-9
+    rs = avg_gain/avg_loss
+    return 100.0 - (100.0/(1.0+rs))
+
+def _atr(highs, lows, closes, n=14):
+    if len(closes) < n+1: return None
+    trs=[]
+    for i in range(1,len(closes)):
+        tr=max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    atr = sum(trs[:n])/n
+    for tr in trs[n:]:
+        atr = (atr*(n-1)+tr)/n
+    return atr
+
+def _adx(highs, lows, closes, n=14):
+    if len(closes) < n+1: return None
+    plus_dm=[]; minus_dm=[]; trs=[]
+    for i in range(1,len(closes)):
+        up = highs[i]-highs[i-1]
+        dn = lows[i-1]-lows[i]
+        plus_dm.append(up if (up>dn and up>0) else 0.0)
+        minus_dm.append(dn if (dn>up and dn>0) else 0.0)
+        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    tr14=sum(trs[:n]); pDM14=sum(plus_dm[:n]); mDM14=sum(minus_dm[:n])
+    for i in range(n,len(trs)):
+        tr14  = tr14  - (tr14/n)  + trs[i]
+        pDM14 = pDM14 - (pDM14/n) + plus_dm[i]
+        mDM14 = mDM14 - (mDM14/n) + minus_dm[i]
+    if tr14<=0: return 0.0
+    pDI=(pDM14/tr14)*100.0; mDI=(mDM14/tr14)*100.0
+    dx=(abs(pDI-mDI)/max(pDI+mDI,1e-9))*100.0
+    return dx  # تقريب
+
+# ===== Universe: أعلى سيولة بالساعة ثم تصفية دقيقة =====
 def list_top_by_1h_volume():
     mk = _ex.load_markets()
     syms = [s for s,i in mk.items() if i.get("active",True) and i.get("quote")==QUOTE]
     syms = syms[:max(10,min(TOP_UNIVERSE,len(syms)))]
-    rows = []
+    rows=[]
     for s in syms:
         o1h = fetch_ohlcv(s, "1h", 2)
         if not o1h: continue
-        close = float(o1h[-1][4]); vol = float(o1h[-1][5]); q = close*vol
+        close=float(o1h[-1][4]); vol=float(o1h[-1][5]); q=close*vol
         rows.append((s,q)); diplomatic_sleep(REQUEST_SLEEP_MS)
-    rows.sort(key=lambda x: x[1], reverse=True)
+    rows.sort(key=lambda x:x[1], reverse=True)
     return [s for s,_ in rows[:50]]
 
-def eval_symbol(sym: str):
-    ob = fetch_orderbook(sym, depth=5)
+def _eval_fast(sym: str):
+    """
+    فلترة ذكية على 1m (240 كاندل) + Orderbook + سرعة متوقعة.
+    """
+    ob = fetch_orderbook(sym, depth=10)
     if not ob: return None
-    o1 = fetch_ohlcv(sym, "1m", 40)
-    if len(o1) < 25: return None
-    lc, lv = float(o1[-1][4]), float(o1[-1][5])
+
+    o1 = fetch_ohlcv(sym, "1m", 240)
+    if len(o1) < 210:  # بدنا EMA200
+        return None
+
+    closes=[float(x[4]) for x in o1]
+    highs =[float(x[2]) for x in o1]
+    lows  =[float(x[3]) for x in o1]
+    vols  =[float(x[5]) for x in o1]
+
+    lc = closes[-1]
+    ema50  = _series_ema(closes, 50)[-1]
+    ema200 = _series_ema(closes, 200)[-1]
+    trend_up = (ema50 is not None and ema200 is not None and ema50 > ema200)
+
+    rsi = _rsi(closes, 14) or 50.0
+    adx = _adx(highs, lows, closes, 14) or 0.0
+    atr = _atr(highs, lows, closes, 14) or 0.0
+    atr_pct = (atr/lc)*100.0 if lc>0 and atr>0 else 0.0
+
+    # Breakout مقابل أعلى قمة آخر 20 شمعة (قبل الحالية)
     prev20 = o1[-21:-1]
-    medv   = st.median([float(x[5]) for x in prev20 if float(x[5])>0]) if prev20 else 0.0
-    h20    = max(float(x[2]) for x in prev20) if prev20 else lc
-    brk = max((lc/max(h20,1e-12)-1)*100.0, 0.0)
-    try: d1 = (lc/float(o1[-2][4])-1)*100.0
-    except: d1 = 0.0
-    try: d3 = (lc/float(o1[-4][4])-1)*100.0
-    except: d3 = 0.0
-    mom = max(d1,0.0) + 0.5*max(d3,0.0)
-    vm  = max(min((lv/max(medv,1e-9)) if medv>0 else 0.0, 6.0), 0.0)
-    ob_bonus = min(max(ob["bid_imb"],0.0),2.0)*0.3
-    spr_pen  = (ob["spread_bp"]/100.0)*0.2
-    score = 1.15*brk + 0.85*vm + 0.6*mom + ob_bonus - spr_pen
-    return {"symbol":sym,"base":sym.split("/")[0],"score":score,"brk":brk,"vm":vm,
-            "mom1":d1,"mom3":d3,"spr":ob["spread_bp"],"imb":ob["bid_imb"]}
+    h20 = max(float(x[2]) for x in prev20) if prev20 else lc
+    brk_pct = ((lc/max(h20,1e-9))-1.0)*100.0 if lc>0 else 0.0
+    brk_pct = max(brk_pct, 0.0)
+
+    # Volume spike
+    medv = st.median([float(x[5]) for x in prev20 if float(x[5])>0]) if prev20 else 0.0
+    v_spike = (float(o1[-1][5])/max(medv,1e-9)) if medv>0 else 0.0
+
+    # Momentum قصير جداً
+    def pct(a,b): 
+        try: return (a/b-1.0)*100.0
+        except: return 0.0
+    mom1 = pct(closes[-1], closes[-2])
+    mom3 = pct(closes[-1], closes[-4]) if len(closes)>=4 else 0.0
+    mom5 = pct(closes[-1], closes[-6]) if len(closes)>=6 else 0.0
+
+    # شروط صلبة (Hard filters) — بسرعة نرمي الرمادية:
+    if not trend_up: return None
+    if adx < 20: return None
+    if not (48.0 <= rsi <= 78.0): return None
+    if ob["spread_bp"] > 20.0: return None  # سبريد واسع = بطيء غالباً
+    if ob["bid_imb"] < 1.10: return None    # ما في دفع من المشترين
+    if not (0.08 <= atr_pct <= 0.80): return None  # حركة كافية لكن مو مبالغ فيها
+
+    # تقدير سرعة الوصول لـ ~0.3%: نستخدم “نبض” = (mom1+0.5*mom3+0.25*mom5) + Breakout/2 + (atr_pct/2)
+    # (هدفنا تمييز العملات اللي تتحرك "هلأ")
+    pulse = max(mom1,0.0) + 0.5*max(mom3,0.0) + 0.25*max(mom5,0.0) + 0.5*brk_pct + 0.5*(atr_pct/1.0)
+    # Score مركّب
+    # - قرب RSI من 60 أفضل؛
+    # - ADX أعلى = أقوى؛
+    # - Breakout إيجابي؛
+    # - Volume spike؛
+    # - Orderbook imbalance؛
+    # - Spread عقوبة؛
+    # - Pulse لسرعة الحركة.
+    rsi_bias = -abs(rsi-60.0)/6.0  # أقرب لـ60 أحسن
+    score = (
+        1.20*brk_pct +
+        0.90*min(v_spike, 6.0) +
+        0.80*max(pulse, 0.0) +
+        0.65*(adx/30.0) +
+        0.50*min(ob["bid_imb"], 2.0) +
+        0.40*rsi_bias -
+        0.25*(ob["spread_bp"]/10.0)
+    )
+
+    return {
+        "symbol": sym,
+        "base": sym.split("/")[0],
+        "score": float(score),
+        "lc": lc,
+        "ema50>ema200": trend_up,
+        "rsi": float(rsi),
+        "adx": float(adx),
+        "atr_pct": float(atr_pct),
+        "brk": float(brk_pct),
+        "v_spike": float(v_spike),
+        "mom1": float(mom1),
+        "mom3": float(mom3),
+        "mom5": float(mom5),
+        "spr": float(ob["spread_bp"]),
+        "imb": float(ob["bid_imb"])
+    }
 
 def run_filter_and_pick():
     top_syms = list_top_by_1h_volume()
     if not top_syms: return None, []
-    cands = []
+    cands=[]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = {pool.submit(eval_symbol, s): s for s in top_syms}
+        futs = {pool.submit(_eval_fast, s): s for s in top_syms}
         for f in as_completed(futs):
             r = f.result()
             if r: cands.append(r)
@@ -157,18 +279,21 @@ SCANNING = False
 def do_scan_and_send():
     global SCANNING
     if SCANNING:
-        tg_send("⏳ سكان شغّال الآن… تجاهلت الطلب المكرر.")
-        return
+        tg_send("⏳ سكان شغّال الآن… تجاهلت الطلب المكرر."); return
     SCANNING = True
     try:
-        tg_send("🔎 بدء فلترة Best-of-50 (1h→1m)…")
+        tg_send("🔎 بدء فلترة (1h سيولة → 1m مؤشرات+OB)…")
         top1, top3 = run_filter_and_pick()
         if not top1:
-            tg_send("⏸ لا يوجد مرشح (بيانات ناقصة)."); return
+            tg_send("⏸ لا يوجد مرشح مناسب حالياً."); return
         if REPORT_TOP3:
-            lines = [f"{i}) {r['symbol']}: sc={r['score']:.2f} | brk={r['brk']:.2f}% "
-                     f"volx={r['vm']:.2f} | mom1={r['mom1']:.2f}% | spr={r['spr']:.0f}bp ob={r['imb']:.2f}"
-                     for i,r in enumerate(top3,1)]
+            lines=[]
+            for i,r in enumerate(top3,1):
+                lines.append(
+                    f"{i}) {r['symbol']} | sc={r['score']:.2f} | brk={r['brk']:.2f}% "
+                    f"RSI={r['rsi']:.1f} ADX={r['adx']:.1f} ATR%={r['atr_pct']:.3f}% "
+                    f"mom1={r['mom1']:.2f}% spr={r['spr']:.0f}bp ob={r['imb']:.2f}"
+                )
             tg_send("🎯 Top3:\n" + "\n".join(lines))
         tg_send(f"🧠 Top1: {top1['symbol']} | score={top1['score']:.2f}")
         ok = send_saqar(top1["base"])
@@ -185,8 +310,6 @@ def scan_manual_http():
 @app.route("/ready", methods=["POST"])
 def on_ready():
     # صقر سيرسل: {"coin":"ADA","reason":"tp_filled|sl_triggered|buy_failed","pnl_eur":null}
-    if LINK_SECRET and request.headers.get("X-Link-Secret","") != LINK_SECRET:
-        return jsonify(ok=False, err="bad secret"), 401
     data = request.get_json(force=True) or {}
     coin   = (data.get("coin") or "").upper()
     reason = data.get("reason") or "-"
@@ -214,7 +337,7 @@ def tg_webhook():
     tg_send("أوامر: /scan ، /ping"); return jsonify(ok=True), 200
 
 @app.get("/")
-def home(): return "Abosiyah Lite — Top1 on demand ✅", 200
+def home(): return "Abosiyah Lite — Smart Top1 on demand ✅", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
