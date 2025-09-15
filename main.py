@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Lite — Scanner بلا قفل:
-- /scan: يبدّل فوراً لأي حلقة قديمة ويبدأ سكان جديد حتى يلاقي مرشح ويرسله.
-- /ready: لو AUTOSCAN_ON_READY=1 يبدأ سكان جديد فوراً (أيضاً بلا قفل).
-- لا يوجد STATE/LOCK. التحكم عبر RUN_ID: كل سكان جديد يزيد المعرف ويُنهي القديم سلمياً.
-- فلترة ذكية (RSI+ADX+ATR+EMA+Breakout+OB) + إعادة محاولة كل RETRY_SECS عند عدم وجود مرشح.
+Abosiyah Lite — No-hard-filters Top1 Scanner (soft penalties)
+- بلا قفل: كل /scan يزيد RUN_ID والحلقة الأقدم تنسحب بهدوء.
+- يعيد المحاولة كل RETRY_SECS حتى يلقى مرشح ويرسله لصقر.
+- /ready يعيد تشغيل سكان تلقائياً لو AUTOSCAN_ON_READY=1.
+- اختيار المرشح يتم بنقاط مع عقوبات ناعمة بدل الاستبعاد.
 """
 
-import os, time, statistics as st, requests, ccxt
+import os, time, statistics as st, math, requests, ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Thread
 from flask import Flask, request, jsonify
@@ -17,13 +17,16 @@ from dotenv import load_dotenv
 load_dotenv()
 app = Flask(__name__)
 
+# Telegram / Saqer
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
 SAQAR_URL   = os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/")
 
+# Exchange
 EXCHANGE    = os.getenv("EXCHANGE","bitvavo").lower()
 QUOTE       = os.getenv("QUOTE","EUR").upper()
 
+# Scanner tuning
 TOP_UNIVERSE      = int(os.getenv("TOP_UNIVERSE","120"))
 MAX_WORKERS       = max(1, int(os.getenv("MAX_WORKERS","6")))
 REQUEST_SLEEP_MS  = int(os.getenv("REQUEST_SLEEP_MS","40"))
@@ -31,6 +34,11 @@ MAX_RPS           = float(os.getenv("MAX_RPS","8"))
 REPORT_TOP3       = int(os.getenv("REPORT_TOP3","1"))
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
 RETRY_SECS        = int(os.getenv("RETRY_SECS","60"))
+
+# Soft-mode knobs
+STRICTNESS            = float(os.getenv("STRICTNESS", "1.0"))   # 0..1 (1 = مرن جداً)
+MAX_SPREAD_BP_SOFT    = float(os.getenv("MAX_SPREAD_BP_SOFT", "35"))
+MIN_CANDLES_1M        = int(os.getenv("MIN_CANDLES_1M", "60"))
 
 # ===== Telegram =====
 def tg_send(text):
@@ -73,6 +81,10 @@ def fetch_orderbook(sym, depth=10):
         imb = bv/max(av,1e-9)
         return {"bid":bid,"ask":ask,"spread_bp":spr_bp,"bid_imb":imb}
     except: return None
+
+def fetch_trades(sym, limit=300):
+    try: throttle(); return _ex.fetch_trades(sym, limit=limit) or []
+    except: return []
 
 # ===== إرسال إلى صقر (no secret) =====
 def send_saqar(base: str):
@@ -141,7 +153,7 @@ def _adx(highs, lows, closes, n=14):
     dx=(abs(pDI-mDI)/max(pDI+mDI,1e-9))*100.0
     return dx
 
-# ===== Universe + تقييم =====
+# ===== Universe + تقييم مرن =====
 def list_top_by_1h_volume():
     mk = _ex.load_markets()
     syms = [s for s,i in mk.items() if i.get("active",True) and i.get("quote")==QUOTE]
@@ -156,20 +168,25 @@ def list_top_by_1h_volume():
     return [s for s,_ in rows[:50]]
 
 def _eval_fast(sym: str):
-    ob = fetch_orderbook(sym, depth=10)
+    ob = fetch_orderbook(sym, depth=15)
     if not ob: return None
+
     o1 = fetch_ohlcv(sym, "1m", 240)
-    if len(o1) < 60: return None
+    if len(o1) < MIN_CANDLES_1M:
+        return None
 
     closes=[float(x[4]) for x in o1]
     highs =[float(x[2]) for x in o1]
     lows  =[float(x[3]) for x in o1]
     lc = closes[-1]
 
-    ema50  = _series_ema(closes, 50)
-    ema200 = _series_ema(closes, 200)
-    ema50  = ema50[-1]  if ema50  else None
-    ema200 = ema200[-1] if ema200 else None
+    # مؤشرات أساسية
+    def pct(a,b):
+        try: return (a/b-1.0)*100.0
+        except: return 0.0
+
+    ema50s  = _series_ema(closes, 50);  ema50  = ema50s[-1]  if ema50s  else None
+    ema200s = _series_ema(closes, 200); ema200 = ema200s[-1] if ema200s else None
     trend_up = (ema50 is not None and ema200 is not None and ema50 > ema200)
 
     rsi = _rsi(closes, 14) or 50.0
@@ -179,43 +196,72 @@ def _eval_fast(sym: str):
 
     prev20 = o1[-21:-1] if len(o1) >= 21 else o1[:-1]
     h20 = max(float(x[2]) for x in prev20) if prev20 else lc
-    brk_pct = ((lc/max(h20,1e-9))-1.0)*100.0 if lc>0 else 0.0
-    brk_pct = max(brk_pct, 0.0)
+    brk_pct = max(((lc/max(h20,1e-9))-1.0)*100.0, 0.0) if lc>0 else 0.0
 
     medv = st.median([float(x[5]) for x in prev20 if float(x[5])>0]) if prev20 else 0.0
     v_spike = (float(o1[-1][5])/max(medv,1e-9)) if medv>0 else 0.0
 
-    def pct(a,b): 
-        try: return (a/b-1.0)*100.0
-        except: return 0.0
     mom1 = pct(closes[-1], closes[-2]) if len(closes)>=2 else 0.0
     mom3 = pct(closes[-1], closes[-4]) if len(closes)>=4 else 0.0
     mom5 = pct(closes[-1], closes[-6]) if len(closes)>=6 else 0.0
 
-    # Hard filters
-    if not trend_up: return None
-    if adx < 20: return None
-    if not (48.0 <= rsi <= 78.0): return None
-    if ob["spread_bp"] > 20.0: return None
-    if ob["bid_imb"] < 1.10: return None
-    if not (0.08 <= atr_pct <= 0.80): return None
+    # Tape speed & dominance (آخر 60ث)
+    recent = fetch_trades(sym, limit=300)
+    now_ms = int(time.time()*1000); min_ms = now_ms - 60_000
+    t_cnt = 0; buy_vol=0.0; sell_vol=0.0
+    for t in recent:
+        ts = int(t.get('timestamp') or 0)
+        if ts < min_ms: continue
+        amt = float(t.get('amount') or 0.0)
+        sd  = (t.get('side') or '').lower()
+        t_cnt += 1
+        if sd == 'buy':  buy_vol  += amt
+        elif sd == 'sell': sell_vol += amt
+    tps    = t_cnt/60.0                          # trades per second
+    buydom = (buy_vol / max(buy_vol+sell_vol, 1e-9)) if (buy_vol+sell_vol)>0 else 0.0
 
-    pulse = max(mom1,0.0) + 0.5*max(mom3,0.0) + 0.25*max(mom5,0.0) + 0.5*brk_pct + 0.5*(atr_pct/1.0)
+    # Book pressure (3 مستويات)
+    try:
+        bsum = sum(float(x[1]) for x in _ex.fetch_order_book(sym, limit=3)['bids'][:3]); throttle()
+        asum = sum(float(x[1]) for x in _ex.fetch_order_book(sym, limit=3)['asks'][:3])
+        ob3  = bsum/max(asum,1e-9)
+    except:
+        ob3 = ob["bid_imb"]
+
+    # ======= Soft penalties بدل الفلاتر =======
+    pen = 0.0; s = STRICTNESS
+    pen += s * max(0.0, (ob["spread_bp"] - MAX_SPREAD_BP_SOFT)/10.0)
+    if trend_up is False:     pen += 1.5 * s
+    pen += s * max(0.0, (48.0 - rsi)/12.0)      # RSI منخفض جداً
+    pen += s * max(0.0, (rsi - 78.0)/12.0)      # RSI عالي جداً
+    pen += s * max(0.0, (22.0 - adx)/6.0)       # ADX ضعيف
+    pen += s * max(0.0, (0.08 - atr_pct)/0.04)  # ATR ضعيف جداً
+    pen += s * max(0.0, (atr_pct - 0.90)/0.30)  # تذبذب مبالغ
+    pen += s * max(0.0, (1.20 - ob3) * 1.2)     # ضغط شراء ضعيف
+    pen += s * max(0.0, (0.55 - buydom) * 2.0)  # هيمنة المشترين ضعيفة
+    pen += s * max(0.0, (2.0  - tps)    * 0.8)  # التيب بطيء
+
+    # Score إيجابي
     rsi_bias = -abs(rsi-60.0)/6.0
+    pulse = max(mom1,0.0) + 0.5*max(mom3,0.0) + 0.25*max(mom5,0.0) + 0.5*brk_pct + 0.5*(atr_pct/1.0)
     score = (
-        1.20*brk_pct +
+        1.50*min(tps, 6.0) +
+        1.10*(buydom*10.0) +
+        1.00*min(ob3, 2.5) +
         0.90*min(v_spike, 6.0) +
-        0.80*max(pulse, 0.0) +
-        0.65*(adx/30.0) +
-        0.50*min(ob["bid_imb"], 2.0) +
+        0.75*max(pulse, 0.0) +
+        0.60*(adx/30.0) +
         0.40*rsi_bias -
-        0.25*(ob["spread_bp"]/10.0)
-    )
+        0.15*(ob["spread_bp"]/10.0)
+    ) - pen
 
-    return {"symbol": sym, "base": sym.split("/")[0], "score": float(score),
-            "rsi": float(rsi), "adx": float(adx), "atr_pct": float(atr_pct),
-            "brk": float(brk_pct), "mom1": float(mom1),
-            "spr": float(ob["spread_bp"]), "imb": float(ob["bid_imb"])}
+    return {
+        "symbol": sym, "base": sym.split("/")[0], "score": float(score),
+        "rsi": float(rsi), "adx": float(adx), "atr_pct": float(atr_pct),
+        "brk": float(brk_pct), "mom1": float(mom1),
+        "spr": float(ob["spread_bp"]), "imb": float(ob3),
+        "tps": float(tps), "dom": float(buydom)
+    }
 
 def run_filter_and_pick():
     top_syms = list_top_by_1h_volume()
@@ -228,18 +274,25 @@ def run_filter_and_pick():
             if r: cands.append(r)
             diplomatic_sleep(REQUEST_SLEEP_MS)
     if not cands: return None, []
+
+    # تطبيع Z-score داخلي لتحسين المقارنة
+    m = sum(r["score"] for r in cands)/len(cands)
+    v = sum((r["score"]-m)**2 for r in cands)/max(1,len(cands)-1)
+    sd = math.sqrt(max(v, 1e-9))
+    for r in cands: r["score"] = (r["score"]-m)/sd
+
     cands.sort(key=lambda r: r["score"], reverse=True)
     return cands[0], cands[:3]
 
 # ===== تشغيل بلا قفل عبر RUN_ID =====
-RUN_ID = 0  # أي سكان جديد يزيده، والحلقة القديمة تخرج لو تغيّر
+RUN_ID = 0  # كل /scan يزيده وتنسحب الحلقات الأقدم
 
-def _pick_once():
+def _pick_once_with_report():
     top1, top3 = run_filter_and_pick()
     if REPORT_TOP3 and top3:
         lines = [f"{i}) {r['symbol']} | sc={r['score']:.2f} | brk={r['brk']:.2f}% "
                  f"RSI={r['rsi']:.1f} ADX={r['adx']:.1f} ATR%={r['atr_pct']:.3f}% "
-                 f"mom1={r['mom1']:.2f}% spr={r['spr']:.0f}bp ob={r['imb']:.2f}"
+                 f"tps={r['tps']:.2f}/s dom={r['dom']:.2f} spr={r['spr']:.0f}bp ob3={r['imb']:.2f}"
                  for i,r in enumerate(top3,1)]
         tg_send("🎯 Top3:\n" + "\n".join(lines))
     return top1
@@ -247,16 +300,15 @@ def _pick_once():
 def _scan_loop(my_id: int):
     tg_send(f"🔎 بدء فلترة (run={my_id})…")
     while True:
-        # لو تم إطلاق سكان جديد، اخرج بهدوء
         if my_id != RUN_ID: 
             tg_send(f"↩️ أوقفت حلقة قديمة (run={my_id}) بسبب سكان أحدث (run={RUN_ID}).")
             return
-        top1 = _pick_once()
+        top1 = _pick_once_with_report()
         if top1:
             tg_send(f"🧠 Top1: {top1['symbol']} | score={top1['score']:.2f}")
             ok = send_saqar(top1["base"])
             tg_send(f"📡 أرسلت {top1['base']} إلى صقر | ok={ok} | run={my_id}")
-            return  # انتهى هذا السكان — لا قفل ولا انتظار
+            return
         tg_send(f"⏸ لا يوجد مرشح — إعادة المحاولة بعد {RETRY_SECS}s (run={my_id}).")
         for _ in range(RETRY_SECS):
             if my_id != RUN_ID: return
@@ -277,7 +329,6 @@ def scan_manual_http():
 
 @app.route("/ready", methods=["POST"])
 def on_ready():
-    # Saqer sends: {"coin":"ADA","reason":"tp_filled|sl_triggered|buy_failed","pnl_eur":null}
     data = request.get_json(force=True) or {}
     coin   = (data.get("coin") or "").upper()
     reason = data.get("reason") or "-"
@@ -304,7 +355,7 @@ def tg_webhook():
     tg_send("أوامر: /scan ، /ping"); return jsonify(ok=True), 200
 
 @app.get("/")
-def home(): return f"Abosiyah Lite — no-lock ✅ (run={RUN_ID})", 200
+def home(): return f"Abosiyah Lite — soft-penalty Top1 ✅ (run={RUN_ID})", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
