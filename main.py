@@ -128,8 +128,13 @@ def book(market, depth=3):
     if not isinstance(data, dict):
         return None
     try:
-        bids = [(float(p), float(a)) for p,a,_ in (data.get("bids") or [])]
-        asks = [(float(p), float(a)) for p,a,_ in (data.get("asks") or [])]
+        bids=[]; asks=[]
+        for row in data.get("bids") or []:
+            if len(row)>=2:
+                bids.append((float(row[0]), float(row[1])))
+        for row in data.get("asks") or []:
+            if len(row)>=2:
+                asks.append((float(row[0]), float(row[1])))
         if not bids or not asks:
             report_error("bad book", f"{market} (no bid/ask)")
             return None
@@ -145,7 +150,6 @@ def book(market, depth=3):
     except Exception as e:
         report_error("parse /book", f"{market} {type(e).__name__}: {e}")
         return None
-
 def trades(market, limit=60):
     data = bv_safe("/trades", params={"market": market, "limit": limit}, tag=f"/trades {market}")
     if data is None:
