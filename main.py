@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Pro v3 — 15m Profit Hunter (full, SAQAR_WEBHOOK version)
+Abosiyah Pro v3 — 15m Profit Hunter (saqar-style webhook)
+- يرسل إلى صقر بنفس أسلوب Abosiyah Lite القديم:
+  SAQAR_WEBHOOK + "/hook"  (POST JSON: {"action":"buy","coin":"BASE"})
+- بدون أسرار/هيدرز إضافية.
+- يحتوي: Gap-Sniper + Multi-Score، fallback لشموع 1m عند 403 /trades،
+  تنبيهات أخطاء بمكبح، /scan يدوي، autoscan عند /ready، /health.
 
-ENV (examples):
+ENV examples:
   BOT_TOKEN, CHAT_ID
-  SAQAR_WEBHOOK="https://your-saqAR-host/hook", LINK_SECRET=""
+  SAQAR_WEBHOOK="http://saqar:8080"   # لا تضع /hook هنا
   AUTOSCAN_ON_READY=1
   SCORE_STAR=0.65
   MAX_SPREAD=0.22
@@ -28,8 +33,7 @@ from flask import Flask, request, jsonify
 BITVAVO = "https://api.bitvavo.com/v2"
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
-SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK","").strip()   # <— هنا التعديل
-LINK_SECRET = os.getenv("LINK_SECRET","").strip()
+SAQAR_URL   = os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/")  # مثل القديم تمامًا
 
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
 SCORE_STAR  = float(os.getenv("SCORE_STAR","0.65"))
@@ -73,8 +77,7 @@ def tg_send(txt: str):
 def _should_report(key: str) -> bool:
     ts = _LAST_ERR.get(key, 0)
     if time.time() - ts >= ERROR_COOLDOWN_SEC:
-        _LAST_ERR[key] = time.time()
-        return True
+        _LAST_ERR[key] = time.time(); return True
     return False
 
 def report_error(tag: str, detail: str):
@@ -85,29 +88,23 @@ def report_error(tag: str, detail: str):
 def _url_ok(url: str) -> bool:
     return isinstance(url, str) and url.startswith(("http://", "https://"))
 
-# تحذير تهيئة إن كان الرابط ناقص
-if not _url_ok(SAQAR_WEBHOOK):
+if not _url_ok(SAQAR_URL):
     report_error("config", "SAQAR_WEBHOOK غير صالح/فارغ — لن أرسل buy حتى يُضبط.")
 
-# ===== Bitvavō helpers (قراءة عامة) =====
+# ===== Bitvavo helpers (قراءة عامة) =====
 def bv_safe(path, timeout=6, params=None, tag=None):
     tag = tag or path
     try:
         r = requests.get(f"{BITVAVO}{path}", params=params, timeout=timeout)
         if not (200 <= r.status_code < 300):
-            report_error(f"API error {tag}", f"HTTP {r.status_code}")
-            return None
-        try:
-            return r.json()
+            report_error(f"API error {tag}", f"HTTP {r.status_code}"); return None
+        try: return r.json()
         except Exception as e:
-            report_error(f"JSON error {tag}", str(e))
-            return None
+            report_error(f"JSON error {tag}", str(e)); return None
     except requests.Timeout:
-        report_error(f"Timeout {tag}", f"after {timeout}s")
-        return None
+        report_error(f"Timeout {tag}", f"after {timeout}s"); return None
     except Exception as e:
-        report_error(f"HTTP exc {tag}", f"{type(e).__name__}: {e}")
-        return None
+        report_error(f"HTTP exc {tag}", f"{type(e).__name__}: {e}"); return None
 
 def list_markets_eur():
     rows = bv_safe("/markets", tag="/markets") or []
@@ -121,13 +118,11 @@ def list_markets_eur():
             out.append((m,b,float(r.get("pricePrecision",6)), minq))
         except Exception as e:
             report_error("parse /markets", f"{type(e).__name__}: {e}")
-            continue
     return out
 
 def book(market, depth=3):
     data = bv_safe(f"/{market}/book", params={"depth": depth}, tag=f"/book {market}")
-    if not isinstance(data, dict):
-        return None
+    if not isinstance(data, dict): return None
     try:
         bids=[]; asks=[]
         for row in data.get("bids") or []:
@@ -135,8 +130,7 @@ def book(market, depth=3):
         for row in data.get("asks") or []:
             if len(row)>=2: asks.append((float(row[0]), float(row[1])))
         if not bids or not asks:
-            report_error("bad book", f"{market} (no bid/ask)")
-            return None
+            report_error("bad book", f"{market} (no bid/ask)"); return None
         best_bid = bids[0][0]; best_ask = asks[0][0]
         spread = (best_ask-best_bid)/best_bid*100 if best_bid>0 else 9e9
         depth_bid = sum(p*a for p,a in bids[:3])
@@ -147,38 +141,30 @@ def book(market, depth=3):
             "bids":bids,"asks":asks
         }
     except Exception as e:
-        report_error("parse /book", f"{market} {type(e).__name__}: {e}")
-        return None
+        report_error("parse /book", f"{market} {type(e).__name__}: {e}"); return None
 
 def candles(market, interval="1m", limit=240):
     data = bv_safe(f"/{market}/candles", params={"interval":interval,"limit":limit}, tag=f"/candles {market}")
     return data if isinstance(data, list) else []
 
 def trades(market, limit=60):
-    # منع مؤقت إن كان السوق محظور trades (403) مؤخراً
-    if TRADES_BAN_UNTIL.get(market, 0) > time.time():
-        return []
+    if TRADES_BAN_UNTIL.get(market, 0) > time.time(): return []
     try:
         r = requests.get(f"{BITVAVO}/trades", params={"market": market, "limit": limit}, timeout=6)
         if r.status_code == 403:
-            TRADES_BAN_UNTIL[market] = time.time() + 600  # 10 دقائق
-            report_error("trades 403", f"{market} — fallback إلى الشموع لمدة 10د")
-            return []
+            TRADES_BAN_UNTIL[market] = time.time() + 600
+            report_error("trades 403", f"{market} — fallback إلى الشموع لمدة 10د"); return []
         if not (200 <= r.status_code < 300):
-            report_error("API error /trades", f"{market} — HTTP {r.status_code}")
-            return []
+            report_error("API error /trades", f"{market} — HTTP {r.status_code}"); return []
         try:
             data = r.json()
             return data if isinstance(data, list) else []
         except Exception as e:
-            report_error("JSON /trades", f"{market} — {e}")
-            return []
+            report_error("JSON /trades", f"{market} — {e}"); return []
     except requests.Timeout:
-        report_error("Timeout /trades", f"{market} بعد 6s")
-        return []
+        report_error("Timeout /trades", f"{market} بعد 6s"); return []
     except Exception as e:
-        report_error("HTTP exc /trades", f"{market} — {type(e).__name__}: {e}")
-        return []
+        report_error("HTTP exc /trades", f"{market} — {type(e).__name__}: {e}"); return []
 
 # ===== تقديرات سريعة =====
 def estimate_slippage_pct(asks, want_eur: float):
@@ -196,25 +182,18 @@ def estimate_slippage_pct(asks, want_eur: float):
     return (last/first - 1.0)*100.0
 
 def tape_from_candles_fallback(market):
-    """
-    (uptick_proxy, speed_proxy):
-    - uptick_proxy: نسبة شموع خضراء مرجّحة بالحجوم آخر 5 دقائق (0..1)
-    - speed_proxy : معدل الحركة الأخيرة (٪/دقيقة) → نعيده كنطاق 0..2 مثل trades_10s_speed
-    """
     cs = candles(market, "1m", limit=6)
-    if not cs or len(cs) < 4:
-        return 0.5, 0.0
+    if not cs or len(cs) < 4: return 0.5, 0.0
     closes = [float(r[4]) for r in cs]
     opens  = [float(r[1]) for r in cs]
     vols   = [float(r[5]) for r in cs]
     greens = 0.0; vol_sum = 0.0
     for o,c,v in zip(opens[-6:-1], closes[-6:-1], vols[-6:-1]):
-        w = max(v, 1e-9)
-        vol_sum += w
+        w = max(v, 1e-9); vol_sum += w
         if c >= o: greens += w
     uptick_proxy = (greens / max(vol_sum, 1e-9)) if vol_sum>0 else 0.5
-    r1 = (closes[-1] / max(closes[-2], 1e-9) - 1.0) * 100.0
-    r2 = (closes[-2] / max(closes[-3], 1e-9) - 1.0) * 100.0
+    r1 = (closes[-1]/max(closes[-2],1e-9)-1.0)*100.0
+    r2 = (closes[-2]/max(closes[-3],1e-9)-1.0)*100.0
     speed_proxy = max(-2.0, min(2.0, 0.6*r1 + 0.4*r2))
     speed_norm = max(0.0, min(2.0, abs(speed_proxy)))
     return float(uptick_proxy), float(speed_norm)
@@ -254,10 +233,8 @@ def adx_rsi_lite(market):
         d = closes[i]-closes[i-1]
         gains += d if d>=0 else 0.0
         loss  += -d if d<0 else 0.0
-    avg_gain = gains/14
-    avg_loss = loss/14 if loss>0 else 1e-9
-    rs = avg_gain/avg_loss
-    rsi = 100.0 - (100.0 / (1.0+rs))
+    avg_gain = gains/14; avg_loss = loss/14 if loss>0 else 1e-9
+    rs = avg_gain/avg_loss; rsi = 100.0 - (100.0 / (1.0+rs))
     trs=[]
     for i in range(1,len(closes)):
         trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
@@ -275,17 +252,13 @@ def score_market(market, cache):
     trs = cache.get(("trades",market))
     if trs is None or (trs and now_ms - int(trs[0].get("timestamp",0) or 0) > 2000):
         trs = trades(market, 60); cache[("trades",market)] = trs
-
     if not bk or bk["bid"]<=0 or bk["ask"]<=0:
         return 0.0, {"why":"no_book"}
 
     spread = bk["spread_pct"]
     depthB = bk["depth_bid_eur"]; depthA = bk["depth_ask_eur"]
-
-    # Tape: trades أو fallback من الشموع
     if trs:
-        ur = uptick_ratio(trs)
-        spd = trades_10s_speed(trs, now_ms)
+        ur = uptick_ratio(trs); spd = trades_10s_speed(trs, now_ms)
     else:
         ur, spd = tape_from_candles_fallback(market)
 
@@ -354,38 +327,26 @@ def adjusted_s_star(coin):
     adj = (LEARN.get(coin) or {}).get("adj", 0.0)
     return max(0.52, min(0.90, SCORE_STAR + adj))
 
-# ===== إرسال الإشارة لصقر (مع رصد أخطاء) =====
+# ===== إرسال الإشارة لصقر — نفس أسلوب الكود القديم =====
 def send_buy(coin, score, why):
     global LAST_SIGNAL_TS
-    if not _url_ok(SAQAR_WEBHOOK):
-        report_error("send_buy", "SAQAR_WEBHOOK مفقود/غير صالح — تجاهلت الإرسال.")
-        return
-    body = {
-        "action":"buy",
-        "coin": coin,
-        "ttl_sec": TTL_SEC,
-        "confidence": round(score,3),
-        "tp_eur_hint": TP_EUR_HINT,
-        "why": why
-    }
-    headers={"Content-Type":"application/json"}
-    if LINK_SECRET: headers["X-Link-Secret"]=LINK_SECRET
+    if not _url_ok(SAQAR_URL):
+        report_error("send_buy", "SAQAR_WEBHOOK مفقود/غير صالح — تجاهلت الإرسال."); return
+    url = SAQAR_URL + "/hook"                      # <— تمامًا مثل القديم
+    payload = {"action":"buy", "coin": coin.upper()}
     try:
-        r = requests.post(SAQAR_WEBHOOK, json=body, headers=headers, timeout=6)
+        r = requests.post(url, json=payload, timeout=(6,20))
         if 200 <= r.status_code < 300:
             LAST_SIGNAL_TS = time.time()
-            tg_send(f"🚀 BUY {coin} ({score:.2f}) — {why[:120]}")
+            tg_send(f"🚀 أرسلت {coin} إلى صقر | {r.status_code} — {why[:120]}")
         else:
-            report_error("send_buy", f"HTTP {r.status_code} {r.text[:120]}")
-    except requests.Timeout:
-        report_error("send_buy", "timeout 6s")
+            report_error("send_buy", f"HTTP {r.status_code} | {r.text[:160]}")
     except Exception as e:
         report_error("send_buy", f"{type(e).__name__}: {e}")
 
-# ===== اختيار top1 من طبقات متعددة =====
+# ===== اختيار top1 =====
 def pick_and_emit(cache, markets):
     best_coin=None; best_score=0.0; best_why=""
-    # 1) Gap-Sniper
     for m in markets[:min(12,len(markets))]:
         s_meta, meta = gap_sniper(m, cache)
         if s_meta>0:
@@ -393,7 +354,6 @@ def pick_and_emit(cache, markets):
             if ok and s_meta > best_score:
                 best_coin, best_score = m.split("-")[0], s_meta
                 best_why = f"gap:{meta.get('why','')}"
-    # 2) Multi-Score
     for m in markets:
         s, meta = score_market(m, cache)
         ok, _ = quality_guards(m, meta)
@@ -403,8 +363,7 @@ def pick_and_emit(cache, markets):
             best_coin, best_score = m.split("-")[0], s
             best_why = meta.get("why","")
     if best_coin:
-        send_buy(best_coin, best_score, best_why)
-        return True
+        send_buy(best_coin, best_score, best_why); return True
     return False
 
 # ===== ترتيب السيولة =====
@@ -422,34 +381,27 @@ def scanner_loop(run_id):
     cache={}
     try:
         mkts_raw = list_markets_eur()
-        if not mkts_raw:
-            report_error("scanner", "no markets returned")
+        if not mkts_raw: report_error("scanner", "no markets returned")
         mkts = [m for (m,b,pp,minq) in mkts_raw if m.endswith("-EUR") and minq<=50.0]
         HOT = sort_by_liq(mkts)[:HOT_SIZE]
         SCOUT = sort_by_liq(mkts)[:SCOUT_SIZE]
-
         hot_t=scout_t=new_t=0
         while run_id == RUN_ID:
             now = time.time()
             if now - LAST_SIGNAL_TS < MIN_COOLDOWN_READY_SEC:
                 time.sleep(0.2); continue
-
             try:
                 if time.time() - hot_t >= 1.0:
-                    if pick_and_emit(cache, HOT):
-                        return
+                    if pick_and_emit(cache, HOT): return
                     hot_t = time.time()
             except Exception as e:
                 report_error("hot loop", f"{type(e).__name__}: {e}")
-
             try:
                 if time.time() - scout_t >= 5.0:
-                    if pick_and_emit(cache, SCOUT):
-                        return
+                    if pick_and_emit(cache, SCOUT): return
                     scout_t = time.time()
             except Exception as e:
                 report_error("scout loop", f"{type(e).__name__}: {e}")
-
             try:
                 if time.time() - new_t >= MARKETS_REFRESH_SEC:
                     mkts_new = [m for (m,b,pp,minq) in list_markets_eur() if m.endswith("-EUR")]
@@ -462,9 +414,7 @@ def scanner_loop(run_id):
                     new_t = time.time()
             except Exception as e:
                 report_error("refresh markets", f"{type(e).__name__}: {e}")
-
             time.sleep(0.05)
-
         tg_send(f"⏹️ run={run_id} stopped (superseded by run={RUN_ID})")
     except Exception as e:
         report_error("scanner crashed", f"{type(e).__name__}: {e}")
@@ -486,13 +436,20 @@ def tg_webhook():
 @app.route("/ready", methods=["POST"])
 def on_ready():
     global RUN_ID
-    if LINK_SECRET and request.headers.get("X-Link-Secret","") != LINK_SECRET:
-        return jsonify(ok=False, err="bad secret"), 401
     data = request.get_json(silent=True) or {}
     coin  = data.get("coin"); reason=data.get("reason"); pnl=data.get("pnl_eur")
     tg_send(f"📩 Ready من صقر — {coin} ({reason}) pnl={pnl}")
     if coin:
-        try: learn_update(coin, float(pnl or 0.0), str(reason or ""))
+        try:
+            L = LEARN.get(coin, {"pnl_ema":0.0,"win_ema":0.5,"adj":0.0})
+            alpha=0.3
+            L["pnl_ema"] = (1-alpha)*L["pnl_ema"] + alpha*float(pnl or 0.0)
+            if str(reason) in ("tp_filled","manual_sell_filled"):
+                L["win_ema"] = (1-alpha)*L["win_ema"] + alpha*1.0
+            else:
+                L["win_ema"] = (1-alpha)*L["win_ema"] + alpha*0.0
+            L["adj"] = max(-0.05, min(0.08, 0.08*(0.5 - L["win_ema"])))
+            LEARN[coin]=L
         except: pass
     if reason in ("buy_failed","taker_failed"):
         COOLDOWN_UNTIL[coin] = time.time() + MIN_COOLDOWN_FAIL_MIN*60
@@ -513,5 +470,5 @@ def home():
 # ===== Main =====
 if __name__=="__main__":
     port = int(os.getenv("PORT","8082"))
-    tg_send("🚀 Abosiyah Pro v3 started.")
+    tg_send("🚀 Abosiyah Pro v3 (saqar-style) started.")
     app.run("0.0.0.0", port, threaded=True)
