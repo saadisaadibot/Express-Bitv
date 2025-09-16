@@ -4,7 +4,7 @@ Abosiyah Pro v3 — 15m Profit Hunter (full, with error alerts & trades fallback
 
 ENV (examples):
   BOT_TOKEN, CHAT_ID
-  SAQER_HOOK_URL="https://your-saqer-host/hook", LINK_SECRET=""
+  SAQEAR_HOOK_URL="https://your-saqar-host/hook", LINK_SECRET=""
   AUTOSCAN_ON_READY=1
   SCORE_STAR=0.65
   MAX_SPREAD=0.22
@@ -28,7 +28,7 @@ from flask import Flask, request, jsonify
 BITVAVO = "https://api.bitvavo.com/v2"
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
-SAQER_HOOK_URL = os.getenv("SAQER_HOOK_URL","").strip()
+SAQAR_HOOK_URL = os.getenv("SAQAR_HOOK_URL","").strip()
 LINK_SECRET = os.getenv("LINK_SECRET","").strip()
 
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
