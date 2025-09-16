@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Lite — no-lock scanner (soft scoring) + stable-exclusion
-- /scan: يبدأ حلقة سكان جديدة فوراً ويُنهي القديمة (RUN_ID).
-- /ready: إن AUTOSCAN_ON_READY=1 يبدأ سكان جديد تلقائياً.
-- Soft scoring بدل فلاتر قاتلة.
-- يستبعد تلقائياً الأزواج المستقرة (USDC/…، USDT/…، إلخ).
-- يُعيد المحاولة كل RETRY_SECS حتى يجد مرشح ويرسله لصقر.
+Abosiyah Lite — Trend Hunter (soft scoring + dead-guard)
+- /scan: يبدأ حلقة سكان جديدة (RUN_ID) ويُنهي القديمة فورًا.
+- Soft scoring مُحسّن لترجيح الترند/الاختراق/الزخم + Orderbook.
+- Dead-Guard: يستبعد الأزواج "الميّتة" (حركة/حجم شبه معدومين) بدون فلاتر قاتلة.
+- يستبعد تلقائيًا الأزواج المستقرة (USDT/USDC/EUR/…).
+- إعادة محاولة كل RETRY_SECS حتى يلتقط مرشح ويرسله لصقر.
 
-ENV:
+ENV الأساسية:
   BOT_TOKEN, CHAT_ID
   SAQAR_WEBHOOK
   EXCHANGE=bitvavo, QUOTE=EUR
-  TOP_UNIVERSE=120, MAX_WORKERS=6, REQUEST_SLEEP_MS=40, MAX_RPS=8, REPORT_TOP3=1
+  TOP_UNIVERSE=150, MAX_WORKERS=6, REQUEST_SLEEP_MS=40, MAX_RPS=8, REPORT_TOP3=1
   AUTOSCAN_ON_READY=1
   RETRY_SECS=60
+
+Tuning (ENV اختياري):
+  MIN_ATR_PCT=0.12        # حد أدنى للتذبذب 1م (٪ من السعر)
+  MIN_ADX=9               # حد أدنى لقوة الاتّجاه
+  MIN_VSPIKE=1.25         # حد أدنى لسبايك الحجم (آخر شمعة / ميديان 20)
+  MIN_RANGE_30M=0.35      # حد أدنى لنطاق 30 دقيقة (%)
+  MAX_SPREAD_BP=35        # حد أقصى سبريد (basis points = 1/100 من ٪)
 """
 
 import os, time, statistics as st, requests, ccxt
@@ -28,18 +35,25 @@ app = Flask(__name__)
 
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
-SAQAR_URL   = os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/")
+SAQAR_URL   = (os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/"))
 
 EXCHANGE    = os.getenv("EXCHANGE","bitvavo").lower()
 QUOTE       = os.getenv("QUOTE","EUR").upper()
 
-TOP_UNIVERSE      = int(os.getenv("TOP_UNIVERSE","120"))
+TOP_UNIVERSE      = int(os.getenv("TOP_UNIVERSE","150"))
 MAX_WORKERS       = max(1, int(os.getenv("MAX_WORKERS","6")))
 REQUEST_SLEEP_MS  = int(os.getenv("REQUEST_SLEEP_MS","40"))
 MAX_RPS           = float(os.getenv("MAX_RPS","8"))
 REPORT_TOP3       = int(os.getenv("REPORT_TOP3","1"))
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
 RETRY_SECS        = int(os.getenv("RETRY_SECS","60"))
+
+# Tuning
+MIN_ATR_PCT   = float(os.getenv("MIN_ATR_PCT","0.12"))
+MIN_ADX       = float(os.getenv("MIN_ADX","9"))
+MIN_VSPIKE    = float(os.getenv("MIN_VSPIKE","1.25"))
+MIN_RANGE_30M = float(os.getenv("MIN_RANGE_30M","0.35"))
+MAX_SPREAD_BP = float(os.getenv("MAX_SPREAD_BP","35"))
 
 # ===== Stable bases to exclude =====
 STABLE_BASES = set((os.getenv("STABLE_BASES","USDT,USDC,EUR,DAI,TUSD,FDUSD,USDP").upper()).split(","))
@@ -83,7 +97,6 @@ def fetch_orderbook(sym, depth=10):
         bv = sum(float(x[1]) for x in ob["bids"][:depth])
         av = sum(float(x[1]) for x in ob["asks"][:depth])
         imb = bv/max(av,1e-9)
-        # عمق 3 أسعار (dominance سريع)
         ob3b = sum(float(x[1]) for x in ob["bids"][:3]) / max(bv,1e-9)
         return {"bid":bid,"ask":ask,"spread_bp":spr_bp,"bid_imb":imb, "ob3":ob3b}
     except: return None
@@ -94,9 +107,8 @@ def send_saqar(base: str):
         tg_send("⚠️ SAQAR_WEBHOOK غير مضبوط."); return False
     url = SAQAR_URL + "/hook"
     payload = {"action":"buy","coin":base.upper()}
-    headers = {"Content-Type":"application/json"}
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=(6,20))
+        r = requests.post(url, json=payload, timeout=(6,20))
         if 200 <= r.status_code < 300:
             tg_send(f"📡 أرسلت {base} إلى صقر | {r.status_code}")
             return True
@@ -156,18 +168,43 @@ def _adx(highs, lows, closes, n=14):
 def list_top_by_1h_volume():
     mk = _ex.load_markets()
     syms = [s for s,i in mk.items() if i.get("active",True) and i.get("quote")==QUOTE]
-    syms = syms[:max(10,min(TOP_UNIVERSE,len(syms)))]
+    # وسّع الكون ثم خذ الأعلى بسيولة الساعة
     rows=[]
     for s in syms:
         base = s.split("/")[0].upper()
-        if base in STABLE_BASES:  # استبعاد الستايبلز من المصدر
+        if base in STABLE_BASES:  # استبعاد الستايبلز
             continue
         o1h = fetch_ohlcv(s, "1h", 2)
         if not o1h: continue
         close=float(o1h[-1][4]); vol=float(o1h[-1][5]); q=close*vol
         rows.append((s,q)); diplomatic_sleep(REQUEST_SLEEP_MS)
     rows.sort(key=lambda x:x[1], reverse=True)
+    # خذ أعلى 50 للترشّح التفصيلي
     return [s for s,_ in rows[:50]]
+
+# ===== Dead-Guard (استبعاد الميّت) =====
+def _is_dead(closes, highs, lows, vols, ob):
+    lc = closes[-1]
+    atr = _atr(highs, lows, closes, 14) or 0.0
+    atr_pct = (atr/lc)*100.0 if lc>0 and atr>0 else 0.0
+
+    # نطاق 30 دقيقة
+    last30 = closes[-31:] if len(closes)>=31 else closes
+    r30 = ((max(last30)-min(last30))/max(lc,1e-9))*100.0 if last30 else 0.0
+
+    # حجم
+    prev20 = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
+    medv = st.median([v for v in prev20 if v>0]) if prev20 else 0.0
+    v_spike = (vols[-1]/max(medv,1e-9)) if medv>0 else 0.0
+
+    # ADX
+    adx = _adx(highs, lows, closes, 14) or 0.0
+
+    # سبريد
+    spr = ob["spread_bp"]
+
+    # قرار ميّت؟
+    return (atr_pct < MIN_ATR_PCT and adx < MIN_ADX and v_spike < MIN_VSPIKE and r30 < MIN_RANGE_30M) or (spr > MAX_SPREAD_BP)
 
 # ===== تقييم مرشح (Soft) =====
 def _eval_fast(sym: str):
@@ -179,13 +216,16 @@ def _eval_fast(sym: str):
     if not ob: return None
 
     o1 = fetch_ohlcv(sym, "1m", 240)
-    if len(o1) < 30: return None
+    if len(o1) < 60: return None
 
     closes=[float(x[4]) for x in o1]
     highs =[float(x[2]) for x in o1]
     lows  =[float(x[3]) for x in o1]
     vols  =[float(x[5]) for x in o1]
     lc = closes[-1]
+
+    if _is_dead(closes, highs, lows, vols, ob):
+        return None  # طنّش الميّت
 
     ema50  = _ema_series(closes, 50)
     ema200 = _ema_series(closes, 200)
@@ -198,45 +238,51 @@ def _eval_fast(sym: str):
     atr = _atr(highs, lows, closes, 14) or 0.0
     atr_pct = (atr/lc)*100.0 if lc>0 and atr>0 else 0.0
 
+    # اختراق أعلى 20 شمعة سابقة
     prev20 = o1[-21:-1] if len(o1) >= 21 else o1[:-1]
     h20 = max(float(x[2]) for x in prev20) if prev20 else lc
     brk_pct = max(((lc/max(h20,1e-9))-1.0)*100.0, 0.0)
 
+    # زخم لحظي ومتوسط
+    def roc(n):
+        if len(closes) <= n: return 0.0
+        try: return (closes[-1]/closes[-n]-1.0)*100.0
+        except: return 0.0
+    r1  = roc(2)   # ~1-2 دقيقة
+    r3  = roc(4)   # ~3-4 د
+    r5  = roc(6)   # ~5-6 د
+    r30 = roc(30)  # ~30 د
+    r90 = roc(90)  # ~90 د
+
+    # سبايك حجم مقابل ميديان 20
     medv = st.median([float(x[5]) for x in prev20 if float(x[5])>0]) if prev20 else 0.0
     v_spike = (float(o1[-1][5])/max(medv,1e-9)) if medv>0 else 0.0
 
-    def pct(a,b):
-        try: return (a/b-1.0)*100.0
-        except: return 0.0
-    mom1 = pct(closes[-1], closes[-2]) if len(closes)>=2 else 0.0
-    mom3 = pct(closes[-1], closes[-4]) if len(closes)>=4 else 0.0
-    mom5 = pct(closes[-1], closes[-6]) if len(closes)>=6 else 0.0
-
-    # ——— Soft penalties / bonuses (لا hard filters)
+    # ——— Soft scoring (متحيّز للترند/الاختراق) ———
     score = 0.0
-    # اتجاه عام + زخم
-    score += 1.0 * (1.0 if trend_up else -0.7)
-    score += 0.60 * max(mom1,0.0) + 0.35 * max(mom3,0.0) + 0.20 * max(mom5,0.0)
+    # اتجاه عام + زخم أفق متعدد
+    score += 2.0 * (1.0 if trend_up else -0.8)
+    score += 0.80 * max(r1,0.0) + 0.60 * max(r3,0.0) + 0.40 * max(r5,0.0) + 0.50 * max(r30,0.0) + 0.35 * max(r90,0.0)
     # اختراق + سبايك فوليوم
-    score += 1.10 * brk_pct
-    score += 0.80 * min(v_spike, 6.0)
-    # ADX/RSI sweet-spot (حول 60)
-    score += 0.55 * (adx/25.0)
-    score += 0.35 * (1.0 - min(abs(rsi-60.0)/40.0, 1.0))
-    # ATR% وسط— قليل جداً = بطيء، كبير جداً = مخاطرة
+    score += 1.40 * brk_pct
+    score += 0.90 * min(v_spike, 8.0)
+    # ADX sweet-spot ~ 18–35
+    score += 0.70 * min(adx/20.0, 2.0)
+    # ATR% وسط (حركة كافية دون إفراط)
     if atr_pct > 0:
-        score += 0.50 * (1.0 - min(abs(atr_pct-0.25)/0.25, 1.0))  # متمركز حول ~0.25%
+        score += 0.60 * (1.0 - min(abs(atr_pct-0.30)/0.30, 1.0))
     # Orderbook: imbalance + dominance top3
-    score += 0.60 * min(ob["bid_imb"], 2.5)
-    score += 0.40 * ob.get("ob3", 0.0)
-    # Spread عقوبة ناعمة
-    score -= 0.20 * (ob["spread_bp"]/10.0)
+    score += 0.70 * min(ob["bid_imb"], 3.0)
+    score += 0.45 * ob.get("ob3", 0.0)
+    # Spread عقوبة
+    score -= 0.25 * (ob["spread_bp"]/10.0)
 
     return {"symbol": sym, "base": base, "score": float(score),
             "rsi": float(rsi), "adx": float(adx), "atr_pct": float(atr_pct),
-            "brk": float(brk_pct), "mom1": float(mom1),
+            "brk": float(brk_pct), "r1": float(r1), "r3": float(r3),
+            "r30": float(r30), "r90": float(r90),
             "spr": float(ob["spread_bp"]), "imb": float(ob["bid_imb"]),
-            "dom3": float(ob.get("ob3",0.0))}
+            "dom3": float(ob.get("ob3",0.0)), "vsp": float(v_spike)}
 
 def run_filter_and_pick():
     top_syms = list_top_by_1h_volume()
@@ -255,18 +301,25 @@ def run_filter_and_pick():
 # ===== تشغيل بلا قفل عبر RUN_ID =====
 RUN_ID = 0
 
+def _top3_lines(top3):
+    lines=[]
+    for i,r in enumerate(top3,1):
+        lines.append(
+            f"{i}) {r['symbol']} | sc={r['score']:.2f} | brk={r['brk']:.2f}% "
+            f"r1={r['r1']:.2f}% r3={r['r3']:.2f}% r30={r['r30']:.2f}% "
+            f"ADX={r['adx']:.1f} ATR%={r['atr_pct']:.3f}% Vx={r['vsp']:.2f} "
+            f"spr={r['spr']:.0f}bp ob3={r['dom3']:.2f}"
+        )
+    return lines
+
 def _pick_once():
     top1, top3 = run_filter_and_pick()
     if REPORT_TOP3 and top3:
-        lines = [f"{i}) {r['symbol']} | sc={r['score']:.2f} | brk={r['brk']:.2f}% "
-                 f"RSI={r['rsi']:.1f} ADX={r['adx']:.1f} ATR%={r['atr_pct']:.3f}% "
-                 f"mom1={r['mom1']:.2f}% spr={r['spr']:.0f}bp ob3={r['dom3']:.2f}"
-                 for i,r in enumerate(top3,1)]
-        tg_send("🎯 Top3:\n" + "\n".join(lines))
+        tg_send("🎯 Top3:\n" + "\n".join(_top3_lines(top3)))
     return top1
 
 def _scan_loop(my_id: int):
-    tg_send(f"🔎 بدء فلترة (run={my_id})…")
+    tg_send(f"🔎 بدء فلترة ترند (run={my_id})…")
     while True:
         if my_id != RUN_ID:
             tg_send(f"↩️ وقفت حلقة أقدم (run={my_id}) لوجود أحدث (run={RUN_ID}).")
@@ -277,7 +330,7 @@ def _scan_loop(my_id: int):
             ok = send_saqar(top1["base"])
             tg_send(f"📡 أرسلت {top1['base']} إلى صقر | ok={ok} | run={my_id}")
             return
-        tg_send(f"⏸ لا يوجد مرشح — سنعيد المحاولة بعد {RETRY_SECS}s (run={my_id}).")
+        tg_send(f"⏸ لا يوجد مرشح (قد تكون السوق هادئة) — إعادة بعد {RETRY_SECS}s (run={my_id}).")
         for _ in range(RETRY_SECS):
             if my_id != RUN_ID: return
             time.sleep(1)
@@ -323,7 +376,7 @@ def tg_webhook():
     tg_send("أوامر: /scan ، /ping"); return jsonify(ok=True), 200
 
 @app.get("/")
-def home(): return f"Abosiyah Lite — no-lock + stable-exclusion ✅ (run={RUN_ID})", 200
+def home(): return f"Abosiyah Lite — Trend Hunter ✅ (run={RUN_ID})", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")))
