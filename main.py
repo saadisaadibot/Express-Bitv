@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Express Pro v4 — Lightning Momentum Hunter (saqar-style webhook)
-- سرعة عالية + حدس بسيط: Tape/Speed + Breakout + Orderbook Gap (ثلاث محرّكات).
-- حُرّاس جودة خفاف (سبريد، سيولة معروضة، انزلاق تقديري).
-- وضع هجومي يقلل الفلاتر ويحاول عدم تفويت الرّنّانات (ON افتراضياً).
-- تفادي رسائل 403/SSL سبامية + مبرّد للأخطاء.
-- /scan يدوي، autoscan عند /ready، /health.
-- رسائل Telegram مُركّزة مع تقييم ألوان (🟢🟡🔴) حسب الجودة.
+Express Pro v5 — Lightning Momentum Hunter (saqar-style webhook)
+- نبض حي Pulse (trades speed + 1m volatility + RVOL 5m/20m)
+- اتجاه خفيف: EMA9>EMA20 + فوق VWAP5m
+- HH-60m Position: تفضيل الثلث العلوي
+- Penalized slippage/spread بدل رمي الفرصة مبكراً
+- تعلم بسيط per-coin لتحريك العتبة
+- تبريد ديناميكي لعملات dull
 
 ENV (أمثلة):
   BOT_TOKEN, CHAT_ID
@@ -14,16 +14,15 @@ ENV (أمثلة):
   AUTOSCAN_ON_READY=1
   AGGRESSIVE=1                              # 1=هجومي، 0=تحفّظ
   BUY_EUR=25
-  MAX_SPREAD=0.30                           # % أقصى سبريد
-  DEPTH_MIN_EUR=2000                        # حد أدنى عمق asks
-  MAX_SLIP=0.25                             # % انزلاق تقديري
-  SCORE_STAR=0.60                           # عتبة multi-score بالوضع التحفّظي
-  TTL_SEC=60
+  MAX_SPREAD=0.30                           # % أقصى سبريد (حارس أخير)
+  DEPTH_MIN_EUR=1800                        # حد أدنى عمق asks
+  MAX_SLIP=0.35                             # % انزلاق تقديري (حارس أخير)
+  SCORE_STAR=0.62                           # عتبة بالتحفّظي (الهجومي أقل)
   MARKETS_REFRESH_SEC=45
   HOT_SIZE=20
   SCOUT_SIZE=80
   ERROR_COOLDOWN_SEC=60
-  MIN_COOLDOWN_READY_SEC=30
+  MIN_COOLDOWN_READY_SEC=25
   MIN_COOLDOWN_FAIL_MIN=30
 """
 
@@ -41,23 +40,23 @@ AGGR              = int(os.getenv("AGGRESSIVE","1"))
 
 BUY_EUR   = float(os.getenv("BUY_EUR","25"))
 MAX_SPREAD= float(os.getenv("MAX_SPREAD","0.30"))
-DEPTH_MIN = float(os.getenv("DEPTH_MIN_EUR","2000"))
-MAX_SLIP  = float(os.getenv("MAX_SLIP","0.25"))
-SCORE_STAR= float(os.getenv("SCORE_STAR","0.60"))
-TTL_SEC   = int(os.getenv("TTL_SEC","60"))
+DEPTH_MIN = float(os.getenv("DEPTH_MIN_EUR","1800"))
+MAX_SLIP  = float(os.getenv("MAX_SLIP","0.35"))
+SCORE_STAR= float(os.getenv("SCORE_STAR","0.62"))
 
 MARKETS_REFRESH_SEC = int(os.getenv("MARKETS_REFRESH_SEC","45"))
 HOT_SIZE    = int(os.getenv("HOT_SIZE","20"))
 SCOUT_SIZE  = int(os.getenv("SCOUT_SIZE","80"))
 
 ERROR_COOLDOWN_SEC = int(os.getenv("ERROR_COOLDOWN_SEC","60"))
-MIN_COOLDOWN_READY_SEC = int(os.getenv("MIN_COOLDOWN_READY_SEC","30"))
+MIN_COOLDOWN_READY_SEC = int(os.getenv("MIN_COOLDOWN_READY_SEC","25"))
 MIN_COOLDOWN_FAIL_MIN  = int(os.getenv("MIN_COOLDOWN_FAIL_MIN","30"))
 
 # ===== حالة داخلية =====
 RUN_ID = 0
-COOLDOWN_UNTIL = {}           # coin -> ts
+COOLDOWN_UNTIL = {}           # coin -> ts (فشل شراء/دول)
 LEARN = {}                    # coin -> {win_ema,pnl_ema,adj}
+DULL_FAILS = {}               # coin -> count within window
 LAST_SIGNAL_TS = 0
 _LAST_ERR = {}                # key->ts
 TRADES_BAN_UNTIL = {}         # market->ts (403 ban)
@@ -76,7 +75,7 @@ def tg_send(txt: str):
     except Exception as e:
         print("tg_send err:", e)
 
-# ===== مكبح أخطاء (ومنها 403/SSL) =====
+# ===== مكبح أخطاء =====
 def _should_report(key: str) -> bool:
     ts = _LAST_ERR.get(key, 0)
     if time.time() - ts >= ERROR_COOLDOWN_SEC:
@@ -94,13 +93,12 @@ def _url_ok(url: str) -> bool:
 if not _url_ok(SAQAR_URL):
     report_error("config","SAQAR_WEBHOOK غير مضبوط — لن تُرسل إشارات.")
 
-# ===== Bitvavo (قراءات عامة) =====
+# ===== Bitvavo (قراءات) =====
 def bv_safe(path, timeout=6, params=None, tag=None):
     tag = tag or path
     try:
         r = requests.get(f"{BITVAVO}{path}", params=params, timeout=timeout)
         if not (200 <= r.status_code < 300):
-            # كتم 403 من /trades (يتعالج في trades)
             if not (path.endswith("/trades") and r.status_code==403):
                 report_error(f"API {tag}", f"HTTP {r.status_code}")
             return None
@@ -110,7 +108,6 @@ def bv_safe(path, timeout=6, params=None, tag=None):
     except requests.Timeout:
         report_error(f"Timeout {tag}", f"after {timeout}s"); return None
     except Exception as e:
-        # SSL EOF وغيره
         report_error(f"HTTP exc {tag}", f"{type(e).__name__}: {e}"); return None
 
 def list_markets_eur():
@@ -153,14 +150,12 @@ def candles(market, interval="1m", limit=240):
     data = bv_safe(f"/{market}/candles", params={"interval":interval,"limit":limit}, tag=f"/candles {market}")
     return data if isinstance(data, list) else []
 
-def trades(market, limit=60):
-    # /trades أحياناً 403 — نطبّق ban 10 د لكل ماركت ثم نستخدم fallback
+def trades(market, limit=80):
     if TRADES_BAN_UNTIL.get(market, 0) > time.time(): return []
     try:
         r = requests.get(f"{BITVAVO}/trades", params={"market": market, "limit": limit}, timeout=5)
         if r.status_code == 403:
             TRADES_BAN_UNTIL[market] = time.time() + 600
-            # لا ترسل رسالة هنا (مكبوت)
             return []
         if not (200 <= r.status_code < 300): return []
         data = r.json()
@@ -168,7 +163,7 @@ def trades(market, limit=60):
     except Exception:
         return []
 
-# ===== تقديرات خفيفة =====
+# ===== تقديرات =====
 def estimate_slippage_pct(asks, want_eur: float):
     if not asks or want_eur<=0: return 9e9
     tot_eur = 0.0; first = asks[0][0]; last=first
@@ -184,7 +179,7 @@ def estimate_slippage_pct(asks, want_eur: float):
     return (last/first - 1.0)*100.0
 
 def uptick_ratio(trs):
-    if not trs: return 0.0
+    if not trs: return 0.5
     buys = sum(1 for t in trs if (t.get("side","").lower())=="buy")
     return buys / max(1, len(trs))
 
@@ -192,64 +187,93 @@ def trades_10s_speed(trs, now_ms):
     recent = [t for t in trs if (now_ms - int(t.get("timestamp",0) or 0)) <= 10_000]
     return len(recent) / 10.0
 
-def tape_from_candles_fallback(market):
-    cs = candles(market,"1m", limit=6)
-    if not cs or len(cs)<4: return 0.5, 0.0
-    closes=[float(r[4]) for r in cs]
-    opens =[float(r[1]) for r in cs]
-    vols  =[float(r[5]) for r in cs]
-    greens=0.0; volsum=0.0
-    for o,c,v in zip(opens[-6:-1], closes[-6:-1], vols[-6:-1]):
-        w=max(v,1e-9); volsum += w
-        if c>=o: greens+=w
-    ur = (greens/max(volsum,1e-9)) if volsum>0 else 0.5
-    r1=(closes[-1]/max(closes[-2],1e-9)-1)*100.0
-    r2=(closes[-2]/max(closes[-3],1e-9)-1)*100.0
-    spd=max(-2.5,min(2.5,0.65*r1+0.35*r2))
-    return float(ur), float(abs(spd))
+# ===== مؤشرات خفيفة =====
+def ema(vals, n):
+    if not vals: return 0.0
+    k=2/(n+1.0); e=vals[0]
+    for v in vals[1:]: e = v*k + e*(1-k)
+    return e
+
+def rvol_5_vs_20(cs):
+    # cs: 1m candles
+    try:
+        vols=[float(r[5]) for r in cs]
+        v5=sum(vols[-5:]); v20=sum(vols[-20:])
+        avg20 = v20/20.0 if v20>0 else 0.0
+        return (v5/5.0)/max(avg20,1e-9)
+    except: return 0.0
+
+def hh_pos_60m(cs):
+    # موضع الإغلاق ضمن أعلى/أدنى 60 دقيقة
+    try:
+        closes=[float(r[4]) for r in cs[-60:]]
+        hi=max(closes); lo=min(closes); last=closes[-1]
+        rng=max(hi-lo,1e-9)
+        return (last-lo)/rng
+    except: return 0.5
 
 def vwap5m(market):
     cs = candles(market, "5m", 1)
     try: return float(cs[-1][4])
     except: return 0.0
 
-def h15_breakout(market):
-    cs = candles(market,"1m", limit=16)
-    try:
-        highs=[float(r[2]) for r in cs[:-1]]
-        last=float(cs[-1][4])
-        return last, (last - max(highs))/max(1e-12, max(highs))*100.0
-    except: return 0.0, 0.0
-
-def adx_rsi_lite(market):
-    cs = candles(market,"1m", limit=120)
-    try:
-        closes=[float(r[4]) for r in cs]
-        highs =[float(r[2]) for r in cs]
-        lows  =[float(r[3]) for r in cs]
-    except: return 0.0, 50.0
-    if len(closes)<40: return 0.0, 50.0
-    gains=loss=0.0
-    for i in range(-14,0):
-        d=closes[i]-closes[i-1]
-        gains += d if d>=0 else 0.0
-        loss  += -d if d<0 else 0.0
-    rs = (gains/14)/max(loss/14,1e-9)
-    rsi = 100.0 - (100.0/(1.0+rs))
-    # ATR نسبية كبديل ADX
-    trs=[]
-    for i in range(1,len(closes)):
-        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
-    atr = sum(trs[-14:])/max(14,1)
-    adx = min(45.0, max(0.0, (atr/max(1e-9, closes[-1]))*1000))
-    return adx, rsi
-
-# ===== تقييم ألوان بسيط =====
-def color_emoji(x, good, warn):
-    # >=good: green, >=warn: yellow, else red
+# ===== تقييم ألوان =====
+def color_emoji(x, good, warn, reverse=False):
+    if reverse:
+        return "🟢" if x<=good else ("🟡" if x<=warn else "🔴")
     return "🟢" if x>=good else ("🟡" if x>=warn else "🔴")
 
-# ===== محرّك 1: Gap / orderbook dominance =====
+# ===== Pulse + Momentum Engine =====
+def engine_pulse(market, cache):
+    now_ms = int(time.time()*1000)
+    cs1m = cache.get(("c1m",market))
+    if cs1m is None:
+        cs1m = candles(market,"1m", limit=120); cache[("c1m",market)] = cs1m
+
+    trs = cache.get(("trades",market))
+    if trs is None:
+        trs = trades(market, 80); cache[("trades",market)] = trs
+
+    ur = uptick_ratio(trs) if trs else 0.5
+    spd = trades_10s_speed(trs, now_ms) if trs else 0.0
+
+    # تذبذب 1m آخر 6 شمعات
+    try:
+        closes=[float(r[4]) for r in cs1m]
+        volty = sum(abs((closes[i]/closes[i-1])-1.0) for i in range(-6,-1)) * 100.0
+        ema9 = ema(closes[-30:], 9); ema20 = ema(closes[-60:],20)
+        last = closes[-1]
+    except:
+        volty=0.0; ema9=ema20=last=0.0
+
+    rvol = rvol_5_vs_20(cs1m)
+    vwap = vwap5m(market)
+    above_vwap = 1.0 if (vwap>0 and last>=vwap) else 0.0
+    align = 1.0 if (ema9>ema20 and last>=ema9) else 0.0
+    hh60 = hh_pos_60m(cs1m)
+
+    # نقاط مطبّقة
+    z_speed = min(1.0, spd/1.2)                        # 1.2 صفقة/ث للعلامة الكاملة
+    z_ur    = min(1.0, (ur-0.5)/0.25) if ur>0.5 else 0
+    z_vol   = min(1.0, volty/1.6)                      # ~0.3% حركة تراكمية ≈ 1.6
+    z_rvol  = min(1.0, (rvol-0.9)/0.6) if rvol>0.9 else 0
+    z_hh    = max(0.0, (hh60-0.6)/0.4)                 # نفضل أعلى 40% من النطاق
+
+    w_speed = 0.32 if AGGR else 0.25
+    w_ur    = 0.18
+    w_vol   = 0.20
+    w_rvol  = 0.15
+    w_trend = 0.15 if AGGR else 0.22
+
+    score = w_speed*z_speed + w_ur*z_ur + w_vol*z_vol + w_rvol*z_rvol + w_trend*(0.6*align + 0.4*above_vwap) + 0.10*z_hh
+
+    why = f"ur={ur:.2f} {color_emoji(ur,0.62,0.54)} | spd={spd:.2f} {color_emoji(spd,0.9,0.5)} | " \
+          f"rvol={rvol:.2f} {color_emoji(rvol,1.20,1.00)} | vol1m~{volty:.2f} {color_emoji(volty,1.4,0.8)} | " \
+          f"EMA9>20={int(align)} | vwap={int(above_vwap)} | HH60={hh60:.2f}"
+
+    return score, {"why": why, "ur":ur, "spd":spd, "rvol":rvol, "vol":volty, "align":align, "hh":hh60}
+
+# ===== Gap / orderbook dominance (خفيف) =====
 def engine_gap(market, cache):
     bk = cache.get(("book",market))
     if bk is None:
@@ -259,82 +283,43 @@ def engine_gap(market, cache):
     if A<=0 or B<=0: return 0.0, {}
     ratio = B/max(A,1e-9)
     score = 0.0
-    if spr<=MAX_SPREAD and ratio>=2.0:
-        score = min(1.0, 0.45 + (ratio-2.0)/3.0)
+    if spr<=MAX_SPREAD and ratio>=1.6:
+        score = min(1.0, 0.35 + (ratio-1.6)/3.0)
     why = f"gap r={ratio:.2f}, spr={spr:.2f}%"
-    return score, {"why": why, "spread": spr}
+    return score, {"why": why, "spr": spr, "B":B, "A":A, "bids":B, "asks":A}
 
-# ===== محرّك 2: Tape/Speed + VWAP =====
-def engine_tape(market, cache):
-    now_ms = int(time.time()*1000)
-    trs = cache.get(("trades",market))
-    if trs is None:
-        trs = trades(market, 60); cache[("trades",market)] = trs
-    if trs:
-        ur = uptick_ratio(trs); spd = trades_10s_speed(trs, now_ms)
-    else:
-        ur, spd = tape_from_candles_fallback(market)
-    last, bo15 = h15_breakout(market)
-    vw = vwap5m(market)
-    above = 1.0 if (vw>0 and last>=vw) else 0.0
-    adx, rsi = adx_rsi_lite(market)
-    # خلي المومنتم يوزن أعلى بالوضع الهجومي
-    w_tape = 0.55 if AGGR else 0.40
-    z_tape = min(1.0, 0.6*ur + 0.4*min(1.0, spd/2.0))
-    z_break= max(0.0, min(1.0, bo15/0.5))*0.7 + above*0.3
-    z_vol  = min(1.0, adx/30.0)
-    z_reg  = 1.0 if (50<=rsi<=75) else (0.6 if 45<=rsi<50 or 75<rsi<=80 else 0.2)
-    score  = w_tape*z_tape + 0.25*z_break + 0.15*z_vol + 0.05*z_reg
-    bk = cache.get(("book",market)) or book(market,3)
-    slip = estimate_slippage_pct((bk or {}).get("asks") or [], BUY_EUR) if bk else 9e9
-    spr  = (bk or {}).get("spread_pct", 9e9) if bk else 9e9
-    meta = {
-        "why": f"ur={ur:.2f} {color_emoji(ur,0.62,0.54)} | spd={spd:.2f} {color_emoji(spd,0.9,0.5)} | "
-               f"bo15={bo15:.2f}% {color_emoji(bo15,0.25,0.10)} | "
-               f"adx~{adx:.1f} {color_emoji(adx,22,14)} | rsi={rsi:.0f} | "
-               f"spr={spr:.2f}% | slip~{slip:.2f}%",
-        "spread": spr, "slip": slip, "ur": ur, "spd": spd
-    }
-    return score, meta
-
-# ===== محرّك 3: Breakout قوي جداً (اندفاع) =====
-def engine_blast(market, cache):
-    cs = candles(market,"1m", limit=8)
-    if not cs or len(cs)<6: return 0.0, {}
-    closes=[float(r[4]) for r in cs]
-    # تسارع: عوائد 1m مؤخراً
-    def roc(n): 
-        return (closes[-1]/max(closes[-n],1e-9)-1.0)*100.0 if len(closes)>n else 0.0
-    r1=roc(2); r3=roc(4); r5=roc(6)
-    boost = max(0.0, 0.8*r1 + 0.6*r3 + 0.4*r5)    # يلتقط الاندفاعات
-    score = min(1.0, boost/1.2)                   # تطبيع سريع
-    return score, {"why": f"blast r1={r1:.2f}% r3={r3:.2f}% r5={r5:.2f}%"}
-
-# ===== حُرّاس خفاف =====
-def quality_guards(market, meta):
+# ===== حُرّاس خفاف + عقوبات =====
+def guards_and_penalties(market, meta, want_eur):
     bk = book(market,3)
-    if not bk: return False, "no_book"
-    if bk["spread_pct"] > MAX_SPREAD: return False, "spread"
-    if bk["depth_ask_eur"] < DEPTH_MIN: return False, "depth"
-    if meta.get("slip",0) > MAX_SLIP: return False, "slip"
-    coin = market.split("-")[0]
-    if COOLDOWN_UNTIL.get(coin,0) > time.time(): return False, "cooldown"
-    return True, "ok"
+    if not bk: return False, "no_book", 0.0
+    slip = estimate_slippage_pct(bk["asks"], want_eur)
+    spr  = bk["spread_pct"]
+    depA = bk["depth_ask_eur"]
+    # رفض صارم فقط لو شي خارج الحدود جداً
+    if spr > MAX_SPREAD*1.6: return False, "spread_hard", 0.0
+    if depA < DEPTH_MIN*0.6: return False, "depth_hard", 0.0
+    if slip > MAX_SLIP*1.8:  return False, "slip_hard", 0.0
+    # عقوبات ناعمة تدخل ضمن السكور
+    pen = 0.0
+    if spr > MAX_SPREAD: pen += min(0.25, (spr-MAX_SPREAD)/MAX_SPREAD*0.18)
+    if slip > MAX_SLIP:  pen += min(0.30, (slip-MAX_SLIP)/MAX_SLIP*0.22)
+    return True, "ok", pen
 
-# ===== تعلّم بسيط يحرّك عتبة الاختيار =====
+# ===== تعلّم =====
 def learn_update(coin, pnl_eur, reason):
     L = LEARN.get(coin, {"pnl_ema":0.0,"win_ema":0.5,"adj":0.0})
     a=0.3
+    win = 1.0 if reason in ("tp_filled","manual_sell_filled") else (0.0 if reason in ("sl_triggered","taker_failed","buy_failed") else 0.5)
     L["pnl_ema"] = (1-a)*L["pnl_ema"] + a*(pnl_eur or 0.0)
-    L["win_ema"] = (1-a)*L["win_ema"] + a*(1.0 if reason in ("tp_filled","manual_sell_filled") else 0.0)
-    L["adj"]     = max(-0.06, min(0.10, 0.10*(0.5 - L["win_ema"])))
+    L["win_ema"] = (1-a)*L["win_ema"] + a*win
+    L["adj"]     = max(-0.08, min(0.12, 0.12*(0.55 - L["win_ema"])))
     LEARN[coin]=L
 
 def adjusted_star(coin):
-    base = 0.48 if AGGR else SCORE_STAR
-    return max(0.45, min(0.90, base + (LEARN.get(coin,{}).get("adj",0.0))))
+    base = 0.50 if AGGR else SCORE_STAR
+    return max(0.45, min(0.92, base + (LEARN.get(coin,{}).get("adj",0.0))))
 
-# ===== إرسال إشارة لصقر (نفس أسلوبك) =====
+# ===== إرسال لصقر =====
 def send_buy(coin, why_line):
     global LAST_SIGNAL_TS
     if not _url_ok(SAQAR_URL):
@@ -351,44 +336,53 @@ def send_buy(coin, why_line):
     except Exception as e:
         report_error("send_buy", f"{type(e).__name__}: {e}")
 
-# ===== اختيار سريع (ثلاث محرّكات) =====
+# ===== اختيار وإطلاق =====
 def pick_and_emit(cache, markets):
     best=None
     for m in markets:
-        # محرّكات
-        s1, meta1 = engine_blast(m, cache)    # يلتقط الانفجارات
-        s2, meta2 = engine_tape(m, cache)     # زخم مستدام + VWAP
-        s3, meta3 = engine_gap(m, cache)      # تفوّق دفتر الطلبات
-        # تجميع بسيط — نعطي وزن أعلى للانفجار بالهجومي
-        w_blast = 0.45 if AGGR else 0.30
-        w_tape  = 0.40 if AGGR else 0.45
-        w_gap   = 0.15
-        score   = w_blast*s1 + w_tape*s2 + w_gap*s3
+        s_pulse, metaP = engine_pulse(m, cache)
+        s_gap  , metaG = engine_gap(m, cache)
 
-        # حُرّاس خفاف
-        meta = {**meta2, "spread": max(meta1.get("spread",meta2.get("spread",9e9)), meta3.get("spread",0))}
-        ok,_ = quality_guards(m, meta)
-        if not ok: continue
+        # نبض أدنى (فلتر رخيص وسريع)
+        if metaP["spd"] < (0.45 if AGGR else 0.35) and metaP["rvol"] < 1.05 and metaP["vol"] < 0.7:
+            # عدّه dull
+            coin = m.split("-")[0]
+            ct = DULL_FAILS.get(coin, (0,0))
+            cnt, ts = ct
+            if time.time()-ts > 600: cnt=0
+            cnt+=1; DULL_FAILS[coin]=(cnt, time.time())
+            if cnt>=2 and COOLDOWN_UNTIL.get(coin,0) < time.time():
+                COOLDOWN_UNTIL[coin] = time.time() + (1200 if AGGR else 2400)  # 20–40 دقيقة
+            continue
+
+        ok, why_guard, penalty = guards_and_penalties(m, {**metaP, **metaG}, BUY_EUR)
+        if not ok: 
+            continue
+
+        # جمع درجات (نعاقب السبريد/الانزلاق)
+        w_pulse = 0.80
+        w_gap   = 0.20
+        raw_score = w_pulse*s_pulse + w_gap*s_gap
+        score = max(0.0, raw_score - penalty)
 
         coin=m.split("-")[0]
         star = adjusted_star(coin)
+
         if score >= star:
-            # توليف Why مختصر + ألوان
-            why = f"{meta2['why']} | {meta3.get('why','')} | ⭐{score:.2f}/{star:.2f}"
-            # اختر الأعلى خلال الجولة
+            why = f"{metaP['why']} | {metaG.get('why','')} | pen={penalty:.2f} | ⭐{score:.2f}/{star:.2f}"
             if not best or score > best[0]:
                 best=(score, coin, why)
 
-        # بالهجومي: لو gap قوي جداً أو blast > 0.9 خذها فوراً
-        if AGGR and (s3>=0.92 or s1>=0.95):
-            coin=m.split("-")[0]
-            send_buy(coin, f"fast {('gap' if s3>=0.92 else 'blast')} ⭐{max(s3,s1):.2f}")
+        # وضع هجومي: لو النبض قوي جداً أطلق فوراً
+        if AGGR and s_pulse>=0.92:
+            send_buy(coin, f"fast pulse ⭐{s_pulse:.2f}")
             return True
+
     if best:
         send_buy(best[1], best[2]); return True
     return False
 
-# ===== ترتيب بسيط حسب سيولة دفتر الأوامر =====
+# ===== ترتيب حسب السيولة =====
 def sort_by_liq(markets):
     scored=[]
     for m in markets:
@@ -410,7 +404,7 @@ def scanner_loop(run_id):
         hot_t=scout_t=refresh_t=0
         while run_id == RUN_ID:
             if time.time() - LAST_SIGNAL_TS < MIN_COOLDOWN_READY_SEC:
-                time.sleep(0.15); continue
+                time.sleep(0.12); continue
             try:
                 if time.time()-hot_t >= 1.0:
                     if pick_and_emit(cache, HOT): return
@@ -418,7 +412,7 @@ def scanner_loop(run_id):
             except Exception as e:
                 report_error("hot loop", f"{type(e).__name__}: {e}")
             try:
-                if time.time()-scout_t >= (2.5 if AGGR else 4.0):
+                if time.time()-scout_t >= (2.3 if AGGR else 3.8):
                     if pick_and_emit(cache, SCOUT): return
                     scout_t=time.time()
             except Exception as e:
@@ -479,10 +473,10 @@ def health():
 
 @app.route("/", methods=["GET"])
 def home():
-    return f"Express Pro v4 ✅ run={RUN_ID} | aggr={AGGR} | learn={len(LEARN)}", 200
+    return f"Express Pro v5 ✅ run={RUN_ID} | aggr={AGGR} | learn={len(LEARN)}", 200
 
 # ===== Main =====
 if __name__=="__main__":
     port = int(os.getenv("PORT","8082"))
-    tg_send("⚡️ Express Pro v4 — started.")
+    tg_send("⚡️ Express Pro v5 — started.")
     app.run("0.0.0.0", port, threaded=True)
