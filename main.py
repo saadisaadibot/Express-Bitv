@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Pro v3 — 15m Profit Hunter (full, with error alerts & trades fallback)
+Abosiyah Pro v3 — 15m Profit Hunter (full, SAQAR_WEBHOOK version)
 
 ENV (examples):
   BOT_TOKEN, CHAT_ID
-  SAQEAR_HOOK_URL="https://your-saqar-host/hook", LINK_SECRET=""
+  SAQAR_WEBHOOK="https://your-saqAR-host/hook", LINK_SECRET=""
   AUTOSCAN_ON_READY=1
   SCORE_STAR=0.65
   MAX_SPREAD=0.22
@@ -28,7 +28,7 @@ from flask import Flask, request, jsonify
 BITVAVO = "https://api.bitvavo.com/v2"
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
-SAQAR_HOOK_URL = os.getenv("SAQAR_HOOK_URL","").strip()
+SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK","").strip()   # <— هنا التعديل
 LINK_SECRET = os.getenv("LINK_SECRET","").strip()
 
 AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
@@ -58,7 +58,7 @@ app = Flask(__name__)
 
 # ===== Telegram =====
 def tg_send(txt: str):
-    if not BOT_TOKEN: 
+    if not BOT_TOKEN:
         print("TG:", txt); return
     try:
         requests.post(
@@ -85,10 +85,11 @@ def report_error(tag: str, detail: str):
 def _url_ok(url: str) -> bool:
     return isinstance(url, str) and url.startswith(("http://", "https://"))
 
-if not _url_ok(SAQAR_HOOK_URL):
-    report_error("config", "SAQAR_HOOK_URL غير صالح أو فارغ — لن أرسل buy حتى يُضبط.")
+# تحذير تهيئة إن كان الرابط ناقص
+if not _url_ok(SAQAR_WEBHOOK):
+    report_error("config", "SAQAR_WEBHOOK غير صالح/فارغ — لن أرسل buy حتى يُضبط.")
 
-# ===== Bitvavo helpers (قراءة عامة) =====
+# ===== Bitvavō helpers (قراءة عامة) =====
 def bv_safe(path, timeout=6, params=None, tag=None):
     tag = tag or path
     try:
@@ -220,7 +221,7 @@ def tape_from_candles_fallback(market):
 
 def uptick_ratio(trs):
     if not trs: return 0.0
-    upt = sum(1 for t in trs if (t.get("side","").lower()=="buy"))
+    upt = sum(1 for t in trs if (t.get("side","").lower())=="buy")
     return upt / max(1, len(trs))
 
 def trades_10s_speed(trs, now_ms):
@@ -356,8 +357,8 @@ def adjusted_s_star(coin):
 # ===== إرسال الإشارة لصقر (مع رصد أخطاء) =====
 def send_buy(coin, score, why):
     global LAST_SIGNAL_TS
-    if not _url_ok(SAQAR_HOOK_URL):
-        report_error("send_buy", "SAQAR_HOOK_URL مفقود/غير صالح — تجاهلت الإرسال.")
+    if not _url_ok(SAQAR_WEBHOOK):
+        report_error("send_buy", "SAQAR_WEBHOOK مفقود/غير صالح — تجاهلت الإرسال.")
         return
     body = {
         "action":"buy",
@@ -370,7 +371,7 @@ def send_buy(coin, score, why):
     headers={"Content-Type":"application/json"}
     if LINK_SECRET: headers["X-Link-Secret"]=LINK_SECRET
     try:
-        r = requests.post(SAQAR_HOOK_URL, json=body, headers=headers, timeout=6)
+        r = requests.post(SAQAR_WEBHOOK, json=body, headers=headers, timeout=6)
         if 200 <= r.status_code < 300:
             LAST_SIGNAL_TS = time.time()
             tg_send(f"🚀 BUY {coin} ({score:.2f}) — {why[:120]}")
