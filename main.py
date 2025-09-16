@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Abosiyah Pro v3 — 15m Profit Hunter (saqar-style webhook)
+Abosiyah Pro v3 — 15m Profit Hunter (saqar-style webhook, colored signals, quiet 403)
 - يرسل إلى صقر بنفس أسلوب Abosiyah Lite القديم:
   SAQAR_WEBHOOK + "/hook"  (POST JSON: {"action":"buy","coin":"BASE"})
 - بدون أسرار/هيدرز إضافية.
-- يحتوي: Gap-Sniper + Multi-Score، fallback لشموع 1m عند 403 /trades،
+- Gap-Sniper + Multi-Score، fallback لشموع 1m عند 403 /trades (صامت)،
   تنبيهات أخطاء بمكبح، /scan يدوي، autoscan عند /ready، /health.
 
 ENV examples:
@@ -148,23 +148,20 @@ def candles(market, interval="1m", limit=240):
     return data if isinstance(data, list) else []
 
 def trades(market, limit=60):
-    if TRADES_BAN_UNTIL.get(market, 0) > time.time(): return []
+    """صامت عند 403: يعمل ban للسوق 10 دقائق ويعيد [] ليفعّل fallback للشموع بلطف."""
+    if TRADES_BAN_UNTIL.get(market, 0) > time.time():
+        return []
     try:
         r = requests.get(f"{BITVAVO}/trades", params={"market": market, "limit": limit}, timeout=6)
         if r.status_code == 403:
-            TRADES_BAN_UNTIL[market] = time.time() + 600
-            report_error("trades 403", f"{market} — fallback إلى الشموع لمدة 10د"); return []
+            TRADES_BAN_UNTIL[market] = time.time() + 600  # 10 دقائق منع
+            return []
         if not (200 <= r.status_code < 300):
-            report_error("API error /trades", f"{market} — HTTP {r.status_code}"); return []
-        try:
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            report_error("JSON /trades", f"{market} — {e}"); return []
-    except requests.Timeout:
-        report_error("Timeout /trades", f"{market} بعد 6s"); return []
-    except Exception as e:
-        report_error("HTTP exc /trades", f"{market} — {type(e).__name__}: {e}"); return []
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 # ===== تقديرات سريعة =====
 def estimate_slippage_pct(asks, want_eur: float):
@@ -243,6 +240,27 @@ def adx_rsi_lite(market):
     adx = min(40.0, max(0.0, (atr/max(1e-9, closes[-1]))*1000*1.2))
     return adx, rsi
 
+# ===== تلوين القيم للتيليغرام =====
+def _color_val(name: str, x: float) -> str:
+    try: v = float(x)
+    except: return str(x)
+    if name == "rsi":
+        return f"🔴{v:.0f}" if v < 40 else (f"🟡{v:.0f}" if v < 60 else f"🟢{v:.0f}")
+    if name == "adx":
+        return f"🔴{v:.1f}" if v < 15 else (f"🟡{v:.1f}" if v < 25 else f"🟢{v:.1f}")
+    if name == "imb":
+        return f"🔴{v:.2f}" if v < 0.45 else (f"🟡{v:.2f}" if v < 0.60 else f"🟢{v:.2f}")
+    if name == "spd":
+        return f"🔴{v:.2f}" if v < 0.20 else (f"🟡{v:.2f}" if v < 0.60 else f"🟢{v:.2f}")
+    if name == "spr":
+        return f"🟢{v:.2f}%" if v <= 0.10 else (f"🟡{v:.2f}%" if v <= 0.20 else f"🔴{v:.2f}%")
+    if name == "slip":
+        return f"🟢{v:.2f}%" if v <= 0.05 else (f"🟡{v:.2f}%" if v <= 0.12 else f"🔴{v:.2f}%")
+    if name == "bo15":
+        col = "🟢" if v >= 0.3 else ("🟡" if v >= 0.0 else "🔴")
+        return f"{col}{v:.2f}%"
+    return str(x)
+
 # ===== Multi-Score =====
 def score_market(market, cache):
     now_ms = int(time.time()*1000)
@@ -276,12 +294,19 @@ def score_market(market, cache):
     z_reg  = 1.0 if (55<=rsi<=75) else (0.6 if 50<=rsi<55 or 75<rsi<=80 else 0.2)
 
     score = 0.35*z_tape + 0.25*z_imb + 0.20*z_break + 0.10*z_vol + 0.10*z_reg
-    why = (
-        f"ur={ur:.2f},spd={spd:.2f},imb={imb:.2f},bo15={bo15:.2f}%,"
-        f"adx~{adx:.1f},rsi={rsi:.0f},spr={spread:.2f}%,slip~{slip:.2f}%"
+
+    why_colored = (
+        f"ur={ur:.2f},"
+        f"spd={_color_val('spd', spd)},"
+        f"imb={_color_val('imb', imb)},"
+        f"bo15={_color_val('bo15', bo15)},"
+        f"adx~{_color_val('adx', adx)},"
+        f"rsi={_color_val('rsi', rsi)},"
+        f"spr={_color_val('spr', spread)},"
+        f"slip~{_color_val('slip', slip)}"
         + ("" if trs else " [fallback]")
     )
-    meta = {"why": why, "spread": spread, "slip": slip, "imb": imb, "ur": ur, "spd": spd}
+    meta = {"why": why_colored, "spread": spread, "slip": slip, "imb": imb, "ur": ur, "spd": spd}
     return score, meta
 
 # ===== Gap-Sniper =====
@@ -332,13 +357,13 @@ def send_buy(coin, score, why):
     global LAST_SIGNAL_TS
     if not _url_ok(SAQAR_URL):
         report_error("send_buy", "SAQAR_WEBHOOK مفقود/غير صالح — تجاهلت الإرسال."); return
-    url = SAQAR_URL + "/hook"                      # <— تمامًا مثل القديم
+    url = SAQAR_URL + "/hook"
     payload = {"action":"buy", "coin": coin.upper()}
     try:
         r = requests.post(url, json=payload, timeout=(6,20))
         if 200 <= r.status_code < 300:
             LAST_SIGNAL_TS = time.time()
-            tg_send(f"🚀 أرسلت {coin} إلى صقر | {r.status_code} — {why[:120]}")
+            tg_send(f"🚀 أرسلت {coin} إلى صقر — {why[:200]}")
         else:
             report_error("send_buy", f"HTTP {r.status_code} | {r.text[:160]}")
     except Exception as e:
@@ -347,13 +372,17 @@ def send_buy(coin, score, why):
 # ===== اختيار top1 =====
 def pick_and_emit(cache, markets):
     best_coin=None; best_score=0.0; best_why=""
+    # Pass 1: gap-sniper على HOT subset
     for m in markets[:min(12,len(markets))]:
         s_meta, meta = gap_sniper(m, cache)
         if s_meta>0:
-            ok, _ = quality_guards(m, {"slip": estimate_slippage_pct((cache.get(("book",m)) or book(m,3))["asks"], BUY_EUR)})
+            bk = cache.get(("book",m)) or book(m,3)
+            if not bk: continue
+            ok, _ = quality_guards(m, {"slip": estimate_slippage_pct(bk["asks"], BUY_EUR)})
             if ok and s_meta > best_score:
                 best_coin, best_score = m.split("-")[0], s_meta
                 best_why = f"gap:{meta.get('why','')}"
+    # Pass 2: multi-score كامل
     for m in markets:
         s, meta = score_market(m, cache)
         ok, _ = quality_guards(m, meta)
@@ -437,19 +466,13 @@ def tg_webhook():
 def on_ready():
     global RUN_ID
     data = request.get_json(silent=True) or {}
-    coin  = data.get("coin"); reason=data.get("reason"); pnl=data.get("pnl_eur")
+    coin  = (data.get("coin") or "").upper()
+    reason=str(data.get("reason") or "")
+    pnl=data.get("pnl_eur")
     tg_send(f"📩 Ready من صقر — {coin} ({reason}) pnl={pnl}")
     if coin:
         try:
-            L = LEARN.get(coin, {"pnl_ema":0.0,"win_ema":0.5,"adj":0.0})
-            alpha=0.3
-            L["pnl_ema"] = (1-alpha)*L["pnl_ema"] + alpha*float(pnl or 0.0)
-            if str(reason) in ("tp_filled","manual_sell_filled"):
-                L["win_ema"] = (1-alpha)*L["win_ema"] + alpha*1.0
-            else:
-                L["win_ema"] = (1-alpha)*L["win_ema"] + alpha*0.0
-            L["adj"] = max(-0.05, min(0.08, 0.08*(0.5 - L["win_ema"])))
-            LEARN[coin]=L
+            learn_update(coin, float(pnl or 0.0), reason)
         except: pass
     if reason in ("buy_failed","taker_failed"):
         COOLDOWN_UNTIL[coin] = time.time() + MIN_COOLDOWN_FAIL_MIN*60
@@ -470,5 +493,5 @@ def home():
 # ===== Main =====
 if __name__=="__main__":
     port = int(os.getenv("PORT","8082"))
-    tg_send("🚀 Abosiyah Pro v3 (saqar-style) started.")
+    tg_send("🚀 Abosiyah Pro v3 (saqar-style, colors, quiet-403) started.")
     app.run("0.0.0.0", port, threaded=True)
