@@ -85,8 +85,8 @@ def report_error(tag: str, detail: str):
 def _url_ok(url: str) -> bool:
     return isinstance(url, str) and url.startswith(("http://", "https://"))
 
-if not _url_ok(SAQER_HOOK_URL):
-    report_error("config", "SAQER_HOOK_URL غير صالح أو فارغ — لن أرسل buy حتى يُضبط.")
+if not _url_ok(SAQAR_HOOK_URL):
+    report_error("config", "SAQAR_HOOK_URL غير صالح أو فارغ — لن أرسل buy حتى يُضبط.")
 
 # ===== Bitvavo helpers (قراءة عامة) =====
 def bv_safe(path, timeout=6, params=None, tag=None):
@@ -356,8 +356,8 @@ def adjusted_s_star(coin):
 # ===== إرسال الإشارة لصقر (مع رصد أخطاء) =====
 def send_buy(coin, score, why):
     global LAST_SIGNAL_TS
-    if not _url_ok(SAQER_HOOK_URL):
-        report_error("send_buy", "SAQER_HOOK_URL مفقود/غير صالح — تجاهلت الإرسال.")
+    if not _url_ok(SAQAR_HOOK_URL):
+        report_error("send_buy", "SAQAR_HOOK_URL مفقود/غير صالح — تجاهلت الإرسال.")
         return
     body = {
         "action":"buy",
@@ -370,7 +370,7 @@ def send_buy(coin, score, why):
     headers={"Content-Type":"application/json"}
     if LINK_SECRET: headers["X-Link-Secret"]=LINK_SECRET
     try:
-        r = requests.post(SAQER_HOOK_URL, json=body, headers=headers, timeout=6)
+        r = requests.post(SAQAR_HOOK_URL, json=body, headers=headers, timeout=6)
         if 200 <= r.status_code < 300:
             LAST_SIGNAL_TS = time.time()
             tg_send(f"🚀 BUY {coin} ({score:.2f}) — {why[:120]}")
