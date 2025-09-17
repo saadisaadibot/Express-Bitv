@@ -1,36 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-Express Pro v5 — Lightning Momentum Hunter (saqar-style webhook, momentum-focused)
-- نبض حي Pulse (trades speed + 1m volatility + RVOL 5m/20m)
-- اتجاه خفيف: EMA9>EMA20 + فوق VWAP5m (وزن صغير)
-- HH-60m Position: تفضيل الثلث العلوي (وزن صغير)
-- Penalized slippage/spread بدل رمي الفرصة مبكراً
-- Fast Momentum Gate: تجاوز هجومي عند تسارع حقيقي (Δ5m/Δ1m + RVOL + uptick + speed)
-- تعلّم بسيط per-coin لتحريك العتبة
-- تبريد أخف لعملات dull
+# Express Momentum v1 — Pure Jump Hunter (saqar-style webhook)
+# - زخم صرف: قفزة 1–3–5 دقائق + تسارع + اختراق قمة قريبة
+# - لا مؤشرات ثقيلة ولا فلاتر “تخنق” — فقط sanity خفيفة (سبريد/كتاب).
+# - /scan يدوي، autoscan عند /ready، /health. Telegram اختياري.
 
-ENV (أمثلة):
-  BOT_TOKEN, CHAT_ID
-  SAQAR_WEBHOOK="http://saqar:8080"        # لا تضع /hook
-  AUTOSCAN_ON_READY=1
-  AGGRESSIVE=1                              # 1=هجومي، 0=تحفّظ
-  BUY_EUR=25
-  MAX_SPREAD=0.45                           # % أقصى سبريد (حارس أخير - مخفف)
-  DEPTH_MIN_EUR=1200                        # حد أدنى عمق asks (مخفف)
-  MAX_SLIP=0.55                             # % انزلاق تقديري (مخفف)
-  SCORE_STAR=0.58                           # عتبة عامة (الهجومي أقل داخلياً)
-  MARKETS_REFRESH_SEC=45
-  HOT_SIZE=20
-  SCOUT_SIZE=80
-  ERROR_COOLDOWN_SEC=60
-  MIN_COOLDOWN_READY_SEC=25
-  MIN_COOLDOWN_FAIL_MIN=30
-"""
-
-import os, time, threading, requests, math
+import os, time, threading, requests
 from flask import Flask, request, jsonify
 
-# ===== إعدادات عامة =====
+# ===== ENV =====
 BITVAVO = "https://api.bitvavo.com/v2"
 BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
 CHAT_ID     = os.getenv("CHAT_ID","").strip()
@@ -40,27 +16,38 @@ AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
 AGGR              = int(os.getenv("AGGRESSIVE","1"))
 
 BUY_EUR   = float(os.getenv("BUY_EUR","25"))
-MAX_SPREAD= float(os.getenv("MAX_SPREAD","0.45"))
-DEPTH_MIN = float(os.getenv("DEPTH_MIN_EUR","1200"))
-MAX_SLIP  = float(os.getenv("MAX_SLIP","0.55"))
-SCORE_STAR= float(os.getenv("SCORE_STAR","0.58"))
 
+# عتبات اندفاع (٪). خفّضها لعدوانية أعلى.
+JUMP_1M = float(os.getenv("JUMP_1M","0.35"))     # تغير آخر دقيقة
+JUMP_3M = float(os.getenv("JUMP_3M","1.10"))     # تغير 3 دقائق
+JUMP_5M = float(os.getenv("JUMP_5M","1.80"))     # تغير 5 دقائق
+ACC_MIN = float(os.getenv("ACC_MIN","0.15"))     # تسارع بسيط: Δ(آخر دقيقة - التي قبلها)
+
+# اختراق/سحب بسيط: لازم الإغلاق قريب من قمة آخر N دقائق
+HH_N_MIN     = int(os.getenv("HH_N_MIN","8"))    # نافذة القمة بالدقائق
+PULLBACK_TOL = float(os.getenv("PULLBACK_TOL","0.30"))  # سماح نزول عن القمة (٪)
+
+# sanity guards خفيفة (تقدر تعطلها بوضع قيم كبيرة)
+MAX_SPREAD_HARD = float(os.getenv("MAX_SPREAD_HARD","1.20"))   # ٪
+DEPTH_MIN_EUR   = float(os.getenv("DEPTH_MIN_EUR","300"))      # EUR asks
+
+# سرعات/أحجام سكان
 MARKETS_REFRESH_SEC = int(os.getenv("MARKETS_REFRESH_SEC","45"))
 HOT_SIZE    = int(os.getenv("HOT_SIZE","20"))
 SCOUT_SIZE  = int(os.getenv("SCOUT_SIZE","80"))
 
+# تبريد ومنع تكرار
 ERROR_COOLDOWN_SEC = int(os.getenv("ERROR_COOLDOWN_SEC","60"))
-MIN_COOLDOWN_READY_SEC = int(os.getenv("MIN_COOLDOWN_READY_SEC","25"))
-MIN_COOLDOWN_FAIL_MIN  = int(os.getenv("MIN_COOLDOWN_FAIL_MIN","30"))
+MIN_COOLDOWN_READY_SEC = int(os.getenv("MIN_COOLDOWN_READY_SEC","20"))
+COOLDOWN_SAME_SEC  = int(os.getenv("COOLDOWN_SAME_SEC","25"))   # لكل عملة بعد إرسال
 
-# ===== حالة داخلية =====
+# ===== حالة =====
 RUN_ID = 0
-COOLDOWN_UNTIL = {}           # coin -> ts (فشل شراء/دول)
-LEARN = {}                    # coin -> {win_ema,pnl_ema,adj}
-DULL_FAILS = {}               # coin -> (count, ts)
 LAST_SIGNAL_TS = 0
-_LAST_ERR = {}                # key->ts
-TRADES_BAN_UNTIL = {}         # market->ts (403 ban)
+_LAST_ERR = {}
+TRADES_BAN_UNTIL = {}
+COOLDOWN_UNTIL = {}  # coin -> ts
+
 app = Flask(__name__)
 
 # ===== Telegram =====
@@ -71,12 +58,12 @@ def tg_send(txt: str):
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": txt},
-            timeout=6
+            timeout=5
         )
     except Exception as e:
         print("tg_send err:", e)
 
-# ===== مكبح أخطاء =====
+# ===== أخطاء =====
 def _should_report(key: str) -> bool:
     ts = _LAST_ERR.get(key, 0)
     if time.time() - ts >= ERROR_COOLDOWN_SEC:
@@ -84,8 +71,7 @@ def _should_report(key: str) -> bool:
     return False
 
 def report_error(tag: str, detail: str):
-    key = f"{tag}:{detail[:64]}"
-    if _should_report(key):
+    if _should_report(f"{tag}:{detail[:80]}"):
         tg_send(f"🛑 {tag} — {detail}")
 
 def _url_ok(url: str) -> bool:
@@ -94,22 +80,15 @@ def _url_ok(url: str) -> bool:
 if not _url_ok(SAQAR_URL):
     report_error("config","SAQAR_WEBHOOK غير مضبوط — لن تُرسل إشارات.")
 
-# ===== Bitvavo (قراءات) =====
-def bv_safe(path, timeout=6, params=None, tag=None):
+# ===== Bitvavo =====
+def bv_safe(path, timeout=5, params=None, tag=None):
     tag = tag or path
     try:
         r = requests.get(f"{BITVAVO}{path}", params=params, timeout=timeout)
-        if not (200 <= r.status_code < 300):
-            if not (path.endswith("/trades") and r.status_code==403):
-                report_error(f"API {tag}", f"HTTP {r.status_code}")
-            return None
-        try: return r.json()
-        except Exception as e:
-            report_error(f"JSON {tag}", str(e)); return None
-    except requests.Timeout:
-        report_error(f"Timeout {tag}", f"after {timeout}s"); return None
-    except Exception as e:
-        report_error(f"HTTP exc {tag}", f"{type(e).__name__}: {e}"); return None
+        if not (200 <= r.status_code < 300): return None
+        return r.json()
+    except Exception:
+        return None
 
 def list_markets_eur():
     rows = bv_safe("/markets", tag="/markets") or []
@@ -125,7 +104,7 @@ def list_markets_eur():
             report_error("parse /markets", f"{type(e).__name__}: {e}")
     return out
 
-def book(market, depth=3):
+def book(market, depth=2):
     data = bv_safe(f"/{market}/book", params={"depth": depth}, tag=f"/book {market}")
     if not isinstance(data, dict): return None
     try:
@@ -137,208 +116,66 @@ def book(market, depth=3):
         if not bids or not asks: return None
         best_bid = bids[0][0]; best_ask = asks[0][0]
         spread = (best_ask-best_bid)/max(best_bid,1e-12)*100.0
-        depth_bid = sum(p*a for p,a in bids[:3])
-        depth_ask = sum(p*a for p,a in asks[:3])
-        return {
-            "bid":best_bid,"ask":best_ask,"spread_pct":spread,
-            "depth_bid_eur":depth_bid,"depth_ask_eur":depth_ask,
-            "bids":bids,"asks":asks
-        }
+        depth_ask = sum(p*a for p,a in asks[:depth])
+        return {"bid":best_bid,"ask":best_ask,"spread_pct":spread,"depth_ask_eur":depth_ask}
     except Exception as e:
         report_error("parse /book", f"{market} {type(e).__name__}: {e}"); return None
 
-def candles(market, interval="1m", limit=240):
+def candles(market, interval="1m", limit=12):
     data = bv_safe(f"/{market}/candles", params={"interval":interval,"limit":limit}, tag=f"/candles {market}")
     return data if isinstance(data, list) else []
 
-def trades(market, limit=80):
-    if TRADES_BAN_UNTIL.get(market, 0) > time.time(): return []
-    try:
-        r = requests.get(f"{BITVAVO}/trades", params={"market": market, "limit": limit}, timeout=5)
-        if r.status_code == 403:
-            TRADES_BAN_UNTIL[market] = time.time() + 600
-            return []
-        if not (200 <= r.status_code < 300): return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-# ===== تقديرات =====
-def estimate_slippage_pct(asks, want_eur: float):
-    if not asks or want_eur<=0: return 9e9
-    tot_eur = 0.0; first = asks[0][0]; last=first
-    for p,a in asks:
-        val = p*a
-        take = min(val, max(0.0, want_eur - tot_eur))
-        if take<=0: break
-        fill_base = take / p
-        tot_eur += fill_base * p
-        last = p
-        if tot_eur >= want_eur: break
-    if first<=0: return 9e9
-    return (last/first - 1.0)*100.0
-
-def uptick_ratio(trs):
-    if not trs: return 0.5
-    buys = sum(1 for t in trs if (t.get("side","").lower())=="buy")
-    return buys / max(1, len(trs))
-
-def trades_10s_speed(trs, now_ms):
-    recent = [t for t in trs if (now_ms - int(t.get("timestamp",0) or 0)) <= 10_000]
-    return len(recent) / 10.0
-
-# ===== مؤشرات خفيفة =====
-def ema(vals, n):
-    if not vals: return 0.0
-    k=2/(n+1.0); e=vals[0]
-    for v in vals[1:]: e = v*k + e*(1-k)
-    return e
-
-def rvol_5_vs_20(cs):
-    # cs: 1m candles
-    try:
-        vols=[float(r[5]) for r in cs]
-        v5=sum(vols[-5:]); v20=sum(vols[-20:])
-        avg20 = v20/20.0 if v20>0 else 0.0
-        return (v5/5.0)/max(avg20,1e-9)
+# ===== زخم صرف من الشموع =====
+def pct(a,b): 
+    try: return (a/b - 1.0)*100.0
     except: return 0.0
 
-def hh_pos_60m(cs):
-    # موضع الإغلاق ضمن أعلى/أدنى 60 دقيقة
-    try:
-        closes=[float(r[4]) for r in cs[-60:]]
-        hi=max(closes); lo=min(closes); last=closes[-1]
-        rng=max(hi-lo,1e-9)
-        return (last-lo)/rng
-    except: return 0.5
-
-def vwap5m(market):
-    cs = candles(market, "5m", 1)
-    try: return float(cs[-1][4])
-    except: return 0.0
-
-# ===== تقييم ألوان =====
-def color_emoji(x, good, warn, reverse=False):
-    if reverse:
-        return "🟢" if x<=good else ("🟡" if x<=warn else "🔴")
-    return "🟢" if x>=good else ("🟡" if x>=warn else "🔴")
-
-# ===== Pulse + Momentum Engine =====
-def engine_pulse(market, cache):
-    now_ms = int(time.time()*1000)
-    cs1m = cache.get(("c1m",market))
-    if cs1m is None:
-        cs1m = candles(market,"1m", limit=120); cache[("c1m",market)] = cs1m
-
-    trs = cache.get(("trades",market))
-    if trs is None:
-        trs = trades(market, 80); cache[("trades",market)] = trs
-
-    ur = uptick_ratio(trs) if trs else 0.5
-    spd = trades_10s_speed(trs, now_ms) if trs else 0.0
-
-    # تذبذب 1m آخر 6 شمعات
+def jumps_meta(cs1m):
+    # cs1m: [[t,o,h,l,c,v], ...]
     try:
         closes=[float(r[4]) for r in cs1m]
-        volty = sum(abs((closes[i]/closes[i-1])-1.0) for i in range(-6,-1)) * 100.0
-        ema9 = ema(closes[-30:], 9); ema20 = ema(closes[-60:],20)
-        last = closes[-1]
-    except:
-        volty=0.0; ema9=ema20=last=0.0
+        highs =[float(r[2]) for r in cs1m]
+    except: 
+        return 0.0,0.0,0.0,0.0,0.0
+    if len(closes) < 7:
+        return 0.0,0.0,0.0,0.0,0.0
+    ch1 = pct(closes[-1], closes[-2])
+    ch2 = pct(closes[-2], closes[-3])
+    ch3 = pct(closes[-1], closes[-4])   # ~3 دقائق
+    ch5 = pct(closes[-1], closes[-6])   # ~5 دقائق
+    hhN = max(highs[-(HH_N_MIN+1):-1]) if len(highs) >= HH_N_MIN+1 else max(highs[:-1])
+    pull = pct(hhN, closes[-1])         # كم نحن تحت القمة (٪)
+    return ch1, ch2, ch3, ch5, pull
 
-    rvol = rvol_5_vs_20(cs1m)
-    vwap = vwap5m(market)
-    above_vwap = 1.0 if (vwap>0 and last>=vwap) else 0.0
-    align = 1.0 if (ema9>ema20 and last>=ema9) else 0.0
-    hh60 = hh_pos_60m(cs1m)
+def momentum_hit(market):
+    cs = candles(market,"1m", limit=max(12, HH_N_MIN+2))
+    if not cs or len(cs)<7: 
+        return False, "", {}
+    ch1, ch2, ch3, ch5, pull = jumps_meta(cs)
+    acc = ch1 - max(0.0, ch2)  # تسارع بسيط: آخر دقيقة أقوى من اللي قبلها
 
-    # نقاط مطبّقة (أوزان الزخم أعلى)
-    z_speed = min(1.0, spd/1.2)                        # 1.2 صفقة/ث للعلامة الكاملة
-    z_ur    = min(1.0, (ur-0.5)/0.25) if ur>0.5 else 0
-    z_vol   = min(1.0, volty/1.6)                      # ~0.3% حركة تراكمية ≈ 1.6
-    z_rvol  = min(1.0, (rvol-0.9)/0.6) if rvol>0.9 else 0
-    z_hh    = max(0.0, (hh60-0.6)/0.4)                 # نفضل أعلى 40% من النطاق
+    # اختراق: لازم نكون قريبين جداً من قمة النافذة
+    near_hh = (pull <= PULLBACK_TOL)
 
-    # أوزان مخففة للاتجاه
-    w_speed = 0.42 if AGGR else 0.33
-    w_ur    = 0.20
-    w_vol   = 0.18
-    w_rvol  = 0.14
-    w_trend = 0.06 if AGGR else 0.15
+    # عتبات عدوانية أخف بالوضع AGGR
+    j1 = JUMP_1M * (0.85 if AGGR else 1.0)
+    j3 = JUMP_3M * (0.90 if AGGR else 1.0)
+    j5 = JUMP_5M * (0.92 if AGGR else 1.0)
+    a0 = ACC_MIN * (0.85 if AGGR else 1.0)
 
-    score = w_speed*z_speed + w_ur*z_ur + w_vol*z_vol + w_rvol*z_rvol + w_trend*(0.6*align + 0.4*above_vwap) + 0.10*z_hh
+    ok = (ch1 >= j1 and ch3 >= j3 and ch5 >= j5 and acc >= a0 and near_hh)
 
-    why = f"ur={ur:.2f} {color_emoji(ur,0.62,0.54)} | spd={spd:.2f} {color_emoji(spd,0.9,0.5)} | " \
-          f"rvol={rvol:.2f} {color_emoji(rvol,1.20,1.00)} | vol1m~{volty:.2f} {color_emoji(volty,1.4,0.8)} | " \
-          f"EMA9>20={int(align)} | vwap={int(above_vwap)} | HH60={hh60:.2f}"
+    why = f"Δ1m={ch1:.2f}% Δ3m={ch3:.2f}% Δ5m={ch5:.2f}% acc={acc:.2f}% pull={pull:.2f}%"
+    meta={"ch1":ch1,"ch3":ch3,"ch5":ch5,"acc":acc,"pull":pull}
+    return ok, why, meta
 
-    return score, {"why": why, "ur":ur, "spd":spd, "rvol":rvol, "vol":volty, "align":align, "hh":hh60, "cs1m": cs1m}
-
-# ===== Momentum Gate (تجاوز هجومي) =====
-def last_change_pct(cs, n=5):
-    try:
-        closes=[float(r[4]) for r in cs[-(n+1):]]
-        return (closes[-1]/closes[0]-1.0)*100.0
-    except: return 0.0
-
-def momentum_gate(metaP, cs1m):
-    ch5 = last_change_pct(cs1m, 5)   # تغيّر آخر 5 دقائق
-    ch1 = last_change_pct(cs1m, 1)   # آخر دقيقة
-    ok  = (
-        metaP["spd"] >= 0.75 and           # ≥0.75 صفقة/ث
-        metaP["ur"]  >= 0.58 and           # أكثرية عمليات شراء
-        metaP["rvol"]>= 1.25 and           # RVOL مرتفع
-        ch5 >= 1.2 and ch1 >= 0.25         # تحرّك فعلي الآن
-    )
-    score_boost = 0.18 if ch5>=2.0 else (0.10 if ch5>=1.5 else 0.0)
-    return ok, score_boost, ch5, ch1
-
-# ===== Gap / orderbook dominance (خفيف) =====
-def engine_gap(market, cache):
-    bk = cache.get(("book",market))
-    if bk is None:
-        bk = book(market,3); cache[("book",market)] = bk
-    if not bk: return 0.0, {}
-    spr = bk["spread_pct"]; B=bk["depth_bid_eur"]; A=bk["depth_ask_eur"]
-    if A<=0 or B<=0: return 0.0, {}
-    ratio = B/max(A,1e-9)
-    score = 0.0
-    if spr<=MAX_SPREAD and ratio>=1.6:
-        score = min(1.0, 0.35 + (ratio-1.6)/3.0)
-    why = f"gap r={ratio:.2f}, spr={spr:.2f}%"
-    return score, {"why": why, "spr": spr, "B":B, "A":A, "bids":B, "asks":A}
-
-# ===== حُرّاس خفاف + عقوبات =====
-def guards_and_penalties(market, meta, want_eur):
-    bk = book(market,3)
-    if not bk: return False, "no_book", 0.0
-    slip = estimate_slippage_pct(bk["asks"], want_eur)
-    spr  = bk["spread_pct"]
-    depA = bk["depth_ask_eur"]
-    # رفض صارم فقط للحالات السيئة جداً
-    if spr > MAX_SPREAD*2.2: return False, "spread_hard", 0.0
-    if depA < DEPTH_MIN*0.4: return False, "depth_hard", 0.0
-    if slip > MAX_SLIP*2.0:  return False, "slip_hard", 0.0
-    # عقوبات ناعمة تدخل ضمن السكور
-    pen = 0.0
-    if spr > MAX_SPREAD: pen += min(0.20, (spr-MAX_SPREAD)/MAX_SPREAD*0.12)
-    if slip > MAX_SLIP:  pen += min(0.25, (slip-MAX_SLIP)/MAX_SLIP*0.16)
-    return True, "ok", pen
-
-# ===== تعلّم =====
-def learn_update(coin, pnl_eur, reason):
-    L = LEARN.get(coin, {"pnl_ema":0.0,"win_ema":0.5,"adj":0.0})
-    a=0.3
-    win = 1.0 if reason in ("tp_filled","manual_sell_filled") else (0.0 if reason in ("sl_triggered","taker_failed","buy_failed") else 0.5)
-    L["pnl_ema"] = (1-a)*L["pnl_ema"] + a*(pnl_eur or 0.0)
-    L["win_ema"] = (1-a)*L["win_ema"] + a*win
-    L["adj"]     = max(-0.08, min(0.12, 0.12*(0.55 - L["win_ema"])))
-    LEARN[coin]=L
-
-def adjusted_star(coin):
-    base = 0.50 if AGGR else SCORE_STAR
-    return max(0.45, min(0.92, base + (LEARN.get(coin,{}).get("adj",0.0))))
+# ===== sanity خفيفة جداً =====
+def sanity_ok(market):
+    bk = book(market,2)
+    if not bk: return False, "no_book"
+    if bk["spread_pct"] > MAX_SPREAD_HARD: return False, f"spread>{MAX_SPREAD_HARD}%"
+    if bk["depth_ask_eur"] < DEPTH_MIN_EUR: return False, "thin_asks"
+    return True, "ok"
 
 # ===== إرسال لصقر =====
 def send_buy(coin, why_line):
@@ -351,79 +188,53 @@ def send_buy(coin, why_line):
         r = requests.post(url, json=payload, timeout=(6,20))
         if 200 <= r.status_code < 300:
             LAST_SIGNAL_TS = time.time()
-            tg_send(f"🚀 أرسلت {coin} إلى صقر — {why_line}")
+            COOLDOWN_UNTIL[coin.upper()] = time.time() + COOLDOWN_SAME_SEC
+            tg_send(f"🚀 BUY→ {coin} — {why_line}")
         else:
             report_error("send_buy", f"HTTP {r.status_code} | {r.text[:140]}")
     except Exception as e:
         report_error("send_buy", f"{type(e).__name__}: {e}")
 
-# ===== اختيار وإطلاق =====
-def pick_and_emit(cache, markets):
-    best=None
-    for m in markets:
-        s_pulse, metaP = engine_pulse(m, cache)
-        s_gap  , metaG = engine_gap(m, cache)
-
-        # فلتر dull مخفف جداً
-        if metaP["spd"] < (0.35 if AGGR else 0.30) and metaP["rvol"] < 1.02 and metaP["vol"] < 0.55:
-            coin = m.split("-")[0]
-            cnt, ts = DULL_FAILS.get(coin, (0,0))
-            if time.time()-ts > 600: cnt=0
-            cnt+=1; DULL_FAILS[coin]=(cnt, time.time())
-            if cnt>=2 and COOLDOWN_UNTIL.get(coin,0) < time.time():
-                COOLDOWN_UNTIL[coin] = time.time() + (900 if AGGR else 1800)  # 15–30 دقيقة
-            continue
-
-        ok, why_guard, penalty = guards_and_penalties(m, {**metaP, **metaG}, BUY_EUR)
-        if not ok:
-            continue
-
-        # بوابة الزخم السريع
-        cs1m = metaP.get("cs1m") or candles(m,"1m",120)
-        ok_momo, boost, ch5, ch1 = momentum_gate(metaP, cs1m)
-
-        # تجميع
-        w_pulse = 0.88
-        w_gap   = 0.12
-        raw_score = w_pulse*s_pulse + w_gap*s_gap + boost
-        score = max(0.0, raw_score - penalty)
-
-        coin=m.split("-")[0]
-        # تبريد العملات الميتة
-        if COOLDOWN_UNTIL.get(coin,0) > time.time(): 
-            continue
-
-        star = adjusted_star(coin)
-
-        # تجاوز هجومي
-        if AGGR and ok_momo and penalty <= 0.12:
-            send_buy(coin, f"FAST momo Δ5m={ch5:.2f}% Δ1m={ch1:.2f}% ⭐{s_pulse:.2f}+{boost:.2f} pen={penalty:.2f}")
-            return True
-
-        # اختيار عادي
-        if score >= star:
-            why = f"{metaP['why']} | {metaG.get('why','')} | Δ5m={ch5:.2f}% Δ1m={ch1:.2f}% | pen={penalty:.2f} | ⭐{score:.2f}/{star:.2f}"
-            if not best or score > best[0]:
-                best=(score, coin, why)
-
-    if best:
-        send_buy(best[1], best[2]); return True
-    return False
-
-# ===== ترتيب حسب السيولة =====
+# ===== ترتيب حسب سيولة خفيفة =====
 def sort_by_liq(markets):
+    # نستخدم spread/ask depth كوكيل بسيط
     scored=[]
     for m in markets:
         b = book(m,1)
         if not b: continue
-        scored.append((m, b["depth_bid_eur"]+b["depth_ask_eur"]))
+        score = (b["depth_ask_eur"] / max(1.0, b["spread_pct"]+0.05))
+        scored.append((m, score))
     scored.sort(key=lambda x:x[1], reverse=True)
     return [m for m,_ in scored]
 
-# ===== حلقة السكانر =====
+# ===== اختيار وإطلاق (Momentum-only) =====
+def pick_and_emit(markets):
+    best=None
+    for m in markets:
+        coin = m.split("-")[0]
+        if COOLDOWN_UNTIL.get(coin,0) > time.time(): 
+            continue
+        ok_sanity, why_s = sanity_ok(m)
+        if not ok_sanity:
+            continue
+        ok, why, meta = momentum_hit(m)
+        if ok:
+            # “نطلق ونمشي” — أول Hit يكفي
+            send_buy(coin, f"{why}")
+            return True
+        # وإلا احفظ أعلى اندفاع (احتياط)
+        score = max(0.0, meta.get("ch1",0)*0.5 + meta.get("ch3",0)*0.3 + meta.get("ch5",0)*0.2 + max(0.0,meta.get("acc",0))*0.2)
+        if not best or score > best[0]:
+            best=(score, coin, why)
+    # إذا مافي Hit صريح، خُذ الأفضل لو تعدّى بعض الزخم
+    if best and best[0] >= (JUMP_3M*0.6):
+        send_buy(best[1], f"soft-hit {best[2]}")
+        return True
+    return False
+
+# ===== حلقة السكان =====
 def scanner_loop(run_id):
-    tg_send(f"🔎 سكان جديد run={run_id}")
-    cache={}
+    tg_send(f"🔎 Momentum scan run={run_id}")
     try:
         mkts_raw = list_markets_eur()
         mkts = [m for (m,b,pp,minq) in mkts_raw if m.endswith("-EUR") and minq<=50.0]
@@ -432,25 +243,23 @@ def scanner_loop(run_id):
         hot_t=scout_t=refresh_t=0
         while run_id == RUN_ID:
             if time.time() - LAST_SIGNAL_TS < MIN_COOLDOWN_READY_SEC:
-                time.sleep(0.12); continue
+                time.sleep(0.10); continue
             try:
-                if time.time()-hot_t >= 1.0:
-                    if pick_and_emit(cache, HOT): return
+                if time.time()-hot_t >= 0.9:
+                    if pick_and_emit(HOT): return
                     hot_t=time.time()
             except Exception as e:
-                report_error("hot loop", f"{type(e).__name__}: {e}")
+                report_error("hot", f"{type(e).__name__}: {e}")
             try:
-                if time.time()-scout_t >= (2.3 if AGGR else 3.8):
-                    if pick_and_emit(cache, SCOUT): return
+                if time.time()-scout_t >= (2.0 if AGGR else 3.2):
+                    if pick_and_emit(SCOUT): return
                     scout_t=time.time()
             except Exception as e:
-                report_error("scout loop", f"{type(e).__name__}: {e}")
+                report_error("scout", f"{type(e).__name__}: {e}")
             try:
                 if time.time()-refresh_t >= MARKETS_REFRESH_SEC:
                     mkts_new = [m for (m,b,pp,minq) in list_markets_eur() if m.endswith("-EUR")]
-                    added = [m for m in mkts_new if m not in mkts]
-                    if added:
-                        tg_send("🆕 أسواق: " + ", ".join(a.split("-")[0] for a in added[:8]))
+                    if mkts_new:
                         mkts = mkts_new
                         HOT   = sort_by_liq(mkts)[:HOT_SIZE]
                         SCOUT = sort_by_liq(mkts)[:SCOUT_SIZE]
@@ -458,11 +267,11 @@ def scanner_loop(run_id):
             except Exception as e:
                 report_error("refresh", f"{type(e).__name__}: {e}")
             time.sleep(0.03 if AGGR else 0.06)
-        tg_send(f"⏹️ run={run_id} stopped (superseded by run={RUN_ID})")
+        tg_send(f"⏹️ run={run_id} stopped (run={RUN_ID})")
     except Exception as e:
         report_error("scanner crash", f"{type(e).__name__}: {e}")
 
-# ===== Flask Routes =====
+# ===== Flask =====
 @app.route("/webhook", methods=["POST"])
 def tg_webhook():
     global RUN_ID
@@ -473,22 +282,18 @@ def tg_webhook():
     if text.startswith("/scan"):
         RUN_ID += 1
         threading.Thread(target=scanner_loop, args=(RUN_ID,), daemon=True).start()
-        tg_send("✅ Scan بدأ يدويًا.")
+        tg_send("✅ Momentum scan بدأ.")
     return jsonify(ok=True)
 
 @app.route("/ready", methods=["POST"])
 def on_ready():
-    global RUN_ID
+    global RUN_ID, LAST_SIGNAL_TS
     data = request.get_json(silent=True) or {}
     coin  = (data.get("coin") or "").upper()
     reason= data.get("reason"); pnl=data.get("pnl_eur")
     tg_send(f"📩 Ready من صقر — {coin} ({reason}) pnl={pnl}")
-    if coin:
-        try:
-            learn_update(coin, float(pnl or 0.0), str(reason))
-        except: pass
-    if reason in ("buy_failed","taker_failed"):
-        COOLDOWN_UNTIL[coin] = time.time() + MIN_COOLDOWN_FAIL_MIN*60
+    # تبريد بسيط بعد ready
+    LAST_SIGNAL_TS = time.time()
     if AUTOSCAN_ON_READY:
         RUN_ID += 1
         threading.Thread(target=scanner_loop, args=(RUN_ID,), daemon=True).start()
@@ -497,14 +302,14 @@ def on_ready():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify(ok=True, run_id=RUN_ID, last_signal_ts=LAST_SIGNAL_TS,
-                   learn=len(LEARN), cooldown=len(COOLDOWN_UNTIL), aggr=AGGR), 200
+                   cooldown=len(COOLDOWN_UNTIL), aggr=AGGR), 200
 
 @app.route("/", methods=["GET"])
 def home():
-    return f"Express Pro v5 ✅ run={RUN_ID} | aggr={AGGR} | learn={len(LEARN)}", 200
+    return f"Express Momentum v1 ✅ run={RUN_ID} | aggr={AGGR}", 200
 
 # ===== Main =====
 if __name__=="__main__":
     port = int(os.getenv("PORT","8082"))
-    tg_send("⚡️ Express Pro v5 (momentum-focused) — started.")
+    tg_send("⚡️ Express Momentum v1 — started (pure jumps).")
     app.run("0.0.0.0", port, threaded=True)
