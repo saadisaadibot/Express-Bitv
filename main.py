@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Express Pro v5 — Lightning Momentum Hunter (saqar-style webhook)
+Express Pro v5 — Lightning Momentum Hunter (saqar-style webhook, momentum-focused)
 - نبض حي Pulse (trades speed + 1m volatility + RVOL 5m/20m)
-- اتجاه خفيف: EMA9>EMA20 + فوق VWAP5m
-- HH-60m Position: تفضيل الثلث العلوي
+- اتجاه خفيف: EMA9>EMA20 + فوق VWAP5m (وزن صغير)
+- HH-60m Position: تفضيل الثلث العلوي (وزن صغير)
 - Penalized slippage/spread بدل رمي الفرصة مبكراً
-- تعلم بسيط per-coin لتحريك العتبة
-- تبريد ديناميكي لعملات dull
+- Fast Momentum Gate: تجاوز هجومي عند تسارع حقيقي (Δ5m/Δ1m + RVOL + uptick + speed)
+- تعلّم بسيط per-coin لتحريك العتبة
+- تبريد أخف لعملات dull
 
 ENV (أمثلة):
   BOT_TOKEN, CHAT_ID
@@ -14,10 +15,10 @@ ENV (أمثلة):
   AUTOSCAN_ON_READY=1
   AGGRESSIVE=1                              # 1=هجومي، 0=تحفّظ
   BUY_EUR=25
-  MAX_SPREAD=0.30                           # % أقصى سبريد (حارس أخير)
-  DEPTH_MIN_EUR=1800                        # حد أدنى عمق asks
-  MAX_SLIP=0.35                             # % انزلاق تقديري (حارس أخير)
-  SCORE_STAR=0.62                           # عتبة بالتحفّظي (الهجومي أقل)
+  MAX_SPREAD=0.45                           # % أقصى سبريد (حارس أخير - مخفف)
+  DEPTH_MIN_EUR=1200                        # حد أدنى عمق asks (مخفف)
+  MAX_SLIP=0.55                             # % انزلاق تقديري (مخفف)
+  SCORE_STAR=0.58                           # عتبة عامة (الهجومي أقل داخلياً)
   MARKETS_REFRESH_SEC=45
   HOT_SIZE=20
   SCOUT_SIZE=80
@@ -39,10 +40,10 @@ AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
 AGGR              = int(os.getenv("AGGRESSIVE","1"))
 
 BUY_EUR   = float(os.getenv("BUY_EUR","25"))
-MAX_SPREAD= float(os.getenv("MAX_SPREAD","0.30"))
-DEPTH_MIN = float(os.getenv("DEPTH_MIN_EUR","1800"))
-MAX_SLIP  = float(os.getenv("MAX_SLIP","0.35"))
-SCORE_STAR= float(os.getenv("SCORE_STAR","0.62"))
+MAX_SPREAD= float(os.getenv("MAX_SPREAD","0.45"))
+DEPTH_MIN = float(os.getenv("DEPTH_MIN_EUR","1200"))
+MAX_SLIP  = float(os.getenv("MAX_SLIP","0.55"))
+SCORE_STAR= float(os.getenv("SCORE_STAR","0.58"))
 
 MARKETS_REFRESH_SEC = int(os.getenv("MARKETS_REFRESH_SEC","45"))
 HOT_SIZE    = int(os.getenv("HOT_SIZE","20"))
@@ -56,7 +57,7 @@ MIN_COOLDOWN_FAIL_MIN  = int(os.getenv("MIN_COOLDOWN_FAIL_MIN","30"))
 RUN_ID = 0
 COOLDOWN_UNTIL = {}           # coin -> ts (فشل شراء/دول)
 LEARN = {}                    # coin -> {win_ema,pnl_ema,adj}
-DULL_FAILS = {}               # coin -> count within window
+DULL_FAILS = {}               # coin -> (count, ts)
 LAST_SIGNAL_TS = 0
 _LAST_ERR = {}                # key->ts
 TRADES_BAN_UNTIL = {}         # market->ts (403 ban)
@@ -252,18 +253,19 @@ def engine_pulse(market, cache):
     align = 1.0 if (ema9>ema20 and last>=ema9) else 0.0
     hh60 = hh_pos_60m(cs1m)
 
-    # نقاط مطبّقة
+    # نقاط مطبّقة (أوزان الزخم أعلى)
     z_speed = min(1.0, spd/1.2)                        # 1.2 صفقة/ث للعلامة الكاملة
     z_ur    = min(1.0, (ur-0.5)/0.25) if ur>0.5 else 0
     z_vol   = min(1.0, volty/1.6)                      # ~0.3% حركة تراكمية ≈ 1.6
     z_rvol  = min(1.0, (rvol-0.9)/0.6) if rvol>0.9 else 0
     z_hh    = max(0.0, (hh60-0.6)/0.4)                 # نفضل أعلى 40% من النطاق
 
-    w_speed = 0.32 if AGGR else 0.25
-    w_ur    = 0.18
-    w_vol   = 0.20
-    w_rvol  = 0.15
-    w_trend = 0.15 if AGGR else 0.22
+    # أوزان مخففة للاتجاه
+    w_speed = 0.42 if AGGR else 0.33
+    w_ur    = 0.20
+    w_vol   = 0.18
+    w_rvol  = 0.14
+    w_trend = 0.06 if AGGR else 0.15
 
     score = w_speed*z_speed + w_ur*z_ur + w_vol*z_vol + w_rvol*z_rvol + w_trend*(0.6*align + 0.4*above_vwap) + 0.10*z_hh
 
@@ -271,7 +273,26 @@ def engine_pulse(market, cache):
           f"rvol={rvol:.2f} {color_emoji(rvol,1.20,1.00)} | vol1m~{volty:.2f} {color_emoji(volty,1.4,0.8)} | " \
           f"EMA9>20={int(align)} | vwap={int(above_vwap)} | HH60={hh60:.2f}"
 
-    return score, {"why": why, "ur":ur, "spd":spd, "rvol":rvol, "vol":volty, "align":align, "hh":hh60}
+    return score, {"why": why, "ur":ur, "spd":spd, "rvol":rvol, "vol":volty, "align":align, "hh":hh60, "cs1m": cs1m}
+
+# ===== Momentum Gate (تجاوز هجومي) =====
+def last_change_pct(cs, n=5):
+    try:
+        closes=[float(r[4]) for r in cs[-(n+1):]]
+        return (closes[-1]/closes[0]-1.0)*100.0
+    except: return 0.0
+
+def momentum_gate(metaP, cs1m):
+    ch5 = last_change_pct(cs1m, 5)   # تغيّر آخر 5 دقائق
+    ch1 = last_change_pct(cs1m, 1)   # آخر دقيقة
+    ok  = (
+        metaP["spd"] >= 0.75 and           # ≥0.75 صفقة/ث
+        metaP["ur"]  >= 0.58 and           # أكثرية عمليات شراء
+        metaP["rvol"]>= 1.25 and           # RVOL مرتفع
+        ch5 >= 1.2 and ch1 >= 0.25         # تحرّك فعلي الآن
+    )
+    score_boost = 0.18 if ch5>=2.0 else (0.10 if ch5>=1.5 else 0.0)
+    return ok, score_boost, ch5, ch1
 
 # ===== Gap / orderbook dominance (خفيف) =====
 def engine_gap(market, cache):
@@ -295,14 +316,14 @@ def guards_and_penalties(market, meta, want_eur):
     slip = estimate_slippage_pct(bk["asks"], want_eur)
     spr  = bk["spread_pct"]
     depA = bk["depth_ask_eur"]
-    # رفض صارم فقط لو شي خارج الحدود جداً
-    if spr > MAX_SPREAD*1.6: return False, "spread_hard", 0.0
-    if depA < DEPTH_MIN*0.6: return False, "depth_hard", 0.0
-    if slip > MAX_SLIP*1.8:  return False, "slip_hard", 0.0
+    # رفض صارم فقط للحالات السيئة جداً
+    if spr > MAX_SPREAD*2.2: return False, "spread_hard", 0.0
+    if depA < DEPTH_MIN*0.4: return False, "depth_hard", 0.0
+    if slip > MAX_SLIP*2.0:  return False, "slip_hard", 0.0
     # عقوبات ناعمة تدخل ضمن السكور
     pen = 0.0
-    if spr > MAX_SPREAD: pen += min(0.25, (spr-MAX_SPREAD)/MAX_SPREAD*0.18)
-    if slip > MAX_SLIP:  pen += min(0.30, (slip-MAX_SLIP)/MAX_SLIP*0.22)
+    if spr > MAX_SPREAD: pen += min(0.20, (spr-MAX_SPREAD)/MAX_SPREAD*0.12)
+    if slip > MAX_SLIP:  pen += min(0.25, (slip-MAX_SLIP)/MAX_SLIP*0.16)
     return True, "ok", pen
 
 # ===== تعلّم =====
@@ -343,40 +364,47 @@ def pick_and_emit(cache, markets):
         s_pulse, metaP = engine_pulse(m, cache)
         s_gap  , metaG = engine_gap(m, cache)
 
-        # نبض أدنى (فلتر رخيص وسريع)
-        if metaP["spd"] < (0.45 if AGGR else 0.35) and metaP["rvol"] < 1.05 and metaP["vol"] < 0.7:
-            # عدّه dull
+        # فلتر dull مخفف جداً
+        if metaP["spd"] < (0.35 if AGGR else 0.30) and metaP["rvol"] < 1.02 and metaP["vol"] < 0.55:
             coin = m.split("-")[0]
-            ct = DULL_FAILS.get(coin, (0,0))
-            cnt, ts = ct
+            cnt, ts = DULL_FAILS.get(coin, (0,0))
             if time.time()-ts > 600: cnt=0
             cnt+=1; DULL_FAILS[coin]=(cnt, time.time())
             if cnt>=2 and COOLDOWN_UNTIL.get(coin,0) < time.time():
-                COOLDOWN_UNTIL[coin] = time.time() + (1200 if AGGR else 2400)  # 20–40 دقيقة
+                COOLDOWN_UNTIL[coin] = time.time() + (900 if AGGR else 1800)  # 15–30 دقيقة
             continue
 
         ok, why_guard, penalty = guards_and_penalties(m, {**metaP, **metaG}, BUY_EUR)
-        if not ok: 
+        if not ok:
             continue
 
-        # جمع درجات (نعاقب السبريد/الانزلاق)
-        w_pulse = 0.80
-        w_gap   = 0.20
-        raw_score = w_pulse*s_pulse + w_gap*s_gap
+        # بوابة الزخم السريع
+        cs1m = metaP.get("cs1m") or candles(m,"1m",120)
+        ok_momo, boost, ch5, ch1 = momentum_gate(metaP, cs1m)
+
+        # تجميع
+        w_pulse = 0.88
+        w_gap   = 0.12
+        raw_score = w_pulse*s_pulse + w_gap*s_gap + boost
         score = max(0.0, raw_score - penalty)
 
         coin=m.split("-")[0]
+        # تبريد العملات الميتة
+        if COOLDOWN_UNTIL.get(coin,0) > time.time(): 
+            continue
+
         star = adjusted_star(coin)
 
+        # تجاوز هجومي
+        if AGGR and ok_momo and penalty <= 0.12:
+            send_buy(coin, f"FAST momo Δ5m={ch5:.2f}% Δ1m={ch1:.2f}% ⭐{s_pulse:.2f}+{boost:.2f} pen={penalty:.2f}")
+            return True
+
+        # اختيار عادي
         if score >= star:
-            why = f"{metaP['why']} | {metaG.get('why','')} | pen={penalty:.2f} | ⭐{score:.2f}/{star:.2f}"
+            why = f"{metaP['why']} | {metaG.get('why','')} | Δ5m={ch5:.2f}% Δ1m={ch1:.2f}% | pen={penalty:.2f} | ⭐{score:.2f}/{star:.2f}"
             if not best or score > best[0]:
                 best=(score, coin, why)
-
-        # وضع هجومي: لو النبض قوي جداً أطلق فوراً
-        if AGGR and s_pulse>=0.92:
-            send_buy(coin, f"fast pulse ⭐{s_pulse:.2f}")
-            return True
 
     if best:
         send_buy(best[1], best[2]); return True
@@ -478,5 +506,5 @@ def home():
 # ===== Main =====
 if __name__=="__main__":
     port = int(os.getenv("PORT","8082"))
-    tg_send("⚡️ Express Pro v5 — started.")
+    tg_send("⚡️ Express Pro v5 (momentum-focused) — started.")
     app.run("0.0.0.0", port, threaded=True)
