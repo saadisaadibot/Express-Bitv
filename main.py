@@ -448,27 +448,67 @@ class ExpressManager:
     def api_hotlist(self): return {"ok":True,"hotlist":self.hot.snapshot()}
 
 # ===== Flask =====
-app=Flask(__name__)
-manager=ExpressManager(UNIVERSE)
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+manager = ExpressManager(UNIVERSE)
+
+def _auth_chat(chat_id: str) -> bool:
+    return (not CHAT_ID) or (str(chat_id) == str(CHAT_ID))
+
+def _tg_handle_cmd(text: str):
+    t = (text or "").strip().lower()
+    if t in ("/scan", "scan", "ابدأ", "سكان"):
+        manager.api_scan(); tg_send("🔎 بدء المسح…"); return
+    if t in ("/hotlist", "hotlist", "هوت", "قائمة"):
+        snap = manager.api_hotlist().get("hotlist", [])
+        if not snap: tg_send("ℹ️ لا توجد Hotlist بعد.")
+        else:
+            lines = [f"{r['market']}: score≈{r.get('score','?')} vol60={r.get('vol_60s','?')}" for r in snap]
+            tg_send("🔥 Hotlist:\n" + "\n".join(lines))
+        return
+    if t in ("/health", "health", "حالة"):
+        h = manager.api_health()
+        tg_send(f"✅ state={h.get('state')} run={h.get('run')} hot={h.get('hotlist')}")
+        return
+    if t.startswith("/ready") or t == "ready":
+        manager.api_ready("tg"); tg_send("🟢 Ready → استئناف المسح"); return
+    tg_send("الأوامر: /scan ، /hotlist ، /health ، /ready")
 
 @app.route("/scan", methods=["GET","POST"])
 def http_scan(): return jsonify(manager.api_scan())
+
 @app.route("/ready", methods=["GET","POST"])
 def http_ready():
     reason = (request.get_json(silent=True) or {}).get("reason") if request.is_json else None
     return jsonify(manager.api_ready(reason))
+
 @app.route("/hotlist", methods=["GET"])
 def http_hot(): return jsonify(manager.api_hotlist())
+
 @app.route("/health", methods=["GET"])
 def http_health(): return jsonify(manager.api_health())
 
-# Hint API
-@app.route("/hint", methods=["GET"])
-def http_hint():
-    m=request.args.get("market","")
-    data=rget(f"express:signal:{m}") if m else None
-    return jsonify({"ok": bool(data), "hint": data or {}})
+# ——— Telegram Webhook ———
+# شغّال على /tg (الافتراضي عندك) وبنفس الوقت /webhook احتياط
+@app.route("/tg", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
+def http_tg_webhook():
+    upd = request.get_json(silent=True) or {}
+    msg  = upd.get("message") or upd.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not _auth_chat(chat_id) or not text:
+        return jsonify(ok=True)
+    try:
+        _tg_handle_cmd(text)
+    except Exception as e:
+        tg_send(f"🐞 TG err: {type(e).__name__}: {e}")
+    return jsonify(ok=True)
 
-if __name__=="__main__":
+@app.route("/", methods=["GET"])
+def home(): return "Express v7 ✅", 200
+
+if __name__ == "__main__":
     manager.start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8081")), threaded=True)
