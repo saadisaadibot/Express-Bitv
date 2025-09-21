@@ -1,315 +1,502 @@
-# Express Momentum v1 — Pure Jump Hunter (saqar-style webhook)
-# - زخم صرف: قفزة 1–3–5 دقائق + تسارع + اختراق قمة قريبة
-# - لا مؤشرات ثقيلة ولا فلاتر “تخنق” — فقط sanity خفيفة (سبريد/كتاب).
-# - /scan يدوي، autoscan عند /ready، /health. Telegram اختياري.
+# -*- coding: utf-8 -*-
+"""
+Express Pro v6 — Liquidity Surfer Edition (Flask + Async WS)
+- بديل "أبو صياح": سكان ذكي يعتمد OrderBook + Tape لكشف الجدران الحقيقية
+- يولّد follow_buy لصقر عبر /hook عندما تتوافر الشروط (Wall Score ≥ العتبة)
+- يدور على لائحة أسواق (MARKETS) بالتتابع، سوق واحد فعّال في كل لحظة
+- يتوقف بعد إرسال إشارة وينتظر /ready من صقر ثم يستأنف المسح
+- /scan: يبدأ جولة جديدة فوراً (يلغي القديمة)
+- /ready: يضع الحالة "جاهز" ويستأنف المسح
+- /health: فحص سريع
 
-import os, time, threading, requests
+ENV (أمثلة أساسية):
+  SAQAR_WEBHOOK="http://saqar:8080"    # بدون /hook
+  LINK_SECRET="..."
+  MARKETS="BTC-EUR,ETH-EUR,ADA-EUR"    # قائمة أسواق
+  AUTOSCAN_ON_START=1                  # يبدأ مسح تلقائي عند التشغيل
+  BOT_TOKEN="123:ABC"                  # اختياري
+  CHAT_ID="-100123456"                 # اختياري
+
+ENV (عناصر الإستراتيجية الافتراضية):
+  DEPTH_LEVELS=30
+  WALL_MIN_EUR=2500
+  WALL_SIZE_RATIO=6.0
+  HIT_RATIO_MIN=0.65
+  DEPL_SPEED_MIN=0.15
+  STICKY_SEC_MIN=3.0
+  REPLENISH_OK_MAX=0.35
+  SCORE_FOLLOW=0.75
+  FRONT_TICKS=1
+  TICK_SIZE_DEFAULT=0.0001
+  MAX_HOLD_SIGNAL_SEC=20
+  COOLDOWN_SEC=5
+  TP_EUR=0.05               # هدف ربح أولي لإشارة صقر
+  SL_PCT=-2                 # ستوب لصقر (%-)
+
+ملاحظات:
+- يعتمد Bitvavo WebSocket: book + trades
+- متوافق تماماً مع صقر: يرسل {"action":"buy","coin":..., "tp_eur":..., "sl_pct":...}
+- إذا أردت دمج فلاتر إضافية (EMA/VWAP) لاحقاً سهلة الإضافة قبل إطلاق الإشارة
+"""
+
+import os, json, time, math, threading, asyncio, statistics as st
+from collections import deque
+from typing import Dict, Tuple, Optional
+
+import requests
+import websockets
 from flask import Flask, request, jsonify
 
-# ===== ENV =====
-BITVAVO = "https://api.bitvavo.com/v2"
-BOT_TOKEN   = os.getenv("BOT_TOKEN","").strip()
-CHAT_ID     = os.getenv("CHAT_ID","").strip()
-SAQAR_URL   = os.getenv("SAQAR_WEBHOOK","").strip().rstrip("/")
+# ========= إعدادات عامة =========
+SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "http://saqar:8080")
+LINK_SECRET   = os.getenv("LINK_SECRET", "")
 
-AUTOSCAN_ON_READY = int(os.getenv("AUTOSCAN_ON_READY","1"))
-AGGR              = int(os.getenv("AGGRESSIVE","1"))
+MARKETS = [m.strip() for m in os.getenv("MARKETS", "BTC-EUR,ETH-EUR,ADA-EUR").split(",") if m.strip()]
+AUTOSCAN_ON_START = os.getenv("AUTOSCAN_ON_START", "1") == "1"
 
-BUY_EUR   = float(os.getenv("BUY_EUR","25"))
+# تليغرام (اختياري)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID   = os.getenv("CHAT_ID", "")
 
-# عتبات اندفاع (٪). خفّضها لعدوانية أعلى.
-JUMP_1M = float(os.getenv("JUMP_1M","0.35"))     # تغير آخر دقيقة
-JUMP_3M = float(os.getenv("JUMP_3M","1.10"))     # تغير 3 دقائق
-JUMP_5M = float(os.getenv("JUMP_5M","1.80"))     # تغير 5 دقائق
-ACC_MIN = float(os.getenv("ACC_MIN","0.15"))     # تسارع بسيط: Δ(آخر دقيقة - التي قبلها)
+# معلمات الإستراتيجية
+DEPTH_LEVELS     = int(os.getenv("DEPTH_LEVELS", "30"))
+WALL_MIN_EUR     = float(os.getenv("WALL_MIN_EUR", "2500"))
+WALL_SIZE_RATIO  = float(os.getenv("WALL_SIZE_RATIO", "6.0"))
+HIT_RATIO_MIN    = float(os.getenv("HIT_RATIO_MIN", "0.65"))
+DEPL_SPEED_MIN   = float(os.getenv("DEPL_SPEED_MIN", "0.15"))
+STICKY_SEC_MIN   = float(os.getenv("STICKY_SEC_MIN", "3.0"))
+REPLENISH_OK_MAX = float(os.getenv("REPLENISH_OK_MAX", "0.35"))
+SCORE_FOLLOW     = float(os.getenv("SCORE_FOLLOW", "0.75"))
+FRONT_TICKS      = int(os.getenv("FRONT_TICKS", "1"))
+TICK_SIZE_DEFAULT= float(os.getenv("TICK_SIZE_DEFAULT", "0.0001"))
+MAX_HOLD_SIGNAL  = float(os.getenv("MAX_HOLD_SIGNAL_SEC", "20"))
+COOLDOWN_SEC     = float(os.getenv("COOLDOWN_SEC", "5"))
 
-# اختراق/سحب بسيط: لازم الإغلاق قريب من قمة آخر N دقائق
-HH_N_MIN     = int(os.getenv("HH_N_MIN","8"))    # نافذة القمة بالدقائق
-PULLBACK_TOL = float(os.getenv("PULLBACK_TOL","0.30"))  # سماح نزول عن القمة (٪)
+TP_EUR           = float(os.getenv("TP_EUR", "0.05"))
+SL_PCT           = float(os.getenv("SL_PCT", "-2"))
 
-# sanity guards خفيفة (تقدر تعطلها بوضع قيم كبيرة)
-MAX_SPREAD_HARD = float(os.getenv("MAX_SPREAD_HARD","1.20"))   # ٪
-DEPTH_MIN_EUR   = float(os.getenv("DEPTH_MIN_EUR","300"))      # EUR asks
+BITVAVO_WS       = "wss://ws.bitvavo.com/v2/"
 
-# سرعات/أحجام سكان
-MARKETS_REFRESH_SEC = int(os.getenv("MARKETS_REFRESH_SEC","45"))
-HOT_SIZE    = int(os.getenv("HOT_SIZE","20"))
-SCOUT_SIZE  = int(os.getenv("SCOUT_SIZE","80"))
-
-# تبريد ومنع تكرار
-ERROR_COOLDOWN_SEC = int(os.getenv("ERROR_COOLDOWN_SEC","60"))
-MIN_COOLDOWN_READY_SEC = int(os.getenv("MIN_COOLDOWN_READY_SEC","20"))
-COOLDOWN_SAME_SEC  = int(os.getenv("COOLDOWN_SAME_SEC","25"))   # لكل عملة بعد إرسال
-
-# ===== حالة =====
-RUN_ID = 0
-LAST_SIGNAL_TS = 0
-_LAST_ERR = {}
-TRADES_BAN_UNTIL = {}
-COOLDOWN_UNTIL = {}  # coin -> ts
-
-app = Flask(__name__)
-
-# ===== Telegram =====
-def tg_send(txt: str):
-    if not BOT_TOKEN:
-        print("TG:", txt); return
+# ========= أدوات عامة =========
+def tg_send(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": txt},
-            timeout=5
-        )
-    except Exception as e:
-        print("tg_send err:", e)
-
-# ===== أخطاء =====
-def _should_report(key: str) -> bool:
-    ts = _LAST_ERR.get(key, 0)
-    if time.time() - ts >= ERROR_COOLDOWN_SEC:
-        _LAST_ERR[key] = time.time(); return True
-    return False
-
-def report_error(tag: str, detail: str):
-    if _should_report(f"{tag}:{detail[:80]}"):
-        tg_send(f"🛑 {tag} — {detail}")
-
-def _url_ok(url: str) -> bool:
-    return isinstance(url, str) and url.startswith(("http://","https://"))
-
-if not _url_ok(SAQAR_URL):
-    report_error("config","SAQAR_WEBHOOK غير مضبوط — لن تُرسل إشارات.")
-
-# ===== Bitvavo =====
-def bv_safe(path, timeout=5, params=None, tag=None):
-    tag = tag or path
-    try:
-        r = requests.get(f"{BITVAVO}{path}", params=params, timeout=timeout)
-        if not (200 <= r.status_code < 300): return None
-        return r.json()
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=3)
     except Exception:
+        pass
+
+def px_round_down(px, tick):  return math.floor(px/tick)*tick
+def px_round_up(px, tick):    return math.ceil(px/tick)*tick
+
+def market_tick_size(market: str) -> float:
+    # إن لم تكن تعرف دقة السوق من API، استخدم الافتراضي
+    # (يمكن لاحقاً جلبها من REST: /markets )
+    return TICK_SIZE_DEFAULT
+
+# ========= تتبع الجدران =========
+class WallTrack:
+    def __init__(self, side: str, price: float, size_base: float):
+        self.side = side               # "buy" أو "sell"
+        self.price = price
+        self.size0 = size_base
+        self.size  = size_base
+        self.ts_first = time.time()
+        self.ts_last  = self.ts_first
+        self.hits_base = 0.0           # تنفيذ فعلي عند السعر (من tape)
+        self.removed_base = 0.0        # إزالة بدون تنفيذ (cancel)
+        self.replenished_base = 0.0    # إعادة تعبئة
+        self.hit_events = 0
+        self.cancel_events = 0
+
+    def update_size(self, new_size: float):
+        now = time.time()
+        delta = new_size - self.size
+        if delta > 1e-12:
+            self.replenished_base += delta
+        elif delta < -1e-12:
+            self.removed_base += (-delta)
+            self.cancel_events += 1
+        self.size = new_size
+        self.ts_last = now
+
+    def record_trade_hit(self, base_qty: float):
+        self.hits_base += base_qty
+        self.hit_events += 1
+        if self.removed_base >= base_qty:
+            self.removed_base -= base_qty
+
+    def life_sec(self) -> float:
+        return max(0.0, time.time() - self.ts_first)
+
+    def depletion(self) -> float:
+        return max(0.0, self.size0 - self.size)
+
+    def metrics(self, size0_eps=1e-12):
+        life = self.life_sec()
+        depl = self.depletion()
+        if self.size0 <= size0_eps or life <= 0:
+            return dict(life=life, hit_ratio=0.0, depl_speed=0.0,
+                        replenish_ratio=0.0, progress=0.0)
+        hit_ratio = (self.hits_base / max(size0_eps, depl))
+        depl_speed = (depl / self.size0) / life
+        replenish_ratio = self.replenished_base / max(size0_eps, self.size0)
+        progress = depl / self.size0
+        return dict(
+            life=life, hit_ratio=hit_ratio, depl_speed=depl_speed,
+            replenish_ratio=replenish_ratio, progress=progress
+        )
+
+    def score(self, avg_depth_eur: float, price_to_eur_coef: float = 1.0) -> Tuple[float, Dict]:
+        m = self.metrics()
+        size_eur = self.size * self.price * price_to_eur_coef
+        size_rel = min(2.0, (size_eur / max(1.0, avg_depth_eur)) if avg_depth_eur>0 else 2.0)
+
+        sticky  = min(1.0, m["life"]/max(1e-6, STICKY_SEC_MIN))
+        hitq    = max(0.0, min(1.0, (m["hit_ratio"] - HIT_RATIO_MIN + 1.0))) / 2.0
+        speedq  = max(0.0, min(1.0, (m["depl_speed"]/max(DEPL_SPEED_MIN,1e-6))))
+        replq   = 1.0 - min(1.0, m["replenish_ratio"]/max(REPLENISH_OK_MAX,1e-6))
+        progq   = m["progress"]
+
+        S = (0.20*size_rel + 0.15*sticky + 0.25*hitq + 0.20*speedq + 0.10*replq + 0.10*progq)
+        return max(0.0, min(1.0, S)), dict(size_eur=size_eur, size_rel=size_rel, **m)
+
+# ========= ماسح سوق واحد =========
+class MarketSurfer:
+    def __init__(self, market: str):
+        self.market = market
+        self.tick   = market_tick_size(market)
+        self.bids: Dict[float,float] = {}
+        self.asks: Dict[float,float] = {}
+        self.best_bid = 0.0
+        self.best_ask = 0.0
+
+        self.current_buy_wall: Optional[WallTrack]  = None
+        self.current_sell_wall: Optional[WallTrack] = None
+
+        self.tape = deque(maxlen=500)  # (ts, side, price, base)
+        self.last_signal_ts = 0.0
+
+    def _update_best(self):
+        if self.bids: self.best_bid = max(self.bids.keys())
+        if self.asks: self.best_ask = min(self.asks.keys())
+
+    def _apply_book(self, bids_upd, asks_upd):
+        for px, sz in bids_upd:
+            p = float(px); s = float(sz)
+            if s<=0: self.bids.pop(p, None)
+            else:    self.bids[p]=s
+        for px, sz in asks_upd:
+            p = float(px); s = float(sz)
+            if s<=0: self.asks.pop(p, None)
+            else:    self.asks[p]=s
+        self._update_best()
+
+    def _apply_trade(self, tr):
+        price = float(tr["price"]); base = float(tr["amount"]); side = tr.get("side","")
+        ts = time.time()
+        self.tape.append((ts, side, price, base))
+        if self.current_buy_wall and abs(price - self.current_buy_wall.price) < 1e-12 and side=="sell":
+            self.current_buy_wall.record_trade_hit(base)
+        if self.current_sell_wall and abs(price - self.current_sell_wall.price) < 1e-12 and side=="buy":
+            self.current_sell_wall.record_trade_hit(base)
+
+    def _avg_depth_eur(self, side_dict: Dict[float,float]) -> float:
+        total_eur = 0.0; levels=0
+        if not side_dict: return 0.0
+        # للطلبات: نرتب تنازلياً بالسعر، للعروض: تصاعدياً
+        if side_dict is self.bids:
+            items = sorted(side_dict.items(), key=lambda x: -x[0])
+        else:
+            items = sorted(side_dict.items(), key=lambda x: x[0])
+        for i,(p,sz) in enumerate(items):
+            if i>=DEPTH_LEVELS: break
+            total_eur += p*sz; levels+=1
+        return (total_eur/levels) if levels>0 else 0.0
+
+    def _detect_wall(self, side: str) -> Optional[Tuple[WallTrack, float]]:
+        side_dict = self.bids if side=="buy" else self.asks
+        if not side_dict: return None
+        avg_eur = self._avg_depth_eur(side_dict)
+        # راقب أول DEPTH_LEVELS مستوى
+        if side=="buy":
+            levels = sorted(side_dict.items(), key=lambda x: -x[0])[:DEPTH_LEVELS]
+        else:
+            levels = sorted(side_dict.items(), key=lambda x: x[0])[:DEPTH_LEVELS]
+
+        for price, size in levels:
+            size_eur = price*size
+            if size_eur < WALL_MIN_EUR: 
+                continue
+            if avg_eur>0 and (size_eur/avg_eur) < WALL_SIZE_RATIO:
+                continue
+            # مرشح
+            track = self.current_buy_wall if side=="buy" else self.current_sell_wall
+            if track and abs(track.price-price)<1e-12:
+                track.update_size(size)
+                return track, avg_eur
+            else:
+                tr = WallTrack(side, price, size)
+                if side=="buy":  self.current_buy_wall = tr
+                else:            self.current_sell_wall = tr
+                return tr, avg_eur
         return None
 
-def list_markets_eur():
-    rows = bv_safe("/markets", tag="/markets") or []
-    out=[]
-    for r in rows:
-        try:
-            if r.get("quote")!="EUR": continue
-            m=r.get("market"); b=r.get("base")
-            minq=float(r.get("minOrderInQuoteAsset",0) or 0)
-            if not m or not b: continue
-            out.append((m,b,float(r.get("pricePrecision",6)), minq))
-        except Exception as e:
-            report_error("parse /markets", f"{type(e).__name__}: {e}")
-    return out
+    def _tape_speed(self, last_sec=2.0) -> float:
+        now = time.time()
+        return sum(b for (ts,_,_,b) in self.tape if now-ts<=last_sec)
 
-def book(market, depth=2):
-    data = bv_safe(f"/{market}/book", params={"depth": depth}, tag=f"/book {market}")
-    if not isinstance(data, dict): return None
-    try:
-        bids=[]; asks=[]
-        for row in data.get("bids") or []:
-            if len(row)>=2: bids.append((float(row[0]), float(row[1])))
-        for row in data.get("asks") or []:
-            if len(row)>=2: asks.append((float(row[0]), float(row[1])))
-        if not bids or not asks: return None
-        best_bid = bids[0][0]; best_ask = asks[0][0]
-        spread = (best_ask-best_bid)/max(best_bid,1e-12)*100.0
-        depth_ask = sum(p*a for p,a in asks[:depth])
-        return {"bid":best_bid,"ask":best_ask,"spread_pct":spread,"depth_ask_eur":depth_ask}
-    except Exception as e:
-        report_error("parse /book", f"{market} {type(e).__name__}: {e}"); return None
+    def maker_entry_buy_px(self, wall: WallTrack) -> float:
+        tgt = px_round_up(wall.price + FRONT_TICKS*self.tick, self.tick)
+        if self.best_ask:
+            tgt = min(tgt, self.best_ask - self.tick)
+        return max(self.tick, tgt)
 
-def candles(market, interval="1m", limit=12):
-    data = bv_safe(f"/{market}/candles", params={"interval":interval,"limit":limit}, tag=f"/candles {market}")
-    return data if isinstance(data, list) else []
+    def maker_entry_sell_px(self, wall: WallTrack) -> float:
+        tgt = px_round_down(wall.price - FRONT_TICKS*self.tick, self.tick)
+        if self.best_bid:
+            tgt = max(tgt, self.best_bid + self.tick)
+        return max(self.tick, tgt)
 
-# ===== زخم صرف من الشموع =====
-def pct(a,b): 
-    try: return (a/b - 1.0)*100.0
-    except: return 0.0
+    async def run_once(self) -> Optional[dict]:
+        """
+        يدير WebSocket لسوق واحد حتى يولّد إشارة صالحة أو تنتهي المهلة.
+        يُعيد dict بالنتيجة أو None إذا لا شيء.
+        عند ظهور buy_wall قوي → يُعاد {"type":"follow_buy", "market":..., "price":..., "info":{...}}
+        """
+        async with websockets.connect(BITVAVO_WS, ping_interval=20, ping_timeout=20) as ws:
+            # اشتراك
+            sub = {"action":"subscribe","channels":[
+                {"name":"book","markets":[self.market]},
+                {"name":"trades","markets":[self.market]}
+            ]}
+            await ws.send(json.dumps(sub))
+            snapshot_ok=False
+            start_ts=time.time()
 
-def jumps_meta(cs1m):
-    # cs1m: [[t,o,h,l,c,v], ...]
-    try:
-        closes=[float(r[4]) for r in cs1m]
-        highs =[float(r[2]) for r in cs1m]
-    except: 
-        return 0.0,0.0,0.0,0.0,0.0
-    if len(closes) < 7:
-        return 0.0,0.0,0.0,0.0,0.0
-    ch1 = pct(closes[-1], closes[-2])
-    ch2 = pct(closes[-2], closes[-3])
-    ch3 = pct(closes[-1], closes[-4])   # ~3 دقائق
-    ch5 = pct(closes[-1], closes[-6])   # ~5 دقائق
-    hhN = max(highs[-(HH_N_MIN+1):-1]) if len(highs) >= HH_N_MIN+1 else max(highs[:-1])
-    pull = pct(hhN, closes[-1])         # كم نحن تحت القمة (٪)
-    return ch1, ch2, ch3, ch5, pull
+            while True:
+                raw = await ws.recv()
+                msg = json.loads(raw)
 
-def momentum_hit(market):
-    cs = candles(market,"1m", limit=max(12, HH_N_MIN+2))
-    if not cs or len(cs)<7: 
-        return False, "", {}
-    ch1, ch2, ch3, ch5, pull = jumps_meta(cs)
-    acc = ch1 - max(0.0, ch2)  # تسارع بسيط: آخر دقيقة أقوى من اللي قبلها
+                if msg.get("event")=="book":
+                    self._apply_book(msg.get("bids",[]), msg.get("asks",[]))
+                    snapshot_ok=True
+                    self.current_buy_wall = None; self.current_sell_wall=None
+                    continue
+                if not snapshot_ok:
+                    continue
 
-    # اختراق: لازم نكون قريبين جداً من قمة النافذة
-    near_hh = (pull <= PULLBACK_TOL)
+                if msg.get("event")=="bookUpdate":
+                    self._apply_book(msg.get("bids",[]), msg.get("asks",[]))
 
-    # عتبات عدوانية أخف بالوضع AGGR
-    j1 = JUMP_1M * (0.85 if AGGR else 1.0)
-    j3 = JUMP_3M * (0.90 if AGGR else 1.0)
-    j5 = JUMP_5M * (0.92 if AGGR else 1.0)
-    a0 = ACC_MIN * (0.85 if AGGR else 1.0)
+                if msg.get("event")=="trade":
+                    for tr in msg.get("trades",[]):
+                        self._apply_trade(tr)
 
-    ok = (ch1 >= j1 and ch3 >= j3 and ch5 >= j5 and acc >= a0 and near_hh)
+                # اكتشاف/تحديث جدران
+                bw = self._detect_wall("buy")
+                sw = self._detect_wall("sell")
 
-    why = f"Δ1m={ch1:.2f}% Δ3m={ch3:.2f}% Δ5m={ch5:.2f}% acc={acc:.2f}% pull={pull:.2f}%"
-    meta={"ch1":ch1,"ch3":ch3,"ch5":ch5,"acc":acc,"pull":pull}
-    return ok, why, meta
+                now=time.time()
+                if now - self.last_signal_ts < COOLDOWN_SEC:
+                    continue
 
-# ===== sanity خفيفة جداً =====
-def sanity_ok(market):
-    bk = book(market,2)
-    if not bk: return False, "no_book"
-    if bk["spread_pct"] > MAX_SPREAD_HARD: return False, f"spread>{MAX_SPREAD_HARD}%"
-    if bk["depth_ask_eur"] < DEPTH_MIN_EUR: return False, "thin_asks"
-    return True, "ok"
+                speed = self._tape_speed(2.0)
 
-# ===== إرسال لصقر =====
-def send_buy(coin, why_line):
-    global LAST_SIGNAL_TS
-    if not _url_ok(SAQAR_URL):
-        report_error("send_buy","SAQAR_WEBHOOK غير صالح."); return
-    url = SAQAR_URL + "/hook"
-    payload = {"action":"buy","coin":coin.upper()}
-    try:
-        r = requests.post(url, json=payload, timeout=(6,20))
-        if 200 <= r.status_code < 300:
-            LAST_SIGNAL_TS = time.time()
-            COOLDOWN_UNTIL[coin.upper()] = time.time() + COOLDOWN_SAME_SEC
-            tg_send(f"🚀 BUY→ {coin} — {why_line}")
+                # follow_buy؟
+                if self.current_buy_wall:
+                    S, info = self.current_buy_wall.score(self._avg_depth_eur(self.bids))
+                    conds = [
+                        info["life"] >= STICKY_SEC_MIN,
+                        info["hit_ratio"] >= HIT_RATIO_MIN,
+                        info["depl_speed"] >= DEPL_SPEED_MIN,
+                        info["replenish_ratio"] <= REPLENISH_OK_MAX,
+                        S >= SCORE_FOLLOW,
+                        speed > 0.0
+                    ]
+                    if self.current_buy_wall.size <= 1e-8:
+                        self.current_buy_wall=None
+                    elif all(conds):
+                        entry = self.maker_entry_buy_px(self.current_buy_wall)
+                        self.last_signal_ts = now
+                        return {
+                            "type":"follow_buy",
+                            "market": self.market,
+                            "price": entry,
+                            "score": round(S,3),
+                            "wall_px": self.current_buy_wall.price,
+                            "info": {k:(round(v,4) if isinstance(v,float) else v) for k,v in info.items()}
+                        }
+
+                # انتهاء صلاحية جدار قديم
+                for w in (self.current_buy_wall, self.current_sell_wall):
+                    if w and (now - w.ts_last > MAX_HOLD_SIGNAL):
+                        if w.side=="buy": self.current_buy_wall=None
+                        else: self.current_sell_wall=None
+
+# ========= مدير المسح المتسلسل عبر عدة أسواق =========
+class ExpressManager:
+    """
+    يدور على MARKETS بالتسلسل. عند أول إشارة follow_buy صحيحة:
+    - يرسل POST إلى صقر /hook
+    - يوقف المسح ويدخل حالة SIGNAL_SENT وينتظر /ready ليستأنف
+    يدعم /scan لتدوير run_id وإعادة الانطلاق فورا.
+    """
+    def __init__(self, markets):
+        self.markets = markets[:]
+        self.state = "IDLE"        # IDLE | SCANNING | SIGNAL_SENT
+        self.run_id = 0
+        self._lock = threading.Lock()
+        self.loop = None
+        self.thread = None
+        self.stop_flag = False
+
+    def set_state(self, s):
+        with self._lock:
+            self.state = s
+
+    def inc_run(self):
+        with self._lock:
+            self.run_id += 1
+            return self.run_id
+
+    def current_run(self):
+        with self._lock:
+            return self.run_id
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_flag = False
+        self.thread = threading.Thread(target=self._runner, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_flag = True
+
+    def _runner(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        if AUTOSCAN_ON_START:
+            self.loop.run_until_complete(self.scan_cycle())
         else:
-            report_error("send_buy", f"HTTP {r.status_code} | {r.text[:140]}")
-    except Exception as e:
-        report_error("send_buy", f"{type(e).__name__}: {e}")
+            self.set_state("IDLE")
+            tg_send("🟡 Express v6 جاهز — استخدم /scan للبدء.")
+            while not self.stop_flag:
+                time.sleep(0.2)
 
-# ===== ترتيب حسب سيولة خفيفة =====
-def sort_by_liq(markets):
-    # نستخدم spread/ask depth كوكيل بسيط
-    scored=[]
-    for m in markets:
-        b = book(m,1)
-        if not b: continue
-        score = (b["depth_ask_eur"] / max(1.0, b["spread_pct"]+0.05))
-        scored.append((m, score))
-    scored.sort(key=lambda x:x[1], reverse=True)
-    return [m for m,_ in scored]
+    async def scan_cycle(self):
+        self.set_state("SCANNING")
+        my_run = self.inc_run()
+        tg_send(f"🟢 بدء مسح جديد (run {my_run}) — الأسواق: {', '.join(self.markets)}")
+        try:
+            while not self.stop_flag and self.state=="SCANNING" and my_run==self.current_run():
+                for m in self.markets:
+                    if self.state!="SCANNING" or my_run!=self.current_run() or self.stop_flag:
+                        break
+                    surfer = MarketSurfer(m)
+                    try:
+                        # مهلة تقديرية لكل سوق قبل الانتقال (يمكن ضبطها بزمن خارجي إذا رغبت)
+                        result = await asyncio.wait_for(surfer.run_once(), timeout=60)
+                    except asyncio.TimeoutError:
+                        result = None
+                    except Exception as e:
+                        tg_send(f"⚠️ خطأ سوق {m}: {e}")
+                        result = None
 
-# ===== اختيار وإطلاق (Momentum-only) =====
-def pick_and_emit(markets):
-    best=None
-    for m in markets:
-        coin = m.split("-")[0]
-        if COOLDOWN_UNTIL.get(coin,0) > time.time(): 
-            continue
-        ok_sanity, why_s = sanity_ok(m)
-        if not ok_sanity:
-            continue
-        ok, why, meta = momentum_hit(m)
-        if ok:
-            # “نطلق ونمشي” — أول Hit يكفي
-            send_buy(coin, f"{why}")
-            return True
-        # وإلا احفظ أعلى اندفاع (احتياط)
-        score = max(0.0, meta.get("ch1",0)*0.5 + meta.get("ch3",0)*0.3 + meta.get("ch5",0)*0.2 + max(0.0,meta.get("acc",0))*0.2)
-        if not best or score > best[0]:
-            best=(score, coin, why)
-    # إذا مافي Hit صريح، خُذ الأفضل لو تعدّى بعض الزخم
-    if best and best[0] >= (JUMP_3M*0.6):
-        send_buy(best[1], f"soft-hit {best[2]}")
-        return True
-    return False
+                    if result and result.get("type")=="follow_buy":
+                        # أطلق الإشارة إلى صقر
+                        ok = self.send_to_saqer(result)
+                        # في كل الأحوال: توقّف وانتظر /ready لاستئناف
+                        self.set_state("SIGNAL_SENT")
+                        info = result.get("info", {})
+                        tg_send(
+                            f"🚀 إشارة شراء ({m})\n"
+                            f"سعر Maker≈ {result['price']}\n"
+                            f"Score={result['score']} | life={info.get('life')} | "
+                            f"hit={info.get('hit_ratio')} | speed={info.get('depl_speed')} | "
+                            f"repl={info.get('replenish_ratio')} | prog={info.get('progress')}\n"
+                            f"تم الإرسال إلى صقر: {'OK' if ok else 'FAILED'}\n"
+                            f"⏸️ التوقف حتى /ready من صقر."
+                        )
+                        return
+                # لم نجد شيء: كرّر الدورة
+        finally:
+            # إذا خرج بدون إشارة، ارجع IDLE
+            if self.state=="SCANNING":
+                self.set_state("IDLE")
+                tg_send("ℹ️ انتهاء دورة المسح بدون إشارة (IDLE).")
 
-# ===== حلقة السكان =====
-def scanner_loop(run_id):
-    tg_send(f"🔎 Momentum scan run={run_id}")
-    try:
-        mkts_raw = list_markets_eur()
-        mkts = [m for (m,b,pp,minq) in mkts_raw if m.endswith("-EUR") and minq<=50.0]
-        HOT   = sort_by_liq(mkts)[:HOT_SIZE]
-        SCOUT = sort_by_liq(mkts)[:SCOUT_SIZE]
-        hot_t=scout_t=refresh_t=0
-        while run_id == RUN_ID:
-            if time.time() - LAST_SIGNAL_TS < MIN_COOLDOWN_READY_SEC:
-                time.sleep(0.10); continue
-            try:
-                if time.time()-hot_t >= 0.9:
-                    if pick_and_emit(HOT): return
-                    hot_t=time.time()
-            except Exception as e:
-                report_error("hot", f"{type(e).__name__}: {e}")
-            try:
-                if time.time()-scout_t >= (2.0 if AGGR else 3.2):
-                    if pick_and_emit(SCOUT): return
-                    scout_t=time.time()
-            except Exception as e:
-                report_error("scout", f"{type(e).__name__}: {e}")
-            try:
-                if time.time()-refresh_t >= MARKETS_REFRESH_SEC:
-                    mkts_new = [m for (m,b,pp,minq) in list_markets_eur() if m.endswith("-EUR")]
-                    if mkts_new:
-                        mkts = mkts_new
-                        HOT   = sort_by_liq(mkts)[:HOT_SIZE]
-                        SCOUT = sort_by_liq(mkts)[:SCOUT_SIZE]
-                    refresh_t=time.time()
-            except Exception as e:
-                report_error("refresh", f"{type(e).__name__}: {e}")
-            time.sleep(0.03 if AGGR else 0.06)
-        tg_send(f"⏹️ run={run_id} stopped (run={RUN_ID})")
-    except Exception as e:
-        report_error("scanner crash", f"{type(e).__name__}: {e}")
+    def send_to_saqer(self, signal: dict) -> bool:
+        coin = signal["market"].split("-")[0]
+        data = {"action":"buy", "coin":coin, "tp_eur":TP_EUR, "sl_pct":SL_PCT}
+        headers = {"X-Link-Secret": LINK_SECRET} if LINK_SECRET else {}
+        try:
+            r = requests.post(SAQAR_WEBHOOK+"/hook", json=data, headers=headers, timeout=5)
+            return r.status_code>=200 and r.status_code<300
+        except Exception as e:
+            tg_send(f"⛔ فشل إرسال إشارة لصقر: {e}")
+            return False
 
-# ===== Flask =====
-@app.route("/webhook", methods=["POST"])
-def tg_webhook():
-    global RUN_ID
-    upd = request.get_json(silent=True) or {}
-    msg = upd.get("message") or upd.get("edited_message") or {}
-    text = (msg.get("text") or "").strip().lower()
-    if not text: return jsonify(ok=True)
-    if text.startswith("/scan"):
-        RUN_ID += 1
-        threading.Thread(target=scanner_loop, args=(RUN_ID,), daemon=True).start()
-        tg_send("✅ Momentum scan بدأ.")
-    return jsonify(ok=True)
+    # تحكّم خارجي من Flask
+    def api_scan(self):
+        # أعد التشغيل من جديد
+        self.set_state("SCANNING")
+        if self.loop and self.loop.is_running():
+            # شغّل دورة مسح جديدة على الحدث loop
+            asyncio.run_coroutine_threadsafe(self.scan_cycle(), self.loop)
+        else:
+            # إذا لم تكن حلقة فعّالة، ابدأ الخيط
+            self.start()
+        return {"ok": True, "state": self.state, "run": self.current_run()}
 
-@app.route("/ready", methods=["POST"])
-def on_ready():
-    global RUN_ID, LAST_SIGNAL_TS
-    data = request.get_json(silent=True) or {}
-    coin  = (data.get("coin") or "").upper()
-    reason= data.get("reason"); pnl=data.get("pnl_eur")
-    tg_send(f"📩 Ready من صقر — {coin} ({reason}) pnl={pnl}")
-    # تبريد بسيط بعد ready
-    LAST_SIGNAL_TS = time.time()
-    if AUTOSCAN_ON_READY:
-        RUN_ID += 1
-        threading.Thread(target=scanner_loop, args=(RUN_ID,), daemon=True).start()
-    return jsonify(ok=True)
+    def api_ready(self):
+        # صقر يقول جاهز — استأنف مسح
+        if self.state=="SIGNAL_SENT":
+            self.set_state("SCANNING")
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.scan_cycle(), self.loop)
+            else:
+                self.start()
+        else:
+            # لو ما في إشارة سابقة، فقط تأكد من التشغيل
+            if self.state!="SCANNING":
+                self.set_state("SCANNING")
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self.scan_cycle(), self.loop)
+                else:
+                    self.start()
+        return {"ok": True, "state": self.state, "run": self.current_run()}
+
+    def api_health(self):
+        return {"ok": True, "state": self.state, "run": self.current_run(), "markets": self.markets}
+
+# ========= Flask API =========
+app = Flask(__name__)
+manager = ExpressManager(MARKETS)
+
+@app.route("/scan", methods=["POST","GET"])
+def http_scan():
+    res = manager.api_scan()
+    return jsonify(res)
+
+@app.route("/ready", methods=["POST","GET"])
+def http_ready():
+    # صقر يستدعي هذا بعد البيع/الفشل ليعيد الإقلاع
+    reason = request.json.get("reason") if request.is_json else None
+    if reason:
+        tg_send(f"✅ Ready من صقر (reason={reason}) — استئناف المسح.")
+    res = manager.api_ready()
+    return jsonify(res)
 
 @app.route("/health", methods=["GET"])
-def health():
-    return jsonify(ok=True, run_id=RUN_ID, last_signal_ts=LAST_SIGNAL_TS,
-                   cooldown=len(COOLDOWN_UNTIL), aggr=AGGR), 200
+def http_health():
+    return jsonify(manager.api_health())
 
-@app.route("/", methods=["GET"])
-def home():
-    return f"Express Momentum v1 ✅ run={RUN_ID} | aggr={AGGR}", 200
-
-# ===== Main =====
-if __name__=="__main__":
-    port = int(os.getenv("PORT","8082"))
-    tg_send("⚡️ Express Momentum v1 — started (pure jumps).")
-    app.run("0.0.0.0", port, threaded=True)
+# ========= التشغيل =========
+if __name__ == "__main__":
+    # ابدأ الخيط الخلفي
+    manager.start()
+    # سيرفر ويب خفيف
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8081")), threaded=True)
