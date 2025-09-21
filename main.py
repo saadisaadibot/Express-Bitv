@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Express Pro v7 — Global Radar (ALL EUR) + Surfer Confirm + Hints
+Express Pro v7 — Global Radar (ALL EUR) + Turbo Fast-Path + Surfer Confirm + Hints
 - اكتشاف تلقائي لكل أسواق EUR (UNIVERSE=AUTO).
-- BurstRadar: رادار trades سريع لكل السوق عبر دفعات WebSocket.
-- Surfer: تأكيد وجود buy wall حقيقي من دفتر الأوامر.
+- BurstRadar سريع يغطي كل السوق (دفعات WebSocket).
+- Turbo Fast-Path: شراء فوري عند انفجار قوي جدًا (اختياري عبر ENV).
+- Surfer: تأكيد جدار شراء حقيقي قبل الشراء في الحالات العادية.
 - إرسال لصقر + كتابة Hint في Redis + Webhook تيليغرام.
 """
 
@@ -24,15 +25,21 @@ DISCOVER_QUOTE= os.getenv("DISCOVER_QUOTE","EUR")
 DISCOVER_REFRESH_MIN = int(os.getenv("DISCOVER_REFRESH_MIN","10"))
 
 # رادار شامل
-BURST_CHUNK            = int(os.getenv("BURST_CHUNK","40"))
-BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","10"))
+BURST_CHUNK            = int(os.getenv("BURST_CHUNK","40"))   # أسواق لكل WS
+BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","10")) # 0 = غطّي كل الشنكات
 BURST_WINDOW_SEC       = int(os.getenv("BURST_WINDOW_SEC","10"))
 BURST_MIN_TRADES_10S   = int(os.getenv("BURST_MIN_TRADES_10S","15"))
 BURST_MIN_BASE_10S     = float(os.getenv("BURST_MIN_BASE_10S","1200"))
 BURST_MIN_UPTICK       = float(os.getenv("BURST_MIN_UPTICK","0.60"))
 BURST_COOLDOWN_SEC     = float(os.getenv("BURST_COOLDOWN_SEC","20"))
 
-# تلغرام
+# Turbo Fast-Path (اختياري)
+FASTPATH_ON = os.getenv("FASTPATH_ON","0") == "1"
+FAST_CNT    = int(os.getenv("FAST_CNT","20"))
+FAST_BASE   = float(os.getenv("FAST_BASE","10000"))
+FAST_UP     = float(os.getenv("FAST_UP","0.80"))
+
+# تيليغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN","")
 CHAT_ID   = os.getenv("CHAT_ID","")
 
@@ -157,23 +164,19 @@ class MarketSurfer:
         if self.asks: self.best_ask=min(self.asks.keys())
 
     def _apply_book(self, bids_upd, asks_upd):
-        # حمايات: قد تأتي عناصر غير رقمية
+        # حمايات قوية حول عناصر الدفتر
         for itm in (bids_upd or []):
             if not (isinstance(itm, (list, tuple)) and len(itm)>=2): continue
             px,sz = itm[0], itm[1]
-            try:
-                p=float(px); s=float(sz)
-            except Exception:
-                continue
+            try: p=float(px); s=float(sz)
+            except Exception: continue
             if s<=0: self.bids.pop(p,None)
             else: self.bids[p]=s
         for itm in (asks_upd or []):
             if not (isinstance(itm, (list, tuple)) and len(itm)>=2): continue
             px,sz = itm[0], itm[1]
-            try:
-                p=float(px); s=float(sz)
-            except Exception:
-                continue
+            try: p=float(px); s=float(sz)
+            except Exception: continue
             if s<=0: self.asks.pop(p,None)
             else: self.asks[p]=s
         self._update_best()
@@ -275,7 +278,7 @@ class MarketSurfer:
 
 # ===== Burst Radar (للجميع) =====
 class BurstRadar:
-    """يشترك بالـtrades لكل الأسواق على دفعات WS، ويرصد انفجار خلال 10s."""
+    """يشترك بالـtrades لكل الأسواق على دفعات WS، ويرصد انفجار خلال BURST_WINDOW_SEC."""
     def __init__(self, markets: List[str], on_burst_cb):
         self.markets = markets[:]
         self.on_burst = on_burst_cb
@@ -286,7 +289,8 @@ class BurstRadar:
     def start(self):
         if self.threads: return
         chunks = [self.markets[i:i+BURST_CHUNK] for i in range(0, len(self.markets), BURST_CHUNK)]
-        chunks = chunks[:max(1, BURST_SOCKETS)]
+        if BURST_SOCKETS > 0:
+            chunks = chunks[:BURST_SOCKETS]  # حد أقصى اختياري
         for i, ch in enumerate(chunks):
             t = threading.Thread(target=self._runner, args=(ch,i), daemon=True)
             t.start(); self.threads.append(t)
@@ -306,7 +310,7 @@ class BurstRadar:
                         if ev not in ("trade","trades"): continue
                         trs=[msg] if ev=="trade" else (msg.get("trades",[]) or [])
                         now=time.time()
-                        if not isinstance(trs, list):  # حماية
+                        if not isinstance(trs, list):
                             continue
                         for tr in trs:
                             if not isinstance(tr, dict): 
@@ -384,7 +388,40 @@ class ExpressManager:
             except Exception as e:
                 tg_send(f"rediscover err: {e}")
 
+    def _ask_snapshot_price(self, market: str) -> float:
+        """أفضل سعر ask سريعًا (للـFast-Path)."""
+        try:
+            async def _ask():
+                async with websockets.connect(BITVAVO_WS, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(json.dumps({"action":"subscribe","channels":[{"name":"book","markets":[market]}]}))
+                    t0=time.time()
+                    while time.time()-t0<2:
+                        msg=json.loads(await ws.recv())
+                        if msg.get("event")=="book":
+                            asks = msg.get("asks") or []
+                            if isinstance(asks, list) and len(asks)>0 and isinstance(asks[0], (list, tuple)):
+                                a0=float(asks[0][0]); tick=TICK_SIZE_DEFAULT
+                                return max(tick, a0 + tick)  # دخول Maker فوق الآسك بتكة
+            px = asyncio.run(_ask())
+            return float(px or 0.0)
+        except Exception:
+            return 0.0
+
     def _on_burst(self, market:str, meta:dict):
+        # ===== Turbo Fast-Path =====
+        if FASTPATH_ON and meta.get("cnt",0) >= FAST_CNT and meta.get("base",0) >= FAST_BASE and meta.get("uptick",0) >= FAST_UP:
+            try:
+                px = self._ask_snapshot_price(market)
+                sig = {"type":"fast_burst","market":market,"price":px,
+                       "score":0.99,"wall_px":0.0,"info":{"fastpath":True, **meta}}
+                write_signal_hint(sig)
+                _ = self.send_to_saqer(sig)
+                tg_send(f"⚡ FAST BUY {market} cnt={meta['cnt']} base={int(meta['base'])} upt={meta['uptick']}")
+                return
+            except Exception as e:
+                tg_send(f"fastpath err {market}: {e}")
+
+        # ===== المسار العادي (Surfer تأكيد) =====
         def _task():
             try:
                 tg_send(f"📡 Burst {market} cnt={meta['cnt']} base={meta['base']:.0f} upt={meta['uptick']}")
@@ -422,7 +459,7 @@ class ExpressManager:
         except Exception as e:
             tg_send(f"⛔ فشل إرسال لصقر: {e}"); return False
 
-    # واجهات HTTP بسيطة
+    # واجهات HTTP
     def api_scan(self): self.start(); return {"ok":True,"state":self.state,"markets":len(self.markets)}
     def api_ready(self, reason:str=None):
         self.start()
