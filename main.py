@@ -16,50 +16,52 @@ import requests
 import websockets
 from flask import Flask, request, jsonify
 
-# ===== إعدادات عامة =====
+# ===== إعدادات عامة # ====== Turbo Profile ======
+
 SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "http://saqar:8080")
 LINK_SECRET   = os.getenv("LINK_SECRET", "")
 
 UNIVERSE_ENV  = os.getenv("UNIVERSE","AUTO").strip()
 DISCOVER_QUOTE= os.getenv("DISCOVER_QUOTE","EUR")
-DISCOVER_REFRESH_MIN = int(os.getenv("DISCOVER_REFRESH_MIN","10"))
+DISCOVER_REFRESH_MIN = int(os.getenv("DISCOVER_REFRESH_MIN","15"))
 
-# رادار شامل
+# رادار Turbo
 BURST_CHUNK            = int(os.getenv("BURST_CHUNK","40"))   # أسواق لكل WS
-BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","10")) # 0 = غطّي كل الشنكات
-BURST_WINDOW_SEC       = int(os.getenv("BURST_WINDOW_SEC","10"))
-BURST_MIN_TRADES_10S   = int(os.getenv("BURST_MIN_TRADES_10S","15"))
-BURST_MIN_BASE_10S     = float(os.getenv("BURST_MIN_BASE_10S","1200"))
-BURST_MIN_UPTICK       = float(os.getenv("BURST_MIN_UPTICK","0.60"))
-BURST_COOLDOWN_SEC     = float(os.getenv("BURST_COOLDOWN_SEC","20"))
+BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","0"))  # 0 = غطّي كل الشنكات
+BURST_WINDOW_SEC       = int(os.getenv("BURST_WINDOW_SEC","6"))
+BURST_MIN_TRADES_10S   = int(os.getenv("BURST_MIN_TRADES_10S","8"))
+BURST_MIN_BASE_10S     = float(os.getenv("BURST_MIN_BASE_10S","600"))
+BURST_MIN_UPTICK       = float(os.getenv("BURST_MIN_UPTICK","0.50"))
+BURST_COOLDOWN_SEC     = float(os.getenv("BURST_COOLDOWN_SEC","10"))
 
-# Turbo Fast-Path (اختياري)
-FASTPATH_ON = os.getenv("FASTPATH_ON","0") == "1"
-FAST_CNT    = int(os.getenv("FAST_CNT","20"))
-FAST_BASE   = float(os.getenv("FAST_BASE","10000"))
-FAST_UP     = float(os.getenv("FAST_UP","0.80"))
+# Turbo Fast-Path (فوري)
+FASTPATH_ON = os.getenv("FASTPATH_ON","1") == "1"
+FAST_CNT    = int(os.getenv("FAST_CNT","12"))
+FAST_BASE   = float(os.getenv("FAST_BASE","5000"))
+FAST_UP     = float(os.getenv("FAST_UP","0.70"))
 
 # تيليغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN","")
 CHAT_ID   = os.getenv("CHAT_ID","")
 
-# Surfer (دفتر الأوامر)
-DEPTH_LEVELS     = int(os.getenv("DEPTH_LEVELS","30"))
-WALL_MIN_EUR     = float(os.getenv("WALL_MIN_EUR","2500"))
-WALL_SIZE_RATIO  = float(os.getenv("WALL_SIZE_RATIO","6.0"))
-HIT_RATIO_MIN    = float(os.getenv("HIT_RATIO_MIN","0.65"))
-DEPL_SPEED_MIN   = float(os.getenv("DEPL_SPEED_MIN","0.15"))
-STICKY_SEC_MIN   = float(os.getenv("STICKY_SEC_MIN","3.0"))
-REPLENISH_OK_MAX = float(os.getenv("REPLENISH_OK_MAX","0.35"))
-SCORE_FOLLOW     = float(os.getenv("SCORE_FOLLOW","0.75"))
+# Surfer (دفتر الأوامر) — أخف
+DEPTH_LEVELS     = int(os.getenv("DEPTH_LEVELS","25"))
+WALL_MIN_EUR     = float(os.getenv("WALL_MIN_EUR","1200"))
+WALL_SIZE_RATIO  = float(os.getenv("WALL_SIZE_RATIO","4.0"))
+HIT_RATIO_MIN    = float(os.getenv("HIT_RATIO_MIN","0.55"))
+DEPL_SPEED_MIN   = float(os.getenv("DEPL_SPEED_MIN","0.08"))
+STICKY_SEC_MIN   = float(os.getenv("STICKY_SEC_MIN","1.5"))
+REPLENISH_OK_MAX = float(os.getenv("REPLENISH_OK_MAX","0.50"))
+SCORE_FOLLOW     = float(os.getenv("SCORE_FOLLOW","0.60"))
 FRONT_TICKS      = int(os.getenv("FRONT_TICKS","1"))
 TICK_SIZE_DEFAULT= float(os.getenv("TICK_SIZE_DEFAULT","0.0001"))
-COOLDOWN_SEC     = float(os.getenv("COOLDOWN_SEC","5"))
+COOLDOWN_SEC     = float(os.getenv("COOLDOWN_SEC","4"))
 
+# Take Profit / Stop Loss
 TP_EUR = float(os.getenv("TP_EUR","0.05"))
 SL_PCT = float(os.getenv("SL_PCT","-2"))
-BITVAVO_WS = "wss://ws.bitvavo.com/v2/"
 
+BITVAVO_WS = "wss://ws.bitvavo.com/v2/"
 # ===== Redis (اختياري) =====
 REDIS_URL = os.getenv("REDIS_URL","")
 R = None
