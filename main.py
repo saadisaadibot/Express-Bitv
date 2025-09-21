@@ -233,15 +233,16 @@ class MarketSurfer:
         self.tape.append((time.time(), side, p, a))
 
     def _avg_depth(self, side_dict:Dict[float,float])->float:
-        if not side_dict: return 0.0
-        items=sorted(side_dict.items(), key=(lambda x:-x[0] if side_dict is self.bids else lambda x:x[0]))
-        if side_dict is self.bids: items=sorted(side_dict.items(), key=lambda x:-x[0])
-        else: items=sorted(side_dict.items(), key=lambda x:x[0])
-        total=0.0; n=0
-        for i,(p,sz) in enumerate(items):
-            if i>=DEPTH_LEVELS: break
-            total+=p*sz; n+=1
-        return (total/n) if n>0 else 0.0
+    if not side_dict: return 0.0
+    if side_dict is self.bids:
+        items = sorted(side_dict.items(), key=lambda x: -x[0])
+    else:
+        items = sorted(side_dict.items(), key=lambda x: x[0])
+    total=0.0; n=0
+    for i,(p,sz) in enumerate(items):
+        if i>=DEPTH_LEVELS: break
+        total+=p*sz; n+=1
+    return (total/n) if n>0 else 0.0
 
     def _detect_wall(self, side:str)->Optional[Tuple[WallTrack,float]]:
         side_dict=self.bids if side=="buy" else self.asks
