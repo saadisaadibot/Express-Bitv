@@ -1,9 +1,4 @@
-flask
-requests
-redis
-python-dotenv
+Flask
 gunicorn
-websocket-client   # <— المهم
-ccxt
-pandas
-tabulate
+requests
+websockets==12.0.3
