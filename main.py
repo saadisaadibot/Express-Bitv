@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Express Pro v7 — Global Radar (ALL EUR) + Surfer Confirm + Hints
-- يكتشف تلقائياً جميع أسواق EUR على Bitvavo (UNIVERSE=AUTO).
-- رادار انفجار trades لكل السوق عبر دفعات WS متعددة (BurstRadar).
-- عند الانفجار يطلق Surfer يقرأ دفتر الأوامر ويؤكد وجود buy wall حقيقي.
-- عند التأكيد يرسل /hook لصقر + يكتب hint في Redis + إشعار تلغرام.
-- يوفر /scan /ready /health /hint و Webhook تيليغرام على /tg و /webhook.
+- اكتشاف تلقائي لكل أسواق EUR (UNIVERSE=AUTO).
+- BurstRadar: رادار trades سريع لكل السوق عبر دفعات WebSocket.
+- Surfer: تأكيد وجود buy wall حقيقي من دفتر الأوامر.
+- إرسال لصقر + كتابة Hint في Redis + Webhook تيليغرام.
 """
 
 import os, json, time, math, threading, asyncio
@@ -16,7 +15,7 @@ import requests
 import websockets
 from flask import Flask, request, jsonify
 
-# ========== إعدادات عامة ==========
+# ===== إعدادات عامة =====
 SAQAR_WEBHOOK = os.getenv("SAQAR_WEBHOOK", "http://saqar:8080")
 LINK_SECRET   = os.getenv("LINK_SECRET", "")
 
@@ -25,15 +24,15 @@ DISCOVER_QUOTE= os.getenv("DISCOVER_QUOTE","EUR")
 DISCOVER_REFRESH_MIN = int(os.getenv("DISCOVER_REFRESH_MIN","10"))
 
 # رادار شامل
-BURST_CHUNK            = int(os.getenv("BURST_CHUNK","40"))   # عدد الأسواق لكل WS
-BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","10")) # أقصى جلسات WS
+BURST_CHUNK            = int(os.getenv("BURST_CHUNK","40"))
+BURST_SOCKETS          = int(os.getenv("BURST_SOCKETS","10"))
 BURST_WINDOW_SEC       = int(os.getenv("BURST_WINDOW_SEC","10"))
 BURST_MIN_TRADES_10S   = int(os.getenv("BURST_MIN_TRADES_10S","15"))
 BURST_MIN_BASE_10S     = float(os.getenv("BURST_MIN_BASE_10S","1200"))
 BURST_MIN_UPTICK       = float(os.getenv("BURST_MIN_UPTICK","0.60"))
 BURST_COOLDOWN_SEC     = float(os.getenv("BURST_COOLDOWN_SEC","20"))
 
-# تلغرام (اختياري)
+# تلغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN","")
 CHAT_ID   = os.getenv("CHAT_ID","")
 
@@ -54,7 +53,7 @@ TP_EUR = float(os.getenv("TP_EUR","0.05"))
 SL_PCT = float(os.getenv("SL_PCT","-2"))
 BITVAVO_WS = "wss://ws.bitvavo.com/v2/"
 
-# ===== Redis اختياري =====
+# ===== Redis (اختياري) =====
 REDIS_URL = os.getenv("REDIS_URL","")
 R = None
 try:
@@ -90,22 +89,22 @@ def tg_send(text:str):
 def px_round_up(px, tick): return math.ceil(px/tick)*tick
 def market_tick_size(_): return TICK_SIZE_DEFAULT
 
-# ===== اكتشاف تلقائي لكل أزواج EUR =====
+# ===== اكتشاف تلقائي لأسواق EUR =====
 def auto_discover_markets(quote="EUR") -> List[str]:
     try:
         rows = requests.get("https://api.bitvavo.com/v2/markets", timeout=8).json()
         out = []
         for r in rows or []:
             if r.get("quote") == quote and r.get("status") == "trading":
-                m = r.get("market"); mq = float(r.get("minOrderInQuoteAsset",0) or 0)
-                # استبعاد الأزواج ذات الحد الأدنى العالي جداً
+                m = r.get("market")
+                mq = float(r.get("minOrderInQuoteAsset",0) or 0)
                 if m and mq <= 20:
                     out.append(m)
         return sorted(out)
     except Exception:
         return []
 
-# ===== Surfer (كشف الجدران عبر دفتر الأوامر) =====
+# ===== Surfer (كشف الجدران) =====
 class WallTrack:
     def __init__(self, side:str, price:float, size_base:float):
         self.side=side; self.price=price
@@ -152,34 +151,52 @@ class MarketSurfer:
         self.best_bid=0.0; self.best_ask=0.0
         self.buy:Optional[WallTrack]=None; self.sell:Optional[WallTrack]=None
         self.tape=deque(maxlen=600); self.last_signal_ts=0.0
+
     def _update_best(self):
         if self.bids: self.best_bid=max(self.bids.keys())
         if self.asks: self.best_ask=min(self.asks.keys())
+
     def _apply_book(self, bids_upd, asks_upd):
-        for px,sz in bids_upd:
-            p=float(px); s=float(sz)
+        # حمايات: قد تأتي عناصر غير رقمية
+        for itm in (bids_upd or []):
+            if not (isinstance(itm, (list, tuple)) and len(itm)>=2): continue
+            px,sz = itm[0], itm[1]
+            try:
+                p=float(px); s=float(sz)
+            except Exception:
+                continue
             if s<=0: self.bids.pop(p,None)
             else: self.bids[p]=s
-        for px,sz in asks_upd:
-            p=float(px); s=float(sz)
+        for itm in (asks_upd or []):
+            if not (isinstance(itm, (list, tuple)) and len(itm)>=2): continue
+            px,sz = itm[0], itm[1]
+            try:
+                p=float(px); s=float(sz)
+            except Exception:
+                continue
             if s<=0: self.asks.pop(p,None)
             else: self.asks[p]=s
         self._update_best()
+
     def _apply_trade(self, tr):
-        p=float(tr["price"]); a=float(tr["amount"]); side=tr.get("side","")
+        try:
+            p=float(tr["price"]); a=float(tr["amount"])
+        except Exception:
+            return
+        side=str(tr.get("side",""))
         if self.buy and abs(p-self.buy.price)<1e-12 and side=="sell": self.buy.hit(a)
         if self.sell and abs(p-self.sell.price)<1e-12 and side=="buy": self.sell.hit(a)
         self.tape.append((time.time(), side, p, a))
+
     def _avg_depth(self, d:Dict[float,float])->float:
         if not d: return 0.0
-        items = sorted(d.items(), key=(lambda kv: -kv[0] if d is self.bids else (lambda x:x))(0))  # safe trick
-        # نعيد كتابة الترتيب بوضوح:
         items = sorted(d.items(), key=(lambda kv: -kv[0])) if d is self.bids else sorted(d.items(), key=lambda kv: kv[0])
         total=0.0; n=0
         for i,(p,sz) in enumerate(items):
             if i>=DEPTH_LEVELS: break
             total+=p*sz; n+=1
         return (total/n) if n else 0.0
+
     def _detect_wall(self, side:str)->Optional[Tuple[WallTrack,float]]:
         side_dict=self.bids if side=="buy" else self.asks
         if not side_dict: return None
@@ -198,10 +215,12 @@ class MarketSurfer:
                 else: self.sell=tr
                 return tr, avg
         return None
+
     def maker_entry_buy_px(self, wall:WallTrack)->float:
         tgt=px_round_up(wall.price + FRONT_TICKS*self.tick, self.tick)
         if self.best_ask: tgt=min(tgt, self.best_ask - self.tick)
         return max(self.tick, tgt)
+
     async def run_until_signal(self, timeout_sec:int=60)->Optional[dict]:
         async with websockets.connect(BITVAVO_WS, ping_interval=20, ping_timeout=20) as ws:
             await ws.send(json.dumps({"action":"subscribe","channels":[
@@ -213,17 +232,36 @@ class MarketSurfer:
                 if time.time()-start > timeout_sec: return None
                 msg=json.loads(await ws.recv())
                 ev=msg.get("event")
+
                 if ev=="book":
-                    self._apply_book(msg.get("bids",[]), msg.get("asks",[])); snapshot_ok=True; self.buy=None; self.sell=None; continue
+                    bids = msg.get("bids") or []
+                    asks = msg.get("asks") or []
+                    if isinstance(bids, list) and isinstance(asks, list):
+                        self._apply_book(bids, asks)
+                        snapshot_ok=True; self.buy=None; self.sell=None
+                    continue
+
                 if not snapshot_ok: continue
+
                 if ev=="bookUpdate":
-                    self._apply_book(msg.get("bids",[]), msg.get("asks",[]))
-                if ev=="trade":
+                    bids = msg.get("bids") or []
+                    asks = msg.get("asks") or []
+                    if isinstance(bids, list) and isinstance(asks, list):
+                        self._apply_book(bids, asks)
+
+                elif ev=="trade":
                     self._apply_trade(msg)
+
                 elif ev=="trades":
-                    for tr in msg.get("trades",[]): self._apply_trade(tr)
+                    trs = msg.get("trades", [])
+                    if isinstance(trs, list):
+                        for tr in trs:
+                            if isinstance(tr, dict): self._apply_trade(tr)
+
+                # كشف الجدران
                 self._detect_wall("buy"); self._detect_wall("sell")
                 if time.time()-self.last_signal_ts < COOLDOWN_SEC: continue
+
                 if self.buy:
                     S,info=self.buy.score(self._avg_depth(self.bids))
                     conds=[info["life"]>=STICKY_SEC_MIN, info["hit_ratio"]>=HIT_RATIO_MIN,
@@ -235,15 +273,16 @@ class MarketSurfer:
                         return {"type":"follow_buy","market":self.market,"price":entry,
                                 "score":round(S,3),"wall_px":self.buy.price,"info":info}
 
-# ===== Global Burst Radar (كل السوق) =====
+# ===== Burst Radar (للجميع) =====
 class BurstRadar:
-    """يشترك بالـtrades لكل الأسواق على دفعات WS ويطلق Surfer عند أي انفجار خلال 10s."""
+    """يشترك بالـtrades لكل الأسواق على دفعات WS، ويرصد انفجار خلال 10s."""
     def __init__(self, markets: List[str], on_burst_cb):
         self.markets = markets[:]
         self.on_burst = on_burst_cb
         self.buffers  = {m: deque(maxlen=4000) for m in self.markets}  # (ts, px, base, up?)
         self.seen_recent = defaultdict(lambda: 0.0)
         self.threads = []; self.stop=False
+
     def start(self):
         if self.threads: return
         chunks = [self.markets[i:i+BURST_CHUNK] for i in range(0, len(self.markets), BURST_CHUNK)]
@@ -252,6 +291,7 @@ class BurstRadar:
             t = threading.Thread(target=self._runner, args=(ch,i), daemon=True)
             t.start(); self.threads.append(t)
         tg_send(f"📡 Radar on {len(chunks)} WS sessions / {len(self.markets)} markets.")
+
     def _runner(self, markets_chunk: List[str], idx: int):
         async def _run():
             subs=[{"name":"trades","markets":markets_chunk}]
@@ -264,13 +304,21 @@ class BurstRadar:
                         msg=json.loads(await ws.recv())
                         ev=msg.get("event")
                         if ev not in ("trade","trades"): continue
-                        trs=[msg] if ev=="trade" else msg.get("trades",[])
+                        trs=[msg] if ev=="trade" else (msg.get("trades",[]) or [])
                         now=time.time()
+                        if not isinstance(trs, list):  # حماية
+                            continue
                         for tr in trs:
+                            if not isinstance(tr, dict): 
+                                continue
                             m=tr.get("market")
                             if m not in self.buffers: continue
-                            px=float(tr.get("price",0) or 0); ba=float(tr.get("amount",0) or 0)
-                            up = 1 if px >= (last_px.get(m,px) or px) else 0
+                            try:
+                                px=float(tr.get("price",0) or 0); ba=float(tr.get("amount",0) or 0)
+                            except Exception:
+                                continue
+                            prev = last_px.get(m, px)
+                            up = 1 if px >= prev else 0
                             last_px[m]=px
                             self.buffers[m].append((now, px, ba, up))
                         if now - last_eval >= 0.5:
@@ -279,6 +327,7 @@ class BurstRadar:
             except Exception as e:
                 tg_send(f"⚠️ radar[{idx}] ws err: {e}")
         asyncio.run(_run())
+
     def _maybe_burst(self, markets_chunk: List[str], now: float):
         for m in markets_chunk:
             buf=self.buffers.get(m); 
@@ -308,19 +357,16 @@ def write_signal_hint(sig: dict):
     }
     rset(key, hint, ttl=120)
 
-# ===== المدير العام =====
+# ===== المدير =====
 class ExpressManager:
     def __init__(self, universe_env: str):
-        # اكتشاف الأسواق
         if universe_env.upper() == "AUTO" or not universe_env:
             self.markets = auto_discover_markets(DISCOVER_QUOTE)
             tg_send(f"🌐 AUTO اكتشف {len(self.markets)} سوق {DISCOVER_QUOTE}.")
         else:
             self.markets = [m.strip() for m in universe_env.split(",") if m.strip()]
-        self.state="IDLE"; self._lock=threading.Lock()
-        self.loop=None; self.thread=None; self.stop=False
+        self.state="IDLE"; self.loop=None; self.thread=None; self.stop=False
         self.radar = BurstRadar(self.markets, on_burst_cb=self._on_burst)
-        # جدولة إعادة اكتشاف كل X دقائق
         if DISCOVER_REFRESH_MIN > 0:
             threading.Thread(target=self._rediscover_loop, daemon=True).start()
 
@@ -331,7 +377,7 @@ class ExpressManager:
                 new = auto_discover_markets(DISCOVER_QUOTE)
                 if new and set(new) != set(self.markets):
                     self.markets = new
-                    self.radar.stop = True  # أوقف القديمة
+                    self.radar.stop = True
                     self.radar = BurstRadar(self.markets, on_burst_cb=self._on_burst)
                     self.radar.start()
                     tg_send(f"🔄 أعيد الاكتشاف: {len(new)} سوق.")
@@ -339,7 +385,6 @@ class ExpressManager:
                 tg_send(f"rediscover err: {e}")
 
     def _on_burst(self, market:str, meta:dict):
-        # شغّل Surfer للتأكيد دون إيقاف الرادار
         def _task():
             try:
                 tg_send(f"📡 Burst {market} cnt={meta['cnt']} base={meta['base']:.0f} upt={meta['uptick']}")
@@ -364,7 +409,7 @@ class ExpressManager:
 
     def _runner(self):
         self.loop=asyncio.new_event_loop(); asyncio.set_event_loop(self.loop)
-        self.state="IDLE"; tg_send("🟡 Express v7 Global Radar جاهز. /scan للبدء (تشغيل الرادار).")
+        self.state="IDLE"; tg_send("🟡 Express v7 Global Radar جاهز. /scan لتشغيل الرادار.")
         while not self.stop: time.sleep(1.0)
 
     def send_to_saqer(self, sig:dict)->bool:
@@ -377,15 +422,13 @@ class ExpressManager:
         except Exception as e:
             tg_send(f"⛔ فشل إرسال لصقر: {e}"); return False
 
-    # واجهات HTTP
-    def api_scan(self):
-        self.start(); return {"ok":True,"state":self.state}
+    # واجهات HTTP بسيطة
+    def api_scan(self): self.start(); return {"ok":True,"state":self.state,"markets":len(self.markets)}
     def api_ready(self, reason:str=None):
         self.start()
         if reason: tg_send(f"✅ Ready ({reason})")
         return {"ok":True,"state":self.state}
-    def api_health(self):
-        return {"ok":True,"state":self.state,"markets":len(self.markets)}
+    def api_health(self): return {"ok":True,"state":self.state,"markets":len(self.markets)}
 
 # ===== Flask =====
 app = Flask(__name__)
@@ -397,12 +440,14 @@ def _auth_chat(chat_id: str) -> bool:
 def _tg_handle_cmd(text: str):
     t=(text or "").strip().lower()
     if t in ("/scan","scan","ابدأ","start"):
-        manager.api_scan(); tg_send("🔎 تم تشغيل الرادار…"); return
+        res=manager.api_scan(); tg_send(f"🔎 تم تشغيل الرادار… ({res.get('markets')} markets)")
+        return
     if t in ("/health","health","حالة"):
         h=manager.api_health(); tg_send(f"✅ state={h.get('state')} markets={h.get('markets')}")
         return
     if t.startswith("/ready") or t=="ready":
-        manager.api_ready("tg"); tg_send("🟢 Ready"); return
+        manager.api_ready("tg"); tg_send("🟢 Ready")
+        return
     tg_send("الأوامر: /scan ، /health ، /ready")
 
 @app.route("/scan", methods=["GET","POST"])
@@ -416,14 +461,12 @@ def http_ready():
 @app.route("/health", methods=["GET"])
 def http_health(): return jsonify(manager.api_health())
 
-# Hint API (لقراءة صقر)
 @app.route("/hint", methods=["GET"])
 def http_hint():
     m=request.args.get("market","")
     data=rget(f"express:signal:{m}") if m else None
     return jsonify({"ok": bool(data), "hint": data or {}})
 
-# Telegram Webhook ("/tg" واحتياط "/webhook")
 @app.route("/tg", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def http_tg():
