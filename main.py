@@ -2,9 +2,9 @@
 """
 Express Pro v7 — Hotlist Surfer + Hints (Flask + Async WS)
 - يبني Hotlist ديناميكي (تجسّس trades جماعي) ويركّز المراقبة عليها.
-- يكتشف جدار شراء "حقيقي" (يُؤكل بتنفيذ) ويرسل شراء لصقر فوراً.
-- يكتب Hint في Redis: entry_hint/score/flash + يراقب بعد الإشارة لخروج مِرآتي (exit_now=1).
-- يوفر /hotlist و /hint و /health و /scan و /ready.
+- يلتقط جدار شراء "حقيقي" (يُؤكل بتنفيذ) ويرسل شراء لصقر فوراً.
+- يكتب Hint في Redis: entry_hint/score/flash + ووتشر 90ث لضبط exit_now.
+- يوفر /hotlist و /hint و /health و /scan و /ready + Webhook تيليغرام (/tg و /webhook).
 """
 
 import os, json, time, math, threading, asyncio
@@ -42,7 +42,6 @@ REPLENISH_OK_MAX = float(os.getenv("REPLENISH_OK_MAX","0.35"))
 SCORE_FOLLOW     = float(os.getenv("SCORE_FOLLOW","0.75"))
 FRONT_TICKS      = int(os.getenv("FRONT_TICKS","1"))
 TICK_SIZE_DEFAULT= float(os.getenv("TICK_SIZE_DEFAULT","0.0001"))
-MAX_HOLD_SIGNAL  = float(os.getenv("MAX_HOLD_SIGNAL_SEC","20"))
 COOLDOWN_SEC     = float(os.getenv("COOLDOWN_SEC","5"))
 
 TP_EUR = float(os.getenv("TP_EUR","0.05"))
@@ -55,7 +54,10 @@ R = None
 try:
     import redis
     if REDIS_URL:
-        R = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2, socket_connect_timeout=2)
+        R = redis.Redis.from_url(
+            REDIS_URL, decode_responses=True,
+            socket_timeout=2, socket_connect_timeout=2
+        )
 except Exception:
     R = None
 
@@ -78,7 +80,7 @@ def tg_send(text:str):
         print("TG:", text); return
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id":CHAT_ID,"text":text}, timeout=3)
+                      json={"chat_id":CHAT_ID,"text":text}, timeout=5)
     except Exception:
         pass
 
@@ -109,10 +111,18 @@ class TradeSpy:
             await ws.send(json.dumps({"action":"subscribe","channels":subs}))
             while True:
                 msg=json.loads(await ws.recv())
-                if msg.get("event")!="trade": continue
-                for tr in msg.get("trades",[]):
+                ev = msg.get("event")
+                # دعم شكلين: "trade" المفرد و "trades" كمصفوفة
+                if ev == "trade":
+                    trs = [msg]
+                elif ev == "trades":
+                    trs = msg.get("trades", [])
+                else:
+                    continue
+                for tr in trs:
                     m = tr.get("market")
-                    if m not in self.windows: continue
+                    if m not in self.windows: 
+                        continue
                     px=float(tr["price"]); ba=float(tr["amount"]); ts=time.time()
                     self.windows[m].append((ts,px,ba))
                     lp=self.last_price.get(m,0.0)
@@ -234,22 +244,16 @@ class MarketSurfer:
         self.tape.append((time.time(), side, p, a))
 
     def _avg_depth(self, side_dict:Dict[float,float])->float:
-        """متوسط عمق اليورو لأول DEPTH_LEVELS من جهة الكتاب."""
-        if not side_dict:
-            return 0.0
-        # رتب حسب السعر (bids نزولاً، asks صعوداً)
+        if not side_dict: return 0.0
         if side_dict is self.bids:
             items = sorted(side_dict.items(), key=lambda kv: -kv[0])
         else:
             items = sorted(side_dict.items(), key=lambda kv: kv[0])
-        total = 0.0
-        n = 0
-        for i, (p, sz) in enumerate(items):
-            if i >= DEPTH_LEVELS:
-                break
-            total += p * sz
-            n += 1
-        return (total / n) if n else 0.0
+        total=0.0; n=0
+        for i,(p,sz) in enumerate(items):
+            if i>=DEPTH_LEVELS: break
+            total+=p*sz; n+=1
+        return (total/n) if n else 0.0
 
     def _detect_wall(self, side:str)->Optional[Tuple[WallTrack,float]]:
         side_dict=self.bids if side=="buy" else self.asks
@@ -290,8 +294,13 @@ class MarketSurfer:
                 if not snapshot_ok: continue
                 if msg.get("event")=="bookUpdate":
                     self._apply_book(msg.get("bids",[]), msg.get("asks",[]))
-                if msg.get("event")=="trade":
-                    for tr in msg.get("trades",[]): self._apply_trade(tr)
+
+                ev = msg.get("event")
+                if ev == "trade":
+                    self._apply_trade(msg)
+                elif ev == "trades":
+                    for tr in msg.get("trades", []):
+                        self._apply_trade(tr)
 
                 self._detect_wall("buy"); self._detect_wall("sell")
                 if time.time()-self.last_signal_ts < COOLDOWN_SEC: continue
@@ -301,7 +310,7 @@ class MarketSurfer:
                         info["life"]>=STICKY_SEC_MIN,
                         info["hit_ratio"]>=HIT_RATIO_MIN,
                         info["depl_speed"]>=DEPL_SPEED_MIN,
-                        info["repl_ratio"]<=REPLENISH_OK_MAX,   # <— اسم الحقل الصحيح
+                        info["repl_ratio"]<=REPLENISH_OK_MAX,   # الاسم الصحيح
                         S>=SCORE_FOLLOW
                     ]
                     if self.buy.size<=1e-8: self.buy=None
@@ -344,8 +353,14 @@ async def post_signal_watch(market: str):
                 if not snapshot_ok: continue
                 if msg.get("event")=="bookUpdate":
                     surfer._apply_book(msg.get("bids",[]), msg.get("asks",[]))
-                if msg.get("event")=="trade":
-                    for tr in msg.get("trades",[]): surfer._apply_trade(tr)
+
+                ev = msg.get("event")
+                if ev == "trade":
+                    surfer._apply_trade(msg)
+                elif ev == "trades":
+                    for tr in msg.get("trades", []):
+                        surfer._apply_trade(tr)
+
                 surfer._detect_wall("buy"); surfer._detect_wall("sell")
 
                 exit_flag=False
@@ -406,9 +421,9 @@ class ExpressManager:
                         tg_send(f"⚠️ Surfer error {m}: {e}"); res=None
                     if res and res.get("type")=="follow_buy":
                         write_signal_hint(res)
-                        ok=self.send_to_saqer(res)
+                        _ = self.send_to_saqer(res)
                         self.state="SIGNAL_SENT"
-                        # راقب الخروج المرآتي
+                        # راقب الخروج المرآتي (لا يمنع الدورة)
                         try: asyncio.run_coroutine_threadsafe(post_signal_watch(res["market"]), self.loop)
                         except Exception: pass
                         info=res.get("info",{})
@@ -427,7 +442,7 @@ class ExpressManager:
         data={"action":"buy","coin":coin,"tp_eur":TP_EUR,"sl_pct":SL_PCT}
         headers={"X-Link-Secret":LINK_SECRET} if LINK_SECRET else {}
         try:
-            r=requests.post(SAQAR_WEBHOOK+"/hook", json=data, headers=headers, timeout=5)
+            r=requests.post(SAQAR_WEBHOOK+"/hook", json=data, headers=headers, timeout=6)
             return 200<=r.status_code<300
         except Exception as e:
             tg_send(f"⛔ فشل إرسال لصقر: {e}"); return False
@@ -500,6 +515,13 @@ def http_hot(): return jsonify(manager.api_hotlist())
 @app.route("/health", methods=["GET"])
 def http_health(): return jsonify(manager.api_health())
 
+# Hint API (لقراءة صقر)
+@app.route("/hint", methods=["GET"])
+def http_hint():
+    m=request.args.get("market","")
+    data=rget(f"express:signal:{m}") if m else None
+    return jsonify({"ok": bool(data), "hint": data or {}})
+
 # ——— Telegram Webhook ———
 @app.route("/tg", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
@@ -516,13 +538,6 @@ def http_tg_webhook():
     except Exception as e:
         tg_send(f"🐞 TG err: {type(e).__name__}: {e}")
     return jsonify(ok=True)
-
-# Hint API (لقراءة صقر)
-@app.route("/hint", methods=["GET"])
-def http_hint():
-    m=request.args.get("market","")
-    data=rget(f"express:signal:{m}") if m else None
-    return jsonify({"ok": bool(data), "hint": data or {}})
 
 @app.route("/", methods=["GET"])
 def home(): return "Express v7 ✅", 200
