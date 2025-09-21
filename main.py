@@ -111,7 +111,7 @@ class TradeSpy:
                 msg=json.loads(await ws.recv())
                 if msg.get("event")!="trade": continue
                 for tr in msg.get("trades",[]):
-                    m = tr.get("market"); 
+                    m = tr.get("market")
                     if m not in self.windows: continue
                     px=float(tr["price"]); ba=float(tr["amount"]); ts=time.time()
                     self.windows[m].append((ts,px,ba))
@@ -124,7 +124,8 @@ class TradeSpy:
                     self.last_price[m]=px
 
     def metrics(self, market:str)->dict:
-        now=time.time(); win=[(ts,px,ba) for (ts,px,ba) in self.windows.get(market,[]) if now-ts<=SPEED_WINDOW_SEC]
+        now=time.time()
+        win=[(ts,px,ba) for (ts,px,ba) in self.windows.get(market,[]) if now-ts<=SPEED_WINDOW_SEC]
         vol=sum(ba for (_,_,ba) in win); cnt=len(win); avg=(vol/cnt) if cnt else 0.0
         u,d=self.updn.get(market,(0,0)); tot=u+d; upt=(u/tot) if tot>0 else 0.5
         score = 0.6*math.log1p(vol) + 0.3*math.log1p(cnt) + 0.1*max(0.0,(upt-0.5))*2
@@ -233,16 +234,22 @@ class MarketSurfer:
         self.tape.append((time.time(), side, p, a))
 
     def _avg_depth(self, side_dict:Dict[float,float])->float:
-    if not side_dict: return 0.0
-    if side_dict is self.bids:
-        items = sorted(side_dict.items(), key=lambda x: -x[0])
-    else:
-        items = sorted(side_dict.items(), key=lambda x: x[0])
-    total=0.0; n=0
-    for i,(p,sz) in enumerate(items):
-        if i>=DEPTH_LEVELS: break
-        total+=p*sz; n+=1
-    return (total/n) if n>0 else 0.0
+        """متوسط عمق اليورو لأول DEPTH_LEVELS من جهة الكتاب."""
+        if not side_dict:
+            return 0.0
+        # رتب حسب السعر (bids نزولاً، asks صعوداً)
+        if side_dict is self.bids:
+            items = sorted(side_dict.items(), key=lambda kv: -kv[0])
+        else:
+            items = sorted(side_dict.items(), key=lambda kv: kv[0])
+        total = 0.0
+        n = 0
+        for i, (p, sz) in enumerate(items):
+            if i >= DEPTH_LEVELS:
+                break
+            total += p * sz
+            n += 1
+        return (total / n) if n else 0.0
 
     def _detect_wall(self, side:str)->Optional[Tuple[WallTrack,float]]:
         side_dict=self.bids if side=="buy" else self.asks
@@ -290,8 +297,13 @@ class MarketSurfer:
                 if time.time()-self.last_signal_ts < COOLDOWN_SEC: continue
                 if self.buy:
                     S,info=self.buy.score(self._avg_depth(self.bids))
-                    conds = [info["life"]>=STICKY_SEC_MIN, info["hit_ratio"]>=HIT_RATIO_MIN,
-                             info["depl_speed"]>=DEPL_SPEED_MIN, info["replenish_ratio"]<=REPLENISH_OK_MAX, S>=SCORE_FOLLOW]
+                    conds = [
+                        info["life"]>=STICKY_SEC_MIN,
+                        info["hit_ratio"]>=HIT_RATIO_MIN,
+                        info["depl_speed"]>=DEPL_SPEED_MIN,
+                        info["repl_ratio"]<=REPLENISH_OK_MAX,   # <— اسم الحقل الصحيح
+                        S>=SCORE_FOLLOW
+                    ]
                     if self.buy.size<=1e-8: self.buy=None
                     elif all(conds):
                         entry=self.maker_entry_buy_px(self.buy)
@@ -403,7 +415,7 @@ class ExpressManager:
                         tg_send(
                             f"🚀 BUY {m} | Maker≈{res['price']} | Score={res['score']}\n"
                             f"life={info.get('life'):.2f} hit={info.get('hit_ratio'):.2f} "
-                            f"spd={info.get('depl_speed'):.3f} repl={info.get('replenish_ratio'):.2f}"
+                            f"spd={info.get('depl_speed'):.3f} repl={info.get('repl_ratio'):.2f}"
                         )
                         return
         finally:
@@ -449,7 +461,6 @@ class ExpressManager:
     def api_hotlist(self): return {"ok":True,"hotlist":self.hot.snapshot()}
 
 # ===== Flask =====
-from flask import Flask, request, jsonify
 app = Flask(__name__)
 manager = ExpressManager(UNIVERSE)
 
@@ -490,7 +501,6 @@ def http_hot(): return jsonify(manager.api_hotlist())
 def http_health(): return jsonify(manager.api_health())
 
 # ——— Telegram Webhook ———
-# شغّال على /tg (الافتراضي عندك) وبنفس الوقت /webhook احتياط
 @app.route("/tg", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def http_tg_webhook():
@@ -506,6 +516,13 @@ def http_tg_webhook():
     except Exception as e:
         tg_send(f"🐞 TG err: {type(e).__name__}: {e}")
     return jsonify(ok=True)
+
+# Hint API (لقراءة صقر)
+@app.route("/hint", methods=["GET"])
+def http_hint():
+    m=request.args.get("market","")
+    data=rget(f"express:signal:{m}") if m else None
+    return jsonify({"ok": bool(data), "hint": data or {}})
 
 @app.route("/", methods=["GET"])
 def home(): return "Express v7 ✅", 200
